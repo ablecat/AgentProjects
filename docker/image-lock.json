@@ -1,0 +1,17 @@
+{
+    "schemaVersion":  1,
+    "generatedAtUtc":  "2026-09-09T12:46:58Z",
+    "dockerServerVersion":  "28.5.1",
+    "images":  {
+                   "python":  {
+                                  "tag":  "repo-agent-python:0.1",
+                                  "imageId":  "sha256:dcccfc3bf814010e538d733a6946a6eb8474289eb0a383fe54058a4e63b41700",
+                                  "base":  "python:3.11.16-slim-bookworm@sha256:528257d48c1da0dcecc2e725d1ae34498d60c965f1241e39cd6a85a8859bdf84"
+                              },
+                   "maven":  {
+                                 "tag":  "repo-agent-maven:0.1",
+                                 "imageId":  "sha256:f97b45572edc5ce4d101ceb47ffde5d253a194a9ddffbf0529f35b6f7d250361",
+                                 "base":  "maven:3.9.16-eclipse-temurin-21-noble@sha256:8f6ac126f7810bb5549c4cd122d2bf0e9cda5bdeb0838aa928f09e779fd8bef8"
+                             }
+               }
+}
