@@ -536,9 +536,10 @@ def _validated_run_id(value: str) -> str:
 
 
 def _validated_artifact_kind(value: str) -> ArtifactKind:
-    if value not in ARTIFACT_FILENAMES:
-        raise ApiError(404, "artifact_not_found", "Artifact not found")
-    return cast(ArtifactKind, value)
+    for artifact_kind in ARTIFACT_FILENAMES:
+        if value == artifact_kind:
+            return artifact_kind
+    raise ApiError(404, "artifact_not_found", "Artifact not found")
 
 
 def _validated_artifact_path(value: object) -> Path:
