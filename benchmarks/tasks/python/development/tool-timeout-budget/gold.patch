@@ -1,0 +1,44 @@
+diff --git a/tasklib/tools.py b/tasklib/tools.py
+--- a/tasklib/tools.py
++++ b/tasklib/tools.py
+@@ -4,6 +4,8 @@
+ 
+ from collections.abc import Callable
+ from dataclasses import dataclass
++import math
++import time
+ 
+ 
+ @dataclass(frozen=True)
+@@ -14,7 +16,28 @@ class ToolResult:
+     error: str | None = None
+ 
+ 
+-def run_tool(name: str, action: Callable[[float], str]) -> ToolResult:
+-    """Execute an action using the historical default timeout hint."""
++def run_tool(
++    name: str,
++    action: Callable[[float], str],
++    *,
++    timeout_seconds: float = 30.0,
++    clock: Callable[[], float] = time.monotonic,
++) -> ToolResult:
++    """Execute an action and make timeout outcomes explicit."""
+ 
+-    return ToolResult(name=name, status="completed", output=action(30.0))
++    if (
++        isinstance(timeout_seconds, bool)
++        or not isinstance(timeout_seconds, (int, float))
++        or not math.isfinite(timeout_seconds)
++        or timeout_seconds <= 0
++    ):
++        raise ValueError("timeout_seconds must be a positive finite number")
++    budget = float(timeout_seconds)
++    started = clock()
++    try:
++        output = action(budget)
++    except TimeoutError:
++        return ToolResult(name, "timed_out", "", "tool timed out")
++    if clock() - started > budget:
++        return ToolResult(name, "timed_out", "", "tool timed out")
++    return ToolResult(name=name, status="completed", output=output)

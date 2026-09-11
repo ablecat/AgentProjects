@@ -1,0 +1,28 @@
+diff --git a/src/main/java/dev/repoagent/task/Backoff.java b/src/main/java/dev/repoagent/task/Backoff.java
+--- a/src/main/java/dev/repoagent/task/Backoff.java
++++ b/src/main/java/dev/repoagent/task/Backoff.java
+@@ -7,6 +7,6 @@ public final class Backoff {
+         if (baseMillis < 0 || attempt < 0 || attempt > 10) {
+             throw new IllegalArgumentException("invalid backoff input");
+         }
+-        return Math.multiplyExact(baseMillis, 1L << Math.max(0, attempt - 1));
++        return Math.multiplyExact(baseMillis, 1L << attempt);
+     }
+ }
+diff --git a/src/test/java/dev/repoagent/task/BackoffRegressionTest.java b/src/test/java/dev/repoagent/task/BackoffRegressionTest.java
+new file mode 100644
+--- /dev/null
++++ b/src/test/java/dev/repoagent/task/BackoffRegressionTest.java
+@@ -0,0 +1,12 @@
++package dev.repoagent.task;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++
++import org.junit.jupiter.api.Test;
++
++class BackoffRegressionTest {
++    @Test
++    void computesFourthAttemptFromFourthExponent() {
++        assertEquals(1_600, Backoff.delayMillis(100, 4));
++    }
++}

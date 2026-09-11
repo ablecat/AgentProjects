@@ -1,0 +1,29 @@
+diff --git a/src/main/java/dev/repoagent/task/FileNames.java b/src/main/java/dev/repoagent/task/FileNames.java
+--- a/src/main/java/dev/repoagent/task/FileNames.java
++++ b/src/main/java/dev/repoagent/task/FileNames.java
+@@ -10,7 +10,7 @@ public final class FileNames {
+     public static Optional<String> extension(String name) {
+         Objects.requireNonNull(name, "name");
+         int dot = name.lastIndexOf('.');
+-        if (dot < 0) {
++        if (dot <= 0 || dot == name.length() - 1) {
+             return Optional.empty();
+         }
+         return Optional.of(name.substring(dot + 1).toLowerCase(Locale.ROOT));
+diff --git a/src/test/java/dev/repoagent/task/FileNamesRegressionTest.java b/src/test/java/dev/repoagent/task/FileNamesRegressionTest.java
+new file mode 100644
+--- /dev/null
++++ b/src/test/java/dev/repoagent/task/FileNamesRegressionTest.java
+@@ -0,0 +1,12 @@
++package dev.repoagent.task;
++
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++import org.junit.jupiter.api.Test;
++
++class FileNamesRegressionTest {
++    @Test
++    void doesNotTreatDotfileAsExtension() {
++        assertTrue(FileNames.extension(".credentials").isEmpty());
++    }
++}

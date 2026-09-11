@@ -1,0 +1,33 @@
+diff --git a/src/main/java/dev/repoagent/task/IssueDraft.java b/src/main/java/dev/repoagent/task/IssueDraft.java
+--- a/src/main/java/dev/repoagent/task/IssueDraft.java
++++ b/src/main/java/dev/repoagent/task/IssueDraft.java
+@@ -4,7 +4,7 @@ import java.util.ArrayList;
+ import java.util.List;
+
+ public final class IssueDraft {
+-    private final List<String> labels = Defaults.LABELS;
++    private final List<String> labels = new ArrayList<>(Defaults.LABELS);
+
+     public void addLabel(String label) {
+         labels.add(label);
+diff --git a/src/test/java/dev/repoagent/task/IssueDraftRegressionTest.java b/src/test/java/dev/repoagent/task/IssueDraftRegressionTest.java
+new file mode 100644
+--- /dev/null
++++ b/src/test/java/dev/repoagent/task/IssueDraftRegressionTest.java
+@@ -0,0 +1,16 @@
++package dev.repoagent.task;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++
++import java.util.List;
++import org.junit.jupiter.api.Test;
++
++class IssueDraftRegressionTest {
++    @Test
++    void keepsDefaultLabelsIsolatedBetweenDrafts() {
++        IssueDraft changed = new IssueDraft();
++        changed.addLabel("security");
++
++        assertEquals(List.of("triage"), new IssueDraft().labels());
++    }
++}

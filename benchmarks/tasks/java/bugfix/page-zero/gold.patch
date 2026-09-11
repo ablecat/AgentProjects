@@ -1,0 +1,29 @@
+diff --git a/src/main/java/dev/repoagent/task/Pages.java b/src/main/java/dev/repoagent/task/Pages.java
+--- a/src/main/java/dev/repoagent/task/Pages.java
++++ b/src/main/java/dev/repoagent/task/Pages.java
+@@ -4,7 +4,7 @@ public final class Pages {
+     private Pages() {}
+
+     public static int offset(int pageNumber, int pageSize) {
+-        if (pageNumber < 0 || pageSize < 1) {
++        if (pageNumber < 1 || pageSize < 1) {
+             throw new IllegalArgumentException("page number and size must be positive");
+         }
+         return Math.multiplyExact(pageNumber - 1, pageSize);
+diff --git a/src/test/java/dev/repoagent/task/PagesRegressionTest.java b/src/test/java/dev/repoagent/task/PagesRegressionTest.java
+new file mode 100644
+--- /dev/null
++++ b/src/test/java/dev/repoagent/task/PagesRegressionTest.java
+@@ -0,0 +1,12 @@
++package dev.repoagent.task;
++
++import static org.junit.jupiter.api.Assertions.assertThrows;
++
++import org.junit.jupiter.api.Test;
++
++class PagesRegressionTest {
++    @Test
++    void rejectsPageZero() {
++        assertThrows(IllegalArgumentException.class, () -> Pages.offset(0, 50));
++    }
++}

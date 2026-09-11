@@ -1,33 +1,288 @@
 # Repo Maintainer Agent
 
-This repository currently contains a base-image-pinned Docker sandbox foundation for a Python and Maven code-maintenance agent. Final local image IDs are recorded after each successful build.
+[简体中文](README.zh-CN.md) | [Demo](docs/DEMO.md) | [Chinese user guide](docs/USER_GUIDE.zh-CN.md) | [Benchmark protocol](benchmarks/README.md)
+
+Repo Maintainer Agent turns a natural-language bug report into a reviewed,
+verified patch for a local Git repository. It plans with an OpenAI-compatible
+model, pauses for approval, edits only a disposable candidate clone, verifies
+the result in hardened Docker containers, and publishes durable artifacts for a
+human to inspect. It never applies, commits, or pushes the patch to the source
+repository.
+
+The repository includes a Typer CLI, a loopback visual workspace, an
+authenticated FastAPI service, resumable LangGraph orchestration, Python and
+Maven sandboxes, and a frozen evaluation suite. No benchmark score is claimed
+in this README; model-backed results must be generated from the locked suite and
+reviewed as evaluation artifacts.
+
+## What it does
+
+- Accepts a clean, committed local Git repository and a natural-language
+  maintenance task.
+- Builds a bounded repository map and lets the model use seven typed tools:
+  `list_files`, `read_file`, `search_code`, `apply_patch`, `get_diff`,
+  `run_check`, and `finish`.
+- Produces a structured change plan and waits for explicit approval unless
+  auto-approval was requested.
+- Applies model patches only in a run-owned candidate clone, then runs
+  deterministic `pytest` or Maven checks in Docker.
+- Allows up to two verification repairs and one independent review repair.
+- Checkpoints every workflow boundary in SQLite so an interrupted run can
+  resume without intentionally repeating completed side effects.
+- Publishes `patch.diff`, `report.md`, `run.json`, `trace.jsonl`, and bounded
+  check logs for human review.
+
+The explicit `demo` provider is key-free and read-only. Missing or incompatible
+model configuration fails clearly; it never falls back to fabricated model
+output.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    U[CLI / Visual UI / REST API] --> S[RunService<br/>single worker + bounded queue]
+    S --> DB[(SQLite checkpoints)]
+    S --> W[LangGraph workflow]
+    W --> M[OpenAI-compatible model<br/>native function calling]
+    W --> T[Typed tool executor]
+    R[Clean source repository<br/>committed HEAD] --> C[Disposable candidate clone]
+    T --> C
+    T --> D[Hardened Docker sandbox]
+    C --> D
+    D --> V[Deterministic pytest / Maven checks]
+    W --> A[Redacted run artifacts]
+    DB --> A
+    A --> H[Human review]
+    H -. manual application only .-> R
+```
+
+The fixed maintenance path is:
+
+```text
+prepare -> baseline_check -> inspect_and_plan -> approval -> implement
+        -> verify -> repair (at most 2) -> review
+        -> review_repair (at most 1) -> finalize
+```
+
+Planning is read-only. Verification is deterministic and cannot be skipped by
+the model. A final `succeeded` state means the workflow completed its configured
+checks and review; it is not a substitute for independent benchmark scoring or
+human acceptance of the patch.
+
+## Supported repository profiles
+
+The maintained repository must be a clean Git worktree with at least one
+commit. Only committed content is copied into the candidate workspace.
+
+| Profile | Supported shape |
+|---|---|
+| Python | Python 3.11, `pytest`, one root project; optional, explicitly authorized dependency bootstrap from a root `requirements.txt` or PEP 621 metadata |
+| Maven | One root `jar` module, Java 17 or 21, Maven 3.9, pinned Surefire/JUnit configuration |
+
+Mixed Python/Maven layouts, Gradle, nested Maven modules, Git submodules, Git
+LFS, repository symlinks/reparse points, custom Maven repositories, build
+extensions, and dirty source worktrees are rejected. See the policy errors and
+check artifacts for the exact reason when a repository is outside this scope.
 
 ## Prerequisites
 
-- Windows with WSL2 and Docker Desktop using the `desktop-linux` context
+The supplied setup scripts target Windows with PowerShell and Docker Desktop:
+
+- Windows with WSL2 and Docker Desktop using Linux containers
 - PowerShell 5.1 or later
-- At least 4 GB of memory available to Docker
+- Python 3.11 or later and Git on the host
+- at least 4 GB of memory available to Docker
 
-Docker Desktop remains opt-in at login. The scripts do not create or edit `.wslconfig`, registry mirrors, proxies, or global Docker cleanup settings.
+The Python package and CI also run on Linux with a compatible Docker Engine.
+Docker Desktop remains opt-in at login. Project scripts do not edit
+`.wslconfig`, registry mirrors, proxy settings, or invoke global Docker cleanup.
 
-## Build and verify
+## Install and verify
+
+From the repository root in PowerShell:
 
 ```powershell
 ./scripts/start-docker.ps1
 ./scripts/build-sandboxes.ps1
 ./scripts/verify-docker.ps1
+py -3.11 -m pip install -e ".[dev]"
+python -m pytest
 ```
 
-The two sandbox images are:
+The sandbox images are:
 
 - `repo-agent-python:0.1`: Python 3.11, pytest, Git, and ripgrep
 - `repo-agent-maven:0.1`: Eclipse Temurin JDK 21, Maven 3.9, Git, and ripgrep
 
-Both images run as UID/GID `10001` by default. The verification script exercises them with no network, a read-only root filesystem, dropped Linux capabilities, `no-new-privileges`, CPU/memory/PID limits, and an isolated temporary workspace.
+| Sandbox | Immutable base image |
+|---|---|
+| Python | `python:3.11.16-slim-bookworm@sha256:528257d48c1da0dcecc2e725d1ae34498d60c965f1241e39cd6a85a8859bdf84` |
+| Maven | `maven:3.9.16-eclipse-temurin-21-noble@sha256:8f6ac126f7810bb5549c4cd122d2bf0e9cda5bdeb0838aa928f09e779fd8bef8` |
 
-Existing Docker Desktop proxy and registry-mirror settings are reported but never changed. The script labels every temporary container and removes only containers and files created by its own run; it never invokes a global prune operation.
+Their Dockerfiles pin immutable base-image digests. Local build metadata is
+recorded in `docker/image-lock.json`; CI validates the Dockerfiles and runtime
+contract without assuming a workstation-specific final image ID.
 
-Every agent-image verification container uses the same isolation contract:
+## Quick start without a model key
+
+Run the read-only inspection flow against this repository:
+
+```powershell
+repo-agent run `
+  --repo . `
+  --task "Inspect repository status and TODO markers" `
+  --provider demo `
+  --format json
+```
+
+Or launch the visual workspace:
+
+```powershell
+repo-agent serve --repo . --open
+```
+
+Open `http://127.0.0.1:8765/` if the browser does not open automatically, then
+select **Read-only demo**. The repository path and sandbox image are fixed when
+the server starts; the browser cannot submit another host path or an arbitrary
+image.
+
+## Configure a model
+
+The model client requires native function calling through either the Responses
+API or Chat Completions. Set these process environment variables using your
+organization's secret-injection mechanism:
+
+```text
+REPO_AGENT_API_KEY
+REPO_AGENT_BASE_URL
+REPO_AGENT_MODEL
+```
+
+Do not commit a key, place it in a task file, pass it in a command-line
+argument, or mount it into a sandbox. Verify connectivity before a real task:
+
+```powershell
+repo-agent doctor --allow-remote-model --format json
+```
+
+Non-loopback model endpoints must use HTTPS and require
+`--allow-remote-model`. That authorization matters: task text and the code
+fragments selected by tool calls can be sent to the configured provider.
+
+### Saved Windows relay configuration
+
+For the configured relay at `https://thz10.airucas.com/v1`, the helper can
+discover models, run the doctor probe, and save the key, Base URL, and model as
+one Windows DPAPI CurrentUser-encrypted document:
+
+```powershell
+./scripts/start-relay.ps1 -Reconfigure -ConfigureOnly
+./scripts/start-relay.ps1 -Repository D:\path\to\clean-repository -OpenBrowser
+```
+
+The saved file is `%LOCALAPPDATA%\RepoMaintainerAgent\config\relay.json`. Later
+starts load it without prompting. Use `-Verify` for a new paid handshake and
+`-Reconfigure -ConfigureOnly` to rotate the configuration. The helper restores
+the process environment when the launched UI exits. DPAPI protects data at
+rest for the current Windows user; it does not protect against code already
+running as that user or an administrator.
+
+## Run a maintenance task
+
+With model variables available in the current process:
+
+```powershell
+repo-agent run `
+  --repo D:\path\to\clean-repository `
+  --task "Fix the parser boundary bug and add a regression test" `
+  --allow-remote-model
+```
+
+Read a UTF-8 task file and approve the generated plan automatically:
+
+```powershell
+repo-agent run `
+  --repo D:\path\to\clean-repository `
+  --task-file .\issue.txt `
+  --yes `
+  --allow-remote-model `
+  --format json
+```
+
+Add `--allow-bootstrap` only after reviewing the repository's declared
+dependencies. Bootstrap uses a registered, bounded command with bridge
+networking; verification runs in a separate container with `network=none`.
+
+Manage durable runs with:
+
+```powershell
+repo-agent show RUN_ID --format json
+repo-agent resume RUN_ID --approve --reason "Plan reviewed"
+repo-agent resume RUN_ID
+repo-agent cancel RUN_ID
+```
+
+`resume` without a decision is for an `interrupted` run. A data directory can
+be owned by only one live `RunService`; while the UI or API is running, make
+decisions through that service. The read-only `show` command remains safe.
+
+## Visual workspace and REST API
+
+The loopback UI shows readiness, repository identity, sandbox policy, plan
+approval, checks, metrics, trace events, and downloadable artifacts:
+
+```powershell
+repo-agent serve --repo D:\path\to\clean-repository --port 8765 --open
+```
+
+For automation, start the authenticated FastAPI surface:
+
+```powershell
+$env:REPO_AGENT_BEARER_TOKEN = "replace-with-a-local-secret"
+$repoRoot = (Get-Location).Path
+$allowedRoot = Split-Path -Parent $repoRoot
+repo-agent serve --api `
+  --repo $repoRoot `
+  --allowed-root $allowedRoot `
+  --host 127.0.0.1 `
+  --port 8080
+```
+
+All run and artifact routes require `Authorization: Bearer ...`; only
+`/healthz` and `/readyz` are unauthenticated. The main routes are:
+
+| Method and path | Purpose |
+|---|---|
+| `POST /v1/runs` | Queue a run and return its ID |
+| `GET /v1/runs/{id}` | Read status, plan, checks, metrics, and artifact links |
+| `POST /v1/runs/{id}/decision` | Approve or reject a plan |
+| `POST /v1/runs/{id}/resume` | Resume an interrupted run |
+| `POST /v1/runs/{id}/cancel` | Request cancellation and sandbox cleanup |
+| `GET /v1/runs/{id}/artifacts/{kind}` | Download a fixed run artifact |
+
+API repository paths must be absolute and stay below a configured
+`--allowed-root`.
+
+## Artifacts and states
+
+By default, Windows stores durable state below `%LOCALAPPDATA%\repo-agent`.
+Override it with `--data-dir` or `REPO_AGENT_DATA_DIR`. Each run owns:
+
+| Artifact | Contents |
+|---|---|
+| `patch.diff` | Candidate unified diff for manual review/application |
+| `report.md` | Task, approved plan, checks, and risk summary |
+| `run.json` | Structured run state and metrics |
+| `trace.jsonl` | Append-only, redacted workflow events |
+| `checks/*.log` | Bounded baseline and verification output |
+
+Public states are `queued`, `planning`, `awaiting_approval`, `running`,
+`interrupted`, `succeeded`, `unverified`, `failed`, `cancelled`,
+`policy_denied`, and `rejected`.
+
+## Security boundary
+
+Every verification container uses this contract:
 
 ```text
 --init --pull never --restart no
@@ -37,15 +292,128 @@ Every agent-image verification container uses the same isolation contract:
 --tmpfs /tmp:rw,nosuid,nodev,size=256m,mode=1777
 ```
 
-Only the run-specific workspace and dependency cache are writable bind mounts. The original repository, host home directory, SSH configuration, model credentials, and Docker socket are never mounted.
+Additional boundaries:
 
-## Base image locks
+- The source repository is never mounted read-write and is never automatically
+  patched, committed, or pushed.
+- The model has no shell, arbitrary command, Git push, host network, Docker
+  socket, SSH, or credential tool.
+- Absolute paths, traversal, `.git`, credential-like paths, symlink/reparse
+  escapes, hard-linked targets, binary patches, renames, submodules, and mode
+  changes are rejected.
+- Host home, SSH configuration, model credentials, and the Docker socket are
+  never mounted into tool or check containers.
+- Output and artifacts are bounded and redacted. Containers are named/labeled
+  per run and cleanup targets exact IDs; no global prune is used.
 
-| Sandbox | Immutable base image |
-|---|---|
-| Python | `python:3.11.16-slim-bookworm@sha256:528257d48c1da0dcecc2e725d1ae34498d60c965f1241e39cd6a85a8859bdf84` |
-| Maven | `maven:3.9.16-eclipse-temurin-21-noble@sha256:8f6ac126f7810bb5549c4cd122d2bf0e9cda5bdeb0838aa928f09e779fd8bef8` |
+The model provider is still an external trust boundary. Only use a remote
+endpoint for repositories whose relevant code and task text may be disclosed to
+that provider.
 
-The final locally built image IDs are recorded in `docker/image-lock.json` by `build-sandboxes.ps1` and checked by `verify-docker.ps1`.
+## Evaluation and reproduction
 
-The lock records the exact local build artifacts, while the Dockerfiles pin the base-image digests. Packages installed from live Debian, Ubuntu, and PyPI indexes can still change in a future rebuild; once CI publishing is introduced, CI and local runs should consume the published sandbox images by their final registry digests rather than rebuilding them independently.
+The frozen suite contains six Python and six Java bug-fix tasks. Candidate
+Agents see a buggy setup, its public tests, and `issue.md`; independent scoring
+withholds `hidden_tests`, `gold.patch`, and expected failure signatures. A
+candidate is not solved merely because its workflow status is `succeeded`.
+
+Validate suite locks without Docker:
+
+```powershell
+python ./benchmarks/validate.py --structure-only
+$projectParent = Split-Path -Parent (Get-Location).Path
+$evaluationRoot = Join-Path $projectParent ".repo-agent-eval-day7-v1"
+repo-agent eval `
+  --matrix-only `
+  --output-dir $evaluationRoot `
+  --format json
+```
+
+`--matrix-only` performs no model call and atomically writes the reviewed
+44-job contract to `$evaluationRoot\matrix.json` before formal execution.
+Keep this durable state root outside the Git repository: it contains canary
+state, candidate workspaces, traces, patches, and scorer evidence and must not
+be committed.
+
+Validate complete fixture lifecycles, then run the offline Docker/security
+acceptance:
+
+```powershell
+python ./benchmarks/validate.py --allow-bootstrap-network
+python ./scripts/smoke-day6.py
+```
+
+A model-backed evaluation requires the same explicit remote-model and bootstrap
+authorizations as a normal run. First run a three-variant canary that is kept
+outside the formal result set:
+
+```powershell
+repo-agent eval `
+  --canary --execute `
+  --allow-remote-model `
+  --allow-bootstrap `
+  --workers 2 `
+  --output-dir $evaluationRoot `
+  --format json
+```
+
+Then run the five stable shards sequentially. Each shard uses at most two
+workers internally, and rerunning a shard resumes its completed jobs:
+
+```powershell
+0..4 | ForEach-Object {
+  repo-agent eval `
+    --matrix --execute `
+    --shard-index $_ --shard-count 5 --workers 2 `
+    --allow-remote-model --allow-bootstrap `
+    --output-dir $evaluationRoot `
+    --format json
+  if ($LASTEXITCODE -ne 0) { throw "Evaluation shard $_ failed." }
+}
+
+repo-agent eval `
+  --merge `
+  --output-dir $evaluationRoot `
+  --report-dir .\benchmarks\results\v1 `
+  --format json
+```
+
+Merge rejects missing, duplicate, misplaced, or incompatible jobs. On success,
+only the three sanitized files `results.jsonl`, `report.json`, and
+`failure-analysis.json` belong in `benchmarks/results/v1`; never copy private
+state, workspaces, traces, or machine-local paths into Git. The report is
+recomputed after reading the exact 44-line JSONL back from disk. Omit token
+price options when no verified price source exists:
+input, cached-input, output, and total token usage are still recorded while
+`cost_usd` remains `null` and `price_source` is `unavailable`. See
+[benchmarks/README.md](benchmarks/README.md) for the scorer boundary, locked
+matrix, resume rules, and claims policy.
+
+## Development checks
+
+Run the same quality gates used by CI:
+
+```powershell
+ruff check src tests scripts benchmarks
+mypy src/repo_agent
+python -m pytest --cov=repo_agent --cov-report=term-missing --cov-fail-under=80
+python ./benchmarks/validate.py --structure-only
+```
+
+Real-container smoke checks are intentionally separate because they require the
+two local sandbox images:
+
+```powershell
+python ./scripts/smoke-day1.py
+python ./scripts/smoke-day2.py
+python ./scripts/smoke-day3.py
+python ./scripts/smoke-day6.py
+```
+
+For a reproducible walkthrough, follow [docs/DEMO.md](docs/DEMO.md). Detailed
+Chinese operating notes are in
+[docs/USER_GUIDE.zh-CN.md](docs/USER_GUIDE.zh-CN.md).
+
+## License
+
+Released under the [MIT License](LICENSE).

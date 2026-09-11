@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "id": "py-development-004",
+  "slug": "severity-summary",
+  "title": "Aggregate findings by severity without reordering evidence",
+  "language": "python",
+  "kind": "development",
+  "category": "reporting",
+  "difficulty": "easy",
+  "timeout_seconds": 10,
+  "assets": {
+    "baseline": "baseline",
+    "issue": "issue.md",
+    "hidden_tests": "hidden_tests",
+    "gold_patch": "gold.patch"
+  },
+  "test_contract": {
+    "runner": "unittest",
+    "public_pattern": "test_*.py",
+    "hidden_pattern": "test_*.py",
+    "baseline_public": "pass",
+    "baseline_hidden": "fail",
+    "gold_public": "pass",
+    "gold_hidden": "pass",
+    "failure_signatures": ["test_groups_and_findings_preserve_source_order"]
+  },
+  "constraints": {
+    "network": false,
+    "third_party_dependencies": [],
+    "python_min": "3.11"
+  }
+}

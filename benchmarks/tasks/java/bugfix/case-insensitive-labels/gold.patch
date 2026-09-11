@@ -1,0 +1,32 @@
+diff --git a/src/main/java/dev/repoagent/task/Labels.java b/src/main/java/dev/repoagent/task/Labels.java
+--- a/src/main/java/dev/repoagent/task/Labels.java
++++ b/src/main/java/dev/repoagent/task/Labels.java
+@@ -13,7 +13,7 @@ public final class Labels {
+         Set<String> seen = new HashSet<>();
+         for (String label : labels) {
+             String normalized = label.strip();
+-            if (!normalized.isEmpty() && seen.add(normalized)) {
++            if (!normalized.isEmpty() && seen.add(normalized.toLowerCase(Locale.ROOT))) {
+                 result.add(normalized);
+             }
+         }
+diff --git a/src/test/java/dev/repoagent/task/LabelsRegressionTest.java b/src/test/java/dev/repoagent/task/LabelsRegressionTest.java
+new file mode 100644
+--- /dev/null
++++ b/src/test/java/dev/repoagent/task/LabelsRegressionTest.java
+@@ -0,0 +1,15 @@
++package dev.repoagent.task;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++
++import java.util.List;
++import org.junit.jupiter.api.Test;
++
++class LabelsRegressionTest {
++    @Test
++    void keepsFirstCaseInsensitiveLabel() {
++        assertEquals(
++                List.of("Urgent"),
++                Labels.uniqueNormalized(List.of("Urgent", "urgent", "URGENT")));
++    }
++}

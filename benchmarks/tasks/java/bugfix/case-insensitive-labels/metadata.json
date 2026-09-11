@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "id": "java-bugfix-006",
+  "slug": "case-insensitive-labels",
+  "title": "Deduplicate labels case-insensitively",
+  "language": "java",
+  "kind": "bugfix",
+  "category": "collection_invariant",
+  "difficulty": "medium",
+  "timeout_seconds": 30,
+  "assets": {
+    "baseline": "baseline",
+    "setup_patch": "setup.patch",
+    "issue": "issue.md",
+    "hidden_tests": "hidden_tests",
+    "gold_patch": "gold.patch"
+  },
+  "test_contract": {
+    "runner": "maven",
+    "public_pattern": "*Test",
+    "hidden_pattern": "*HiddenTest",
+    "regression_pattern": "*RegressionTest",
+    "setup_public": "pass",
+    "setup_hidden": "fail",
+    "regression_on_setup": "fail",
+    "gold_public": "pass",
+    "gold_hidden": "pass",
+    "failure_signatures": ["duplicateLabelsIgnoreCase"],
+    "regression_failure_signatures": ["keepsFirstCaseInsensitiveLabel"]
+  },
+  "constraints": {
+    "network": false,
+    "third_party_dependencies": [],
+    "test_dependencies": ["org.junit.jupiter:junit-jupiter:5.11.4"],
+    "java_release": "17",
+    "build": "maven-single-module"
+  }
+}

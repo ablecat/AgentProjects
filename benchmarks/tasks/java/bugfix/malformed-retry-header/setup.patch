@@ -1,0 +1,12 @@
+diff --git a/src/main/java/dev/repoagent/task/RetryAfterParser.java b/src/main/java/dev/repoagent/task/RetryAfterParser.java
+--- a/src/main/java/dev/repoagent/task/RetryAfterParser.java
++++ b/src/main/java/dev/repoagent/task/RetryAfterParser.java
+@@ -13,7 +13,7 @@ public final class RetryAfterParser {
+         try {
+             seconds = Integer.parseInt(raw);
+         } catch (NumberFormatException exception) {
+-            throw new IllegalArgumentException("Retry-After must be an integer", exception);
++            return fallback;
+         }
+         if (seconds < 0) {
+             throw new IllegalArgumentException("Retry-After must not be negative");

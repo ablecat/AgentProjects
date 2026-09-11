@@ -1,0 +1,12 @@
+diff --git a/tasklib/records.py b/tasklib/records.py
+--- a/tasklib/records.py
++++ b/tasklib/records.py
+@@ -5,7 +5,7 @@ import json
+ def decode_record(payload: str) -> dict[str, object]:
+     try:
+         value = json.loads(payload)
+-    except Exception as exc:
++    except json.JSONDecodeError as exc:
+         raise ValueError("record is not valid JSON") from exc
+     if not isinstance(value, dict):
+         raise ValueError("record must be an object")

@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "suite_id": "repo-agent-python-development-v1",
+  "validator": "validate.py",
+  "formal_evaluation": false,
+  "tasks": [
+    {
+      "id": "py-development-001",
+      "path": "configurable-path-exclusions",
+      "sha256": "e36a937ae11ce0dfbd9ea774e5091ed1c5237183a0e270a433576f0f553cd084"
+    },
+    {
+      "id": "py-development-002",
+      "path": "json-report-exporter",
+      "sha256": "74dee4e7a8953f566a0c5e0c24ab24b16588d391bdcb0c91445524eb7a95e017"
+    },
+    {
+      "id": "py-development-003",
+      "path": "tool-timeout-budget",
+      "sha256": "3fbd017270d09f8922416088760f99d992bb4d45b104e133ebc3a0f80c32a7e3"
+    },
+    {
+      "id": "py-development-004",
+      "path": "severity-summary",
+      "sha256": "08215018ff0dc5bcd313eed217158e40d2cde720422f8d0083f25a3ab5efe4aa"
+    }
+  ]
+}

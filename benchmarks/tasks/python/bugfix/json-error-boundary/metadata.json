@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "id": "py-bugfix-004",
+  "slug": "json-error-boundary",
+  "title": "Do not mask unexpected decoder failures",
+  "language": "python",
+  "kind": "bugfix",
+  "category": "exception_handling",
+  "difficulty": "medium",
+  "timeout_seconds": 10,
+  "assets": {
+    "baseline": "baseline",
+    "setup_patch": "setup.patch",
+    "issue": "issue.md",
+    "hidden_tests": "hidden_tests",
+    "gold_patch": "gold.patch"
+  },
+  "test_contract": {
+    "runner": "unittest",
+    "public_pattern": "test_*.py",
+    "hidden_pattern": "test_*.py",
+    "setup_public": "pass",
+    "setup_hidden": "fail",
+    "gold_public": "pass",
+    "gold_hidden": "pass",
+    "failure_signatures": ["test_decoder_runtime_error_is_not_masked", "test_invalid_input_type_is_not_masked"]
+  },
+  "constraints": {
+    "network": false,
+    "third_party_dependencies": [],
+    "python_min": "3.11"
+  }
+}

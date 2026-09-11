@@ -1,0 +1,33 @@
+diff --git a/src/main/java/dev/repoagent/task/RetryAfterParser.java b/src/main/java/dev/repoagent/task/RetryAfterParser.java
+--- a/src/main/java/dev/repoagent/task/RetryAfterParser.java
++++ b/src/main/java/dev/repoagent/task/RetryAfterParser.java
+@@ -13,7 +13,7 @@ public final class RetryAfterParser {
+         try {
+             seconds = Integer.parseInt(raw);
+         } catch (NumberFormatException exception) {
+-            return fallback;
++            throw new IllegalArgumentException("Retry-After must be an integer", exception);
+         }
+         if (seconds < 0) {
+             throw new IllegalArgumentException("Retry-After must not be negative");
+diff --git a/src/test/java/dev/repoagent/task/RetryAfterParserRegressionTest.java b/src/test/java/dev/repoagent/task/RetryAfterParserRegressionTest.java
+new file mode 100644
+--- /dev/null
++++ b/src/test/java/dev/repoagent/task/RetryAfterParserRegressionTest.java
+@@ -0,0 +1,16 @@
++package dev.repoagent.task;
++
++import static org.junit.jupiter.api.Assertions.assertThrows;
++
++import java.util.Map;
++import org.junit.jupiter.api.Test;
++
++class RetryAfterParserRegressionTest {
++    @Test
++    void rejectsMalformedRetryAfter() {
++        assertThrows(
++                IllegalArgumentException.class,
++                () -> RetryAfterParser.retryAfterSeconds(
++                        Map.of("Retry-After", "not-a-number"), 30));
++    }
++}

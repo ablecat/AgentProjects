@@ -1,0 +1,186 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://repo-maintainer-agent.local/schemas/bugfix-task-v1.json",
+  "title": "Repo Maintainer Agent Python/Java bug-fix task",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "id",
+    "slug",
+    "title",
+    "language",
+    "kind",
+    "category",
+    "difficulty",
+    "timeout_seconds",
+    "assets",
+    "test_contract",
+    "constraints"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "id": { "type": "string", "pattern": "^(py|java)-bugfix-[0-9]{3}$" },
+    "slug": { "type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$" },
+    "title": { "type": "string", "minLength": 1 },
+    "language": { "enum": ["python", "java"] },
+    "kind": { "const": "bugfix" },
+    "category": {
+      "enum": [
+        "local_logic",
+        "boundary",
+        "cross_file_state",
+        "exception_handling",
+        "test_gap",
+        "collection_invariant"
+      ]
+    },
+    "difficulty": { "enum": ["easy", "medium"] },
+    "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 30 },
+    "assets": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["baseline", "setup_patch", "issue", "hidden_tests", "gold_patch"],
+      "properties": {
+        "baseline": { "const": "baseline" },
+        "setup_patch": { "const": "setup.patch" },
+        "issue": { "const": "issue.md" },
+        "hidden_tests": { "const": "hidden_tests" },
+        "gold_patch": { "const": "gold.patch" }
+      }
+    },
+    "test_contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "runner",
+        "public_pattern",
+        "hidden_pattern",
+        "setup_public",
+        "setup_hidden",
+        "gold_public",
+        "gold_hidden",
+        "failure_signatures"
+      ],
+      "properties": {
+        "runner": { "enum": ["unittest", "maven"] },
+        "public_pattern": { "enum": ["test_*.py", "*Test"] },
+        "hidden_pattern": { "enum": ["test_*.py", "*HiddenTest"] },
+        "regression_pattern": { "const": "*RegressionTest" },
+        "setup_public": { "const": "pass" },
+        "setup_hidden": { "const": "fail" },
+        "gold_public": { "const": "pass" },
+        "gold_hidden": { "const": "pass" },
+        "regression_on_setup": { "const": "fail" },
+        "failure_signatures": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "regression_failure_signatures": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[A-Za-z_$][A-Za-z0-9_$]*$" }
+        }
+      }
+    },
+    "constraints": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["network", "third_party_dependencies"],
+      "properties": {
+        "network": { "const": false },
+        "third_party_dependencies": { "const": [] },
+        "python_min": { "const": "3.11" },
+        "test_dependencies": {
+          "const": ["org.junit.jupiter:junit-jupiter:5.11.4"]
+        },
+        "java_release": { "const": "17" },
+        "build": { "const": "maven-single-module" }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "language": { "const": "python" } },
+        "required": ["language"]
+      },
+      "then": {
+        "properties": {
+          "id": { "pattern": "^py-bugfix-[0-9]{3}$" },
+          "test_contract": {
+            "properties": {
+              "runner": { "const": "unittest" },
+              "public_pattern": { "const": "test_*.py" },
+              "hidden_pattern": { "const": "test_*.py" },
+              "failure_signatures": {
+                "items": {
+                  "type": "string",
+                  "pattern": "^test_[A-Za-z0-9_]+$"
+                }
+              }
+            }
+          },
+          "constraints": {
+            "required": ["network", "third_party_dependencies", "python_min"]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "language": { "const": "java" } },
+        "required": ["language"]
+      },
+      "then": {
+        "properties": {
+          "id": { "pattern": "^java-bugfix-[0-9]{3}$" },
+          "test_contract": {
+            "required": [
+              "runner",
+              "public_pattern",
+              "hidden_pattern",
+              "regression_pattern",
+              "setup_public",
+              "setup_hidden",
+              "regression_on_setup",
+              "gold_public",
+              "gold_hidden",
+              "failure_signatures",
+              "regression_failure_signatures"
+            ],
+            "properties": {
+              "runner": { "const": "maven" },
+              "public_pattern": { "const": "*Test" },
+              "hidden_pattern": { "const": "*HiddenTest" },
+              "failure_signatures": {
+                "items": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z_$][A-Za-z0-9_$]*$"
+                }
+              },
+              "regression_failure_signatures": {
+                "items": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z_$][A-Za-z0-9_$]*$"
+                }
+              }
+            }
+          },
+          "constraints": {
+            "required": [
+              "network",
+              "third_party_dependencies",
+              "test_dependencies",
+              "java_release",
+              "build"
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

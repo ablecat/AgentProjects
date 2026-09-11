@@ -1,0 +1,12 @@
+diff --git a/src/main/java/dev/repoagent/task/FileNames.java b/src/main/java/dev/repoagent/task/FileNames.java
+--- a/src/main/java/dev/repoagent/task/FileNames.java
++++ b/src/main/java/dev/repoagent/task/FileNames.java
+@@ -10,7 +10,7 @@ public final class FileNames {
+     public static Optional<String> extension(String name) {
+         Objects.requireNonNull(name, "name");
+         int dot = name.lastIndexOf('.');
+-        if (dot <= 0 || dot == name.length() - 1) {
++        if (dot < 0) {
+             return Optional.empty();
+         }
+         return Optional.of(name.substring(dot + 1).toLowerCase(Locale.ROOT));

@@ -1,0 +1,52 @@
+diff --git a/tasklib/scanner.py b/tasklib/scanner.py
+--- a/tasklib/scanner.py
++++ b/tasklib/scanner.py
+@@ -2,11 +2,46 @@
+ 
+ from __future__ import annotations
+ 
+ from collections.abc import Iterable
++from fnmatch import fnmatchcase
+ 
+ 
+-def collect_paths(paths: Iterable[str]) -> list[str]:
++def collect_paths(
++    paths: Iterable[str], *, exclusions: Iterable[str] = ()
++) -> list[str]:
+     """Return normalized repository paths in deterministic order."""
+ 
+     normalized = {path.removeprefix("./") for path in paths if path}
+-    return sorted(normalized, key=lambda value: (value.casefold(), value))
++    patterns = tuple(_validated_pattern(pattern) for pattern in exclusions)
++    included = (
++        path
++        for path in normalized
++        if not any(_matches(path.split("/"), pattern) for pattern in patterns)
++    )
++    return sorted(included, key=lambda value: (value.casefold(), value))
++
++
++def _validated_pattern(pattern: str) -> tuple[str, ...]:
++    if not isinstance(pattern, str) or not pattern or "\\" in pattern:
++        raise ValueError("exclusions must be non-empty POSIX globs")
++    parts = tuple(pattern.split("/"))
++    if pattern.startswith("/") or any(part in {"", ".", ".."} for part in parts):
++        raise ValueError("exclusions must be repository-relative POSIX globs")
++    if any("**" in part and part != "**" for part in parts):
++        raise ValueError("** must occupy a complete path segment")
++    return parts
++
++
++def _matches(path: list[str], pattern: tuple[str, ...]) -> bool:
++    if not pattern:
++        return not path
++    head, *tail = pattern
++    if head == "**":
++        return _matches(path, tuple(tail)) or bool(
++            path and _matches(path[1:], pattern)
++        )
++    return bool(
++        path
++        and fnmatchcase(path[0], head)
++        and _matches(path[1:], tuple(tail))
++    )

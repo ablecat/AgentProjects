@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/app.css">
+  <title>Repo Maintainer Agent</title>
+</head>
+<body>
+  <header class="app-header">
+    <div class="brand-mark" aria-hidden="true">RA</div>
+    <div class="brand-copy">
+      <h1>Repo Maintainer Agent</h1>
+      <p>v0.1.0 / Release candidate</p>
+    </div>
+    <div class="header-status" aria-live="polite">
+      <span class="status-dot" id="header-status-dot"></span>
+      <span id="header-status-text">Loading runtime</span>
+      <button class="icon-button" id="refresh-state" type="button" title="Refresh runtime" aria-label="Refresh runtime">&#8635;</button>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <aside class="panel run-panel" aria-labelledby="run-heading">
+      <div class="panel-heading">
+        <div><p class="eyebrow">Run configuration</p><h2 id="run-heading">New task</h2></div>
+        <span class="provider-badge" id="provider-badge">OpenAI</span>
+      </div>
+
+      <fieldset class="mode-selector">
+        <legend>Execution mode</legend>
+        <div class="segmented-control">
+          <label><input type="radio" name="mode" value="agent" checked><span>Maintenance</span></label>
+          <label><input type="radio" name="mode" value="demo"><span>Read-only demo</span></label>
+        </div>
+      </fieldset>
+
+      <form id="run-form">
+        <label for="repo-path">Repository</label>
+        <input id="repo-path" type="text" readonly value="Loading...">
+        <label for="task">Task</label>
+        <textarea id="task" name="task" maxlength="4000" rows="6" required>Fix the reported bug and add a focused regression test</textarea>
+
+        <div id="agent-settings">
+          <label for="base-ref">Base ref</label>
+          <input id="base-ref" type="text" maxlength="255" placeholder="HEAD">
+          <div class="toggle-list">
+            <label class="toggle-row" for="auto-approve">
+              <span><strong>Auto approve</strong><small>Skip the plan checkpoint</small></span>
+              <input id="auto-approve" type="checkbox">
+            </label>
+            <label class="toggle-row" for="allow-remote-model">
+              <span><strong>Remote model</strong><small>Allow selected code to leave this machine</small></span>
+              <input id="allow-remote-model" type="checkbox">
+            </label>
+          </div>
+        </div>
+
+        <div id="demo-settings" hidden>
+          <fieldset>
+            <legend>Sandbox image</legend>
+            <div class="segmented-control">
+              <label><input type="radio" name="image" value="repo-agent-python:0.1" checked><span>Python 3.11</span></label>
+              <label><input type="radio" name="image" value="repo-agent-maven:0.1"><span>Maven / Java 21</span></label>
+            </div>
+          </fieldset>
+          <details class="advanced-settings">
+            <summary>Advanced limits</summary>
+            <div class="advanced-grid">
+              <label for="max-steps">Max steps</label><input id="max-steps" type="number" min="1" max="16" step="1" value="8">
+              <label for="timeout-seconds">Tool timeout</label><div class="input-with-unit"><input id="timeout-seconds" type="number" min="1" max="120" step="1" value="30"><span>sec</span></div>
+              <label for="max-output-bytes">Max output</label>
+              <select id="max-output-bytes">
+                <option value="16384">16 KiB</option><option value="65536" selected>64 KiB</option><option value="131072">128 KiB</option><option value="262144">256 KiB</option>
+              </select>
+            </div>
+          </details>
+        </div>
+
+        <div class="form-error" id="form-error" role="alert" hidden></div>
+        <button class="primary-button" id="run-button" type="submit"><span aria-hidden="true">&#9654;</span><span id="run-button-label">Create maintenance run</span></button>
+      </form>
+
+      <section class="run-history" aria-labelledby="history-heading">
+        <div class="section-heading-row"><h3 id="history-heading">Recent runs</h3><span id="queue-summary">Queue 0</span></div>
+        <div id="run-list" class="run-list"></div>
+      </section>
+    </aside>
+
+    <section class="panel result-panel" aria-labelledby="result-heading" aria-busy="false">
+      <div class="panel-heading result-heading-row">
+        <div><p class="eyebrow">Selected run</p><h2 id="result-heading">Workflow result</h2></div>
+        <div class="result-actions">
+          <button class="secondary-button" id="copy-json" type="button" disabled title="Copy run JSON">Copy JSON</button>
+          <button class="secondary-button" id="download-json" type="button" disabled title="Download run JSON">Download</button>
+        </div>
+      </div>
+      <div class="tabs" role="tablist" aria-label="Result views">
+        <button id="summary-tab" role="tab" aria-selected="true" aria-controls="summary-view" type="button">Summary</button>
+        <button id="json-tab" role="tab" aria-selected="false" aria-controls="json-view" type="button" disabled>Raw JSON</button>
+      </div>
+
+      <div class="result-body">
+        <div class="empty-state" id="empty-state"><div class="empty-glyph" aria-hidden="true">&gt;_</div><p>No run selected</p></div>
+        <section id="summary-view" role="tabpanel" aria-labelledby="summary-tab" hidden>
+          <div class="run-status" id="run-status" data-tone="neutral">
+            <span class="run-status-mark" aria-hidden="true"></span>
+            <div><span class="run-status-label" id="run-status-label">Not started</span><span class="run-status-task" id="run-status-task"></span></div>
+          </div>
+          <div class="workflow-actions" id="workflow-actions" hidden>
+            <button class="primary-inline-button" id="approve-run" type="button">Approve plan</button>
+            <button class="danger-button" id="reject-run" type="button">Reject</button>
+            <button class="secondary-button" id="resume-run" type="button">Resume</button>
+            <button class="danger-button" id="cancel-run" type="button">Cancel</button>
+          </div>
+          <dl class="metrics">
+            <div><dt>Node</dt><dd id="metric-node">-</dd></div><div><dt>Tools</dt><dd id="metric-tools">0</dd></div>
+            <div><dt>Duration</dt><dd id="metric-duration">-</dd></div><div><dt>Tokens</dt><dd id="metric-tokens">0</dd></div>
+          </dl>
+
+          <section class="plan-section" id="plan-section" aria-labelledby="plan-heading" hidden>
+            <div class="section-heading-row"><h3 id="plan-heading">Change plan</h3><span id="plan-file-count"></span></div>
+            <p id="plan-goal"></p>
+            <div class="plan-columns">
+              <div><h4>Files</h4><ul id="plan-files"></ul></div><div><h4>Steps</h4><ol id="plan-steps"></ol></div>
+              <div><h4>Checks</h4><ul id="plan-checks"></ul></div><div><h4>Risks</h4><ul id="plan-risks"></ul></div>
+            </div>
+          </section>
+
+          <section class="answer-section" aria-labelledby="answer-heading">
+            <h3 id="answer-heading">Run summary</h3><p id="answer-text"></p><p class="run-error" id="run-error" hidden></p>
+          </section>
+          <section class="tools-section" aria-labelledby="tools-heading">
+            <div class="section-heading-row"><h3 id="tools-heading">Verification</h3><span id="tool-summary"></span></div>
+            <div class="tool-list" id="tool-list"></div>
+          </section>
+          <section class="artifact-section" id="artifact-section" aria-labelledby="artifacts-heading" hidden>
+            <h3 id="artifacts-heading">Artifacts</h3><div class="artifact-links" id="artifact-links"></div>
+          </section>
+        </section>
+        <section id="json-view" role="tabpanel" aria-labelledby="json-tab" hidden><pre id="json-output" tabindex="0"></pre></section>
+      </div>
+    </section>
+
+    <aside class="panel environment-panel" aria-labelledby="environment-heading">
+      <div class="panel-heading"><div><p class="eyebrow">Runtime</p><h2 id="environment-heading">Environment</h2></div></div>
+      <section class="environment-section" aria-labelledby="service-state-heading">
+        <div class="section-heading-row"><h3 id="service-state-heading">Agent service</h3><span class="contract-state">Durable</span></div>
+        <dl class="key-values"><div><dt>Status</dt><dd id="service-status">Loading</dd></div><div><dt>Queue</dt><dd id="service-queue">-</dd></div><div><dt>Model</dt><dd id="service-model">-</dd></div></dl>
+      </section>
+      <section class="environment-section" aria-labelledby="repository-state-heading">
+        <h3 id="repository-state-heading">Repository</h3>
+        <dl class="key-values"><div><dt>Branch</dt><dd id="repo-branch">-</dd></div><div><dt>HEAD</dt><dd id="repo-head">-</dd></div><div><dt>Changes</dt><dd id="repo-dirty">-</dd></div></dl>
+        <p class="commit-notice" id="commit-notice" hidden></p>
+      </section>
+      <section class="environment-section" aria-labelledby="docker-state-heading">
+        <h3 id="docker-state-heading">Docker engine</h3>
+        <dl class="key-values"><div><dt>Status</dt><dd id="docker-status">Checking</dd></div><div><dt>Context</dt><dd id="docker-context">-</dd></div><div><dt>Server</dt><dd id="docker-server">-</dd></div></dl>
+        <div class="image-list" id="image-list"></div>
+      </section>
+      <section class="environment-section" aria-labelledby="policy-heading"><h3 id="policy-heading">Sandbox policy</h3><dl class="policy-grid" id="policy-grid"></dl></section>
+      <section class="environment-section" aria-labelledby="checks-heading">
+        <div class="section-heading-row"><h3 id="checks-heading">Check execution</h3><span class="contract-state">Hardened</span></div>
+        <div class="check-profile-list" id="check-profile-list"></div>
+        <dl class="key-values check-contract"><div><dt>Bootstrap</dt><dd id="check-bootstrap">-</dd></div><div><dt>Verify</dt><dd id="check-verify">-</dd></div><div><dt>Timeout</dt><dd id="check-timeout">-</dd></div></dl>
+      </section>
+    </aside>
+  </main>
+  <script src="/app.js" defer></script>
+</body>
+</html>

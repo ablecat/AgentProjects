@@ -1,0 +1,11 @@
+diff --git a/tasklib/window.py b/tasklib/window.py
+--- a/tasklib/window.py
++++ b/tasklib/window.py
+@@ -8,6 +8,6 @@ def take_window(values: Sequence[T], offset: int, limit: int) -> list[T]:
+         raise ValueError("offset must be non-negative")
+     if limit < 1:
+         raise ValueError("limit must be positive")
+-    if offset > len(values):
++    if offset >= len(values):
+         raise IndexError("offset is past the end")
+     return list(values[offset : offset + limit])

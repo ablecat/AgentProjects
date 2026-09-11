@@ -1,0 +1,11 @@
+diff --git a/src/main/java/dev/repoagent/task/Backoff.java b/src/main/java/dev/repoagent/task/Backoff.java
+--- a/src/main/java/dev/repoagent/task/Backoff.java
++++ b/src/main/java/dev/repoagent/task/Backoff.java
+@@ -7,6 +7,6 @@ public final class Backoff {
+         if (baseMillis < 0 || attempt < 0 || attempt > 10) {
+             throw new IllegalArgumentException("invalid backoff input");
+         }
+-        return Math.multiplyExact(baseMillis, 1L << attempt);
++        return Math.multiplyExact(baseMillis, 1L << Math.max(0, attempt - 1));
+     }
+ }

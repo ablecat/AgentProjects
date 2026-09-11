@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "experiment_id": "repo-agent-day7-v1",
+  "suite_id": "repo-agent-python-java-day3-v1",
+  "matrix": {
+    "baseline": {
+      "task_count": 12,
+      "trials_per_task": 1,
+      "run_count": 12
+    },
+    "no-review": {
+      "task_count": 12,
+      "trials_per_task": 1,
+      "run_count": 12
+    },
+    "full": {
+      "task_count": 12,
+      "trials_per_task": 1,
+      "extra_trials": 2,
+      "extra_trial_task_ids": [
+        "py-bugfix-003",
+        "py-bugfix-004",
+        "java-bugfix-003",
+        "java-bugfix-006"
+      ],
+      "run_count": 20
+    },
+    "total_run_count": 44
+  },
+  "request_policy": {
+    "tool_choice": "auto (provider default)",
+    "parallel_tool_calls": false,
+    "store": false,
+    "temperature": null,
+    "seed": null,
+    "unsupported_parameters": ["temperature", "seed"],
+    "api_preference": ["responses", "chat_completions_fallback"]
+  },
+  "budget_policy": {
+    "agent_timeout_seconds": 1200,
+    "max_tool_calls": 30,
+    "max_tokens": 30000,
+    "max_changed_files": 12,
+    "max_changed_lines": 1200,
+    "max_patch_bytes": 65536,
+    "max_output_bytes": 65536
+  }
+}

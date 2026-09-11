@@ -1,0 +1,16 @@
+diff --git a/tasklib/defaults.py b/tasklib/defaults.py
+--- a/tasklib/defaults.py
++++ b/tasklib/defaults.py
+@@ -1,2 +1,2 @@
+-DEFAULT_LABELS = ("bug", "maintenance")
++DEFAULT_LABELS = ["bug", "maintenance"]
+ DEFAULT_RETRIES = 2
+diff --git a/tasklib/config.py b/tasklib/config.py
+--- a/tasklib/config.py
++++ b/tasklib/config.py
+@@ -3,4 +3,4 @@ from tasklib.defaults import DEFAULT_LABELS, DEFAULT_RETRIES
+ 
+ 
+ def new_config() -> dict[str, object]:
+-    return {"labels": list(DEFAULT_LABELS), "retries": DEFAULT_RETRIES}
++    return {"labels": DEFAULT_LABELS, "retries": DEFAULT_RETRIES}

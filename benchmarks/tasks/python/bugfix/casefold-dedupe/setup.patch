@@ -1,0 +1,12 @@
+diff --git a/tasklib/labels.py b/tasklib/labels.py
+--- a/tasklib/labels.py
++++ b/tasklib/labels.py
+@@ -7,7 +7,7 @@ def merge_labels(primary: Iterable[str], extra: Iterable[str]) -> list[str]:
+     result: list[str] = []
+     seen: set[str] = set()
+     for label in [*primary, *extra]:
+-        key = label.casefold()
++        key = label
+         if key in seen:
+             continue
+         seen.add(key)

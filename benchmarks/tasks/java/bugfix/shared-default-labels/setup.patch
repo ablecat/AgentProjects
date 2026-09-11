@@ -1,0 +1,12 @@
+diff --git a/src/main/java/dev/repoagent/task/IssueDraft.java b/src/main/java/dev/repoagent/task/IssueDraft.java
+--- a/src/main/java/dev/repoagent/task/IssueDraft.java
++++ b/src/main/java/dev/repoagent/task/IssueDraft.java
+@@ -4,7 +4,7 @@ import java.util.ArrayList;
+ import java.util.List;
+
+ public final class IssueDraft {
+-    private final List<String> labels = new ArrayList<>(Defaults.LABELS);
++    private final List<String> labels = Defaults.LABELS;
+
+     public void addLabel(String label) {
+         labels.add(label);

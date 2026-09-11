@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "suite_id": "repo-agent-python-java-day3-v1",
+  "languages": ["python", "java"],
+  "task_contract": "task.schema.json",
+  "validator": "validate.py",
+  "tasks": [
+    {
+      "id": "py-bugfix-001",
+      "path": "tasks/python/bugfix/trailing-separator",
+      "sha256": "9ec1bd6935ebe59e531b09e143f7e4faa766b08006ce22848ec2d79ac37b4f1c"
+    },
+    {
+      "id": "py-bugfix-002",
+      "path": "tasks/python/bugfix/end-offset",
+      "sha256": "22775f9cc5500d7ec5f2a25e265292a666456626c15ac4c4985814988a02e898"
+    },
+    {
+      "id": "py-bugfix-003",
+      "path": "tasks/python/bugfix/shared-defaults",
+      "sha256": "d5a424bd428571464df02e649d87674c448f701b5587ea05975bbc58e96b1727"
+    },
+    {
+      "id": "py-bugfix-004",
+      "path": "tasks/python/bugfix/json-error-boundary",
+      "sha256": "417243d18cbfaf03cca716445c147b22f4f369bfd1f190eb05d0957d61a42928"
+    },
+    {
+      "id": "py-bugfix-005",
+      "path": "tasks/python/bugfix/boolean-env",
+      "sha256": "911761278619a7291e184c2998f92f9b6976e2718224ce6c9f8cae7cc180dd58"
+    },
+    {
+      "id": "py-bugfix-006",
+      "path": "tasks/python/bugfix/casefold-dedupe",
+      "sha256": "4d58404be85738b9ef1e188eaa40fc6ed15b6557b7bdb89add5db9a76eba44bc"
+    },
+    {
+      "id": "java-bugfix-001",
+      "path": "tasks/java/bugfix/backoff-attempt",
+      "sha256": "a7108bf13318dfcc5330a330e0237b0d02270ec10ccf85752eb31d50b4c1198b"
+    },
+    {
+      "id": "java-bugfix-002",
+      "path": "tasks/java/bugfix/page-zero",
+      "sha256": "43b1160336ecda48857c7d37699a3e063bfce52008aa21ab73f7a3a9391543db"
+    },
+    {
+      "id": "java-bugfix-003",
+      "path": "tasks/java/bugfix/shared-default-labels",
+      "sha256": "be17939137b0f5e6fb067bf1a183bb252fb47cde37d1029436b2cb3504beaca8"
+    },
+    {
+      "id": "java-bugfix-004",
+      "path": "tasks/java/bugfix/malformed-retry-header",
+      "sha256": "9ca59502022c004632188c5f34d282ab2833bf524d7e6436508f48abaa7cd325"
+    },
+    {
+      "id": "java-bugfix-005",
+      "path": "tasks/java/bugfix/dotfile-extension",
+      "sha256": "2713ac33038470b786cba7502a95f8bb4fbd9b3ea3b0c08c3a57ccda8920b505"
+    },
+    {
+      "id": "java-bugfix-006",
+      "path": "tasks/java/bugfix/case-insensitive-labels",
+      "sha256": "588de603cc9511f6a37f5fc62eedc743b2f041a69fa4febe9dba20f5cb1dc2cd"
+    }
+  ],
+  "reserved_development_tasks": [
+    {
+      "id": "py-development-001",
+      "path": "tasks/python/development/configurable-path-exclusions",
+      "status": "reserved"
+    },
+    {
+      "id": "py-development-002",
+      "path": "tasks/python/development/json-report-exporter",
+      "status": "reserved"
+    },
+    {
+      "id": "py-development-003",
+      "path": "tasks/python/development/tool-timeout-budget",
+      "status": "reserved"
+    },
+    {
+      "id": "py-development-004",
+      "path": "tasks/python/development/severity-summary",
+      "status": "reserved"
+    }
+  ]
+}

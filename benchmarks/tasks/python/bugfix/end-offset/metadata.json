@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "id": "py-bugfix-002",
+  "slug": "end-offset",
+  "title": "Allow an empty window at the end offset",
+  "language": "python",
+  "kind": "bugfix",
+  "category": "boundary",
+  "difficulty": "easy",
+  "timeout_seconds": 10,
+  "assets": {
+    "baseline": "baseline",
+    "setup_patch": "setup.patch",
+    "issue": "issue.md",
+    "hidden_tests": "hidden_tests",
+    "gold_patch": "gold.patch"
+  },
+  "test_contract": {
+    "runner": "unittest",
+    "public_pattern": "test_*.py",
+    "hidden_pattern": "test_*.py",
+    "setup_public": "pass",
+    "setup_hidden": "fail",
+    "gold_public": "pass",
+    "gold_hidden": "pass",
+    "failure_signatures": ["test_offset_at_end", "test_zero_offset_for_empty_input"]
+  },
+  "constraints": {
+    "network": false,
+    "third_party_dependencies": [],
+    "python_min": "3.11"
+  }
+}

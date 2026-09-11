@@ -1,0 +1,58 @@
+diff --git a/tasklib/__init__.py b/tasklib/__init__.py
+--- a/tasklib/__init__.py
++++ b/tasklib/__init__.py
+@@ -1,5 +1,10 @@
+ """Repository finding helpers."""
+ 
+-from .findings import Finding, format_findings
++from .findings import Finding, SeveritySummary, format_findings, summarize_by_severity
+ 
+-__all__ = ["Finding", "format_findings"]
++__all__ = [
++    "Finding",
++    "SeveritySummary",
++    "format_findings",
++    "summarize_by_severity",
++]
+diff --git a/tasklib/findings.py b/tasklib/findings.py
+--- a/tasklib/findings.py
++++ b/tasklib/findings.py
+@@ -12,6 +12,13 @@ class Finding:
+     message: str
+ 
+ 
++@dataclass(frozen=True)
++class SeveritySummary:
++    severity: str
++    count: int
++    findings: tuple[Finding, ...]
++
++
+ def format_findings(findings: list[Finding]) -> str:
+     """Render findings in their source order."""
+ 
+@@ -19,3 +26,24 @@ def format_findings(findings: list[Finding]) -> str:
+         f"{finding.source}: {finding.severity}: {finding.message}\n"
+         for finding in findings
+     )
++
++
++def summarize_by_severity(
++    findings: list[Finding],
++) -> tuple[SeveritySummary, ...]:
++    """Group findings without changing severity or evidence order."""
++
++    order: list[str] = []
++    grouped: dict[str, list[Finding]] = {}
++    for finding in findings:
++        severity = finding.severity.strip().casefold()
++        if not severity:
++            raise ValueError("finding severity must not be blank")
++        if severity not in grouped:
++            order.append(severity)
++            grouped[severity] = []
++        grouped[severity].append(finding)
++    return tuple(
++        SeveritySummary(severity, len(grouped[severity]), tuple(grouped[severity]))
++        for severity in order
++    )

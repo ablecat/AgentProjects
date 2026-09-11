@@ -1,0 +1,12 @@
+diff --git a/src/main/java/dev/repoagent/task/Labels.java b/src/main/java/dev/repoagent/task/Labels.java
+--- a/src/main/java/dev/repoagent/task/Labels.java
++++ b/src/main/java/dev/repoagent/task/Labels.java
+@@ -13,7 +13,7 @@ public final class Labels {
+         Set<String> seen = new HashSet<>();
+         for (String label : labels) {
+             String normalized = label.strip();
+-            if (!normalized.isEmpty() && seen.add(normalized.toLowerCase(Locale.ROOT))) {
++            if (!normalized.isEmpty() && seen.add(normalized)) {
+                 result.add(normalized);
+             }
+         }

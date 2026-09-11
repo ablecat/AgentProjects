@@ -1,11 +1,14 @@
 .git
 .venv
+*.egg-info
 .tmp
+.tmp-*
 artifacts
 __pycache__
 .pytest_cache
 .ruff_cache
 .mypy_cache
 *.log
+.coverage-*
 .env
 .env.*
