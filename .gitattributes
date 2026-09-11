@@ -1,4 +1,5 @@
 benchmarks/**/*.json text eol=lf
+benchmarks/**/*.jsonl text eol=lf
 benchmarks/**/*.md text eol=lf
 benchmarks/**/*.patch text eol=lf whitespace=-blank-at-eol
 benchmarks/**/*.py text eol=lf

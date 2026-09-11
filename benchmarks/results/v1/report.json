@@ -1,0 +1,118 @@
+{
+  "all_run_success": {
+    "baseline": {
+      "jobs": 12,
+      "rate": 0.8333333333333334,
+      "solved": 10
+    },
+    "full": {
+      "jobs": 20,
+      "rate": 0.05,
+      "solved": 1
+    },
+    "no-review": {
+      "jobs": 12,
+      "rate": 0.25,
+      "solved": 3
+    }
+  },
+  "completed_at": "2026-09-11T18:50:05.336Z",
+  "completed_job_count": 44,
+  "cost_usd": null,
+  "execution_started": true,
+  "experiment_id": "repo-agent-day7-v1",
+  "experiment_manifest_sha256": "ede02ea66d67161d28ac8be417928a833df3d76498875fa3703647f304718f79",
+  "failure_analysis_path": "failure-analysis.json",
+  "failure_categories": {
+    "budget_exceeded": 29,
+    "regression_not_reproduced": 1
+  },
+  "job_count": 44,
+  "language_success": {
+    "java": {
+      "jobs": 18,
+      "rate": 0.2222222222222222,
+      "solved": 4
+    },
+    "python": {
+      "jobs": 18,
+      "rate": 0.5555555555555556,
+      "solved": 10
+    }
+  },
+  "latency_ms": {
+    "p50": 120515.5,
+    "p95": 641810.95
+  },
+  "manifest_sha256": "b31765f66d6e499960a04b713eaae6dc5499efd1d2091bebc2febb1400074cae",
+  "model": "gpt-5.6-sol",
+  "pass_at_1": 0.3888888888888889,
+  "patch_bytes": {
+    "mean": 559.9772727272727,
+    "p50": 0.0,
+    "p95": 1664.95,
+    "total": 24639
+  },
+  "price_source": "unavailable",
+  "repeat_stability": {
+    "java-bugfix-003": {
+      "all_solved": false,
+      "rate": 0.0,
+      "solved": 0,
+      "trials": 3
+    },
+    "java-bugfix-006": {
+      "all_solved": false,
+      "rate": 0.0,
+      "solved": 0,
+      "trials": 3
+    },
+    "py-bugfix-003": {
+      "all_solved": false,
+      "rate": 0.0,
+      "solved": 0,
+      "trials": 3
+    },
+    "py-bugfix-004": {
+      "all_solved": false,
+      "rate": 0.3333333333333333,
+      "solved": 1,
+      "trials": 3
+    }
+  },
+  "report_path": "report.json",
+  "results_path": "results.jsonl",
+  "results_sha256": "1f083cdf6ce1630ec50da47cadf3b16a7e628c09c23f10e697bc407549579761",
+  "schema_version": 1,
+  "solved_job_count": 14,
+  "status": "completed",
+  "suite_id": "repo-agent-python-java-day3-v1",
+  "test_restoration_rate": 0.36363636363636365,
+  "tokens": {
+    "cached_input": 54656,
+    "complete": true,
+    "input": 1222140,
+    "output": 95306,
+    "total": 1317446
+  },
+  "tool_error_rate": 0.2515991471215352,
+  "trial_one_job_count": 36,
+  "trial_one_solved_job_count": 14,
+  "variant_success": {
+    "baseline": {
+      "jobs": 12,
+      "rate": 0.8333333333333334,
+      "solved": 10
+    },
+    "full": {
+      "jobs": 12,
+      "rate": 0.08333333333333333,
+      "solved": 1
+    },
+    "no-review": {
+      "jobs": 12,
+      "rate": 0.25,
+      "solved": 3
+    }
+  }
+}

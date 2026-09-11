@@ -11,9 +11,9 @@ repository.
 
 The repository includes a Typer CLI, a loopback visual workspace, an
 authenticated FastAPI service, resumable LangGraph orchestration, Python and
-Maven sandboxes, and a frozen evaluation suite. No benchmark score is claimed
-in this README; model-backed results must be generated from the locked suite and
-reviewed as evaluation artifacts.
+Maven sandboxes, and a frozen evaluation suite. Locked v1 model results are
+published below and in `benchmarks/results/v1`; the sanitized `results.jsonl`
+is the source of truth.
 
 ## What it does
 
@@ -309,6 +309,47 @@ Additional boundaries:
 The model provider is still an external trust boundary. Only use a remote
 endpoint for repositories whose relevant code and task text may be disclosed to
 that provider.
+
+## Measured benchmark results (v1)
+
+The locked 44-job evaluation completed with `gpt-5.6-sol` on 2026-09-12
+(UTC+8). Every number below is recomputable from
+[`results.jsonl`](benchmarks/results/v1/results.jsonl), whose SHA-256 is
+`1f083cdf6ce1630ec50da47cadf3b16a7e628c09c23f10e697bc407549579761`.
+The relay's token prices were not independently verified, so cost is not
+reported.
+
+The primary comparison uses only trial 1:
+
+| Variant | Solved | Python | Java | Agent p50 | Agent p95 |
+|---|---:|---:|---:|---:|---:|
+| `baseline` | 10/12 | 6/6 | 4/6 | 72.1 s | 370.4 s |
+| `no-review` | 3/12 | 3/6 | 0/6 | 347.4 s | 693.6 s |
+| `full` | 1/12 | 1/6 | 0/6 | 238.1 s | 633.0 s |
+
+This is a negative result for the complete architecture on the locked suite.
+`full` missed the predeclared quality bar of 8/12 with at least 4/6 in each
+language. It solved nine fewer tasks than `baseline` and two fewer than
+`no-review`, so the results do not support either the complete-architecture or
+independent-review benefit claims.
+
+Across all 44 runs, all evaluations completed and 14 were solved. Agent latency
+was 120.5 s p50 and 641.8 s p95, so the eight-minute p95 target was missed. The
+30 failures were 29 `budget_exceeded` and one
+`regression_not_reproduced`; no run hit the 20-minute hard timeout. Regression
+tests were restored in 16/44 runs, and 118/469 tool calls returned errors
+(25.16%). Complete usage reporting recorded 1,317,446 tokens: 1,222,140 input
+(including 54,656 cached input) and 95,306 output. Cost remains `null` with
+`price_source=unavailable`.
+
+The four repeated `full` tasks produced `0/3` for `py-bugfix-003`, `1/3` for
+`py-bugfix-004`, `0/3` for `java-bugfix-003`, and `0/3` for
+`java-bugfix-006`. Three are consistent failures and one is inconsistent; none
+demonstrates stable success. See
+[`report.json`](benchmarks/results/v1/report.json) and
+[`failure-analysis.json`](benchmarks/results/v1/failure-analysis.json) for the
+derived aggregates and failed-job inventory. These measurements characterize
+this model, budget, and locked suite only.
 
 ## Evaluation and reproduction
 

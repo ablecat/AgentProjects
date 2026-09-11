@@ -8,8 +8,8 @@ clone 中修改代码，再用加固的 Docker 容器验证结果，最后交付
 检查。它不会把补丁自动应用、提交或推送到原仓库。
 
 项目包含 Typer CLI、本机可视化工作台、带认证的 FastAPI 服务、可恢复的
-LangGraph 工作流、Python/Maven 沙箱和冻结评测集。本 README 不声明任何模型评测
-分数；真实模型结果必须由锁定评测集生成，并以评测产物为准。
+LangGraph 工作流、Python/Maven 沙箱和冻结评测集。锁定的 v1 模型实测结果见下文
+及 `benchmarks/results/v1`；脱敏后的 `results.jsonl` 是唯一数据源。
 
 ## 核心能力
 
@@ -287,6 +287,43 @@ Windows 默认把持久化数据保存到 `%LOCALAPPDATA%\repo-agent`，可用 `
 
 模型服务本身仍是外部信任边界。只有当仓库允许把相关代码和任务文本发送给该服务
 时，才应授权远程模型。
+
+## v1 实测结果
+
+锁定的 44-job 评测已于 2026-09-12（UTC+8）使用 `gpt-5.6-sol` 完成。下列
+数字均可从 [`results.jsonl`](benchmarks/results/v1/results.jsonl) 重新计算；该文件
+SHA-256 为
+`1f083cdf6ce1630ec50da47cadf3b16a7e628c09c23f10e697bc407549579761`。
+中转站 token 单价未经独立核实，因此不报告费用。
+
+主比较只使用 trial 1：
+
+| Variant | 解决数 | Python | Java | Agent p50 | Agent p95 |
+|---|---:|---:|---:|---:|---:|
+| `baseline` | 10/12 | 6/6 | 4/6 | 72.1 秒 | 370.4 秒 |
+| `no-review` | 3/12 | 3/6 | 0/6 | 347.4 秒 | 693.6 秒 |
+| `full` | 1/12 | 1/6 | 0/6 | 238.1 秒 | 633.0 秒 |
+
+这是完整架构在该锁定评测集上的负面结果。`full` 未达到预声明的 8/12 总门槛，
+Python 和 Java 也未分别达到 4/6；它比 `baseline` 少解决 9 题，比
+`no-review` 少解决 2 题。因此，本次结果不支持“完整架构提升成功率”或“独立
+review 带来收益”这两个正向结论。
+
+全部 44 次运行均完成评测，其中 14 次解决任务。Agent 延迟为 p50 120.5 秒、
+p95 641.8 秒，未达到 p95 不超过 8 分钟的目标。30 个失败包括 29 个
+`budget_exceeded` 和 1 个 `regression_not_reproduced`；没有运行触发 20 分钟硬
+超时。16/44 次运行成功恢复回归测试，469 次工具调用中有 118 次返回错误
+（25.16%）。完整 usage 记录为 1,317,446 tokens：1,222,140 input（其中
+54,656 cached input）和 95,306 output。费用保持 `null`，
+`price_source=unavailable`。
+
+四个 `full` 重复任务的结果分别为：`py-bugfix-003` 为 0/3、
+`py-bugfix-004` 为 1/3、`java-bugfix-003` 为 0/3、`java-bugfix-006` 为
+0/3。三个任务是结果一致的失败，一个任务结果不一致，没有任务表现出稳定成功。
+派生汇总和失败任务清单见
+[`report.json`](benchmarks/results/v1/report.json) 与
+[`failure-analysis.json`](benchmarks/results/v1/failure-analysis.json)。这些实测
+只描述当前模型、预算和锁定评测集，不能外推到其他仓库。
 
 ## 评测与复现
 

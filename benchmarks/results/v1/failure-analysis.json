@@ -1,0 +1,252 @@
+{
+  "experiment_id": "repo-agent-day7-v1",
+  "failed_jobs": [
+    {
+      "error": "model token budget exceeded 30000 tokens",
+      "failure_category": "budget_exceeded",
+      "status": "completed",
+      "task_id": "java-bugfix-004",
+      "trial": 1,
+      "variant": "baseline"
+    },
+    {
+      "error": "model token budget exceeded 30000 tokens",
+      "failure_category": "budget_exceeded",
+      "status": "completed",
+      "task_id": "java-bugfix-006",
+      "trial": 1,
+      "variant": "baseline"
+    },
+    {
+      "error": "RuntimeError: model token budget exceeded (30000)",
+      "failure_category": "budget_exceeded",
+      "status": "completed",
+      "task_id": "py-bugfix-003",
+      "trial": 1,
+      "variant": "no-review"
+    },
+    {
+      "error": "RuntimeError: model token budget exceeded (30000)",
+      "failure_category": "budget_exceeded",
+      "status": "completed",
+      "task_id": "py-bugfix-004",
+      "trial": 1,
+      "variant": "no-review"
+    },
+    {
+      "error": "RuntimeError: model token budget exceeded (30000)",
+      "failure_category": "budget_exceeded",
+      "status": "completed",
+      "task_id": "py-bugfix-005",
+      "trial": 1,
+      "variant": "no-review"
+    },
+    {
+      "error": "RuntimeError: model token budget exceeded (30000)",
+      "failure_category": "budget_exceeded",
+      "status": "completed",
+      "task_id": "java-bugfix-001",
+      "trial": 1,
+      "variant": "no-review"
+    },
+    {
+      "error": "RuntimeError: model token budget exceeded (30000)",
+      "failure_category": "budget_exceeded",
+      "status": "completed",
+      "task_id": "java-bugfix-002",
+      "trial": 1,
+      "variant": "no-review"
+    },
+    {
+      "error": "RuntimeError: model token budget exceeded (30000)",
+      "failure_category": "budget_exceeded",
+      "status": "completed",
+      "task_id": "java-bugfix-003",
+      "trial": 1,
+      "variant": "no-review"
+    },
+    {
+      "error": "RuntimeError: model token budget exceeded (30000)",
+      "failure_category": "budget_exceeded",
+      "status": "completed",
+      "task_id": "java-bugfix-004",
+      "trial": 1,
+      "variant": "no-review"
+    },
+    {
+      "error": "RuntimeError: model token budget exceeded (30000)",
+      "failure_category": "budget_exceeded",
+      "status": "completed",
+      "task_id": "java-bugfix-005",
+      "trial": 1,
+      "variant": "no-review"
+    },
+    {
+      "error": "RuntimeError: model token budget exceeded (30000)",
+      "failure_category": "budget_exceeded",
+      "status": "completed",
+      "task_id": "java-bugfix-006",
+      "trial": 1,
+      "variant": "no-review"
+    },
+    {
+      "error": "RuntimeError: model token budget exceeded (30000)",
+      "failure_category": "budget_exceeded",
+      "status": "completed",
+      "task_id": "py-bugfix-001",
+      "trial": 1,
+      "variant": "full"
+    },
+    {
+      "error": "RuntimeError: model token budget exceeded (30000)",
+      "failure_category": "budget_exceeded",
+      "status": "completed",
+      "task_id": "py-bugfix-002",
+      "trial": 1,
+      "variant": "full"
+    },
+    {
+      "error": "RuntimeError: model token budget exceeded (30000)",
+      "failure_category": "budget_exceeded",
+      "status": "completed",
+      "task_id": "py-bugfix-003",
+      "trial": 1,
+      "variant": "full"
+    },
+    {
+      "error": null,
+      "failure_category": "regression_not_reproduced",
+      "status": "completed",
+      "task_id": "py-bugfix-005",
+      "trial": 1,
+      "variant": "full"
+    },
+    {
+      "error": "RuntimeError: model token budget exceeded (30000)",
+      "failure_category": "budget_exceeded",
+      "status": "completed",
+      "task_id": "py-bugfix-006",
+      "trial": 1,
+      "variant": "full"
+    },
+    {
+      "error": "RuntimeError: model token budget exceeded (30000)",
+      "failure_category": "budget_exceeded",
+      "status": "completed",
+      "task_id": "java-bugfix-001",
+      "trial": 1,
+      "variant": "full"
+    },
+    {
+      "error": "RuntimeError: model token budget exceeded (30000)",
+      "failure_category": "budget_exceeded",
+      "status": "completed",
+      "task_id": "java-bugfix-002",
+      "trial": 1,
+      "variant": "full"
+    },
+    {
+      "error": "RuntimeError: model token budget exceeded (30000)",
+      "failure_category": "budget_exceeded",
+      "status": "completed",
+      "task_id": "java-bugfix-003",
+      "trial": 1,
+      "variant": "full"
+    },
+    {
+      "error": "RuntimeError: model token budget exceeded (30000)",
+      "failure_category": "budget_exceeded",
+      "status": "completed",
+      "task_id": "java-bugfix-004",
+      "trial": 1,
+      "variant": "full"
+    },
+    {
+      "error": "RuntimeError: model token budget exceeded (30000)",
+      "failure_category": "budget_exceeded",
+      "status": "completed",
+      "task_id": "java-bugfix-005",
+      "trial": 1,
+      "variant": "full"
+    },
+    {
+      "error": "RuntimeError: model token budget exceeded (30000)",
+      "failure_category": "budget_exceeded",
+      "status": "completed",
+      "task_id": "java-bugfix-006",
+      "trial": 1,
+      "variant": "full"
+    },
+    {
+      "error": "RuntimeError: model token budget exceeded (30000)",
+      "failure_category": "budget_exceeded",
+      "status": "completed",
+      "task_id": "py-bugfix-003",
+      "trial": 2,
+      "variant": "full"
+    },
+    {
+      "error": "RuntimeError: model token budget exceeded (30000)",
+      "failure_category": "budget_exceeded",
+      "status": "completed",
+      "task_id": "py-bugfix-004",
+      "trial": 2,
+      "variant": "full"
+    },
+    {
+      "error": "RuntimeError: model token budget exceeded (30000)",
+      "failure_category": "budget_exceeded",
+      "status": "completed",
+      "task_id": "java-bugfix-003",
+      "trial": 2,
+      "variant": "full"
+    },
+    {
+      "error": "RuntimeError: model token budget exceeded (30000)",
+      "failure_category": "budget_exceeded",
+      "status": "completed",
+      "task_id": "java-bugfix-006",
+      "trial": 2,
+      "variant": "full"
+    },
+    {
+      "error": "RuntimeError: model token budget exceeded (30000)",
+      "failure_category": "budget_exceeded",
+      "status": "completed",
+      "task_id": "py-bugfix-003",
+      "trial": 3,
+      "variant": "full"
+    },
+    {
+      "error": "RuntimeError: model token budget exceeded (30000)",
+      "failure_category": "budget_exceeded",
+      "status": "completed",
+      "task_id": "py-bugfix-004",
+      "trial": 3,
+      "variant": "full"
+    },
+    {
+      "error": "RuntimeError: model token budget exceeded (30000)",
+      "failure_category": "budget_exceeded",
+      "status": "completed",
+      "task_id": "java-bugfix-003",
+      "trial": 3,
+      "variant": "full"
+    },
+    {
+      "error": "RuntimeError: model token budget exceeded (30000)",
+      "failure_category": "budget_exceeded",
+      "status": "completed",
+      "task_id": "java-bugfix-006",
+      "trial": 3,
+      "variant": "full"
+    }
+  ],
+  "failure_categories": {
+    "budget_exceeded": 29,
+    "regression_not_reproduced": 1
+  },
+  "results_sha256": "1f083cdf6ce1630ec50da47cadf3b16a7e628c09c23f10e697bc407549579761",
+  "schema_version": 1,
+  "suite_id": "repo-agent-python-java-day3-v1"
+}
