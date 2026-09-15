@@ -102,12 +102,13 @@ class RunMetrics(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    # Runtime policy caps execution; the record keeps real overage values for diagnosis.
     node_count: int = Field(default=0, ge=0)
-    tool_calls: int = Field(default=0, ge=0, le=30)
+    tool_calls: int = Field(default=0, ge=0)
     repair_attempts: int = Field(default=0, ge=0, le=2)
     review_repairs: int = Field(default=0, ge=0, le=1)
     duration_ms: int = Field(default=0, ge=0)
-    tokens: int = Field(default=0, ge=0, le=30000)
+    tokens: int = Field(default=0, ge=0)
 
 
 class RunRecord(BaseModel):

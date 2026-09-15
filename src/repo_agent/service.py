@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import os
 import importlib
+import math
+import os
 from dataclasses import dataclass, replace
 from pathlib import Path
 import queue
@@ -47,7 +48,7 @@ def run_agent(
 ) -> RunResult:
     """Run once against a fresh candidate cloned from committed HEAD."""
 
-    if not isinstance(task, str) or not task.strip():
+    if not isinstance(task, str) or not task.strip() or "\x00" in task:
         raise ValueError("task must contain non-whitespace text")
     normalized_task = task.strip()
     if type(allow_mutations) is not bool:
@@ -367,6 +368,8 @@ class RunService:
                 self._worker.start()
 
     def close(self, *, timeout: float = 10.0) -> None:
+        validated_timeout = _validated_non_negative_timeout(timeout)
+        assert validated_timeout is not None
         with self._close_lock:
             lease = self._lease
             if lease is None or not lease.held:
@@ -390,7 +393,7 @@ class RunService:
                         pass
 
             if worker is not None and worker is not threading.current_thread():
-                worker.join(timeout=max(0.0, timeout))
+                worker.join(timeout=validated_timeout)
             if worker is not None and worker.is_alive():
                 raise TimeoutError(
                     "run service worker did not stop before the close timeout; "
@@ -610,10 +613,17 @@ class RunService:
         timeout: float | None = None,
         stop_at_approval: bool = True,
     ) -> RunRecord:
+        validated_timeout = _validated_non_negative_timeout(
+            timeout, optional=True
+        )
+        if type(stop_at_approval) is not bool:
+            raise ValueError("stop_at_approval must be a boolean")
         run_id = _validated_run_id(run_id)
-        if timeout is not None and (timeout < 0 or timeout == float("inf")):
-            raise ValueError("timeout must be a finite non-negative number")
-        deadline = None if timeout is None else time.monotonic() + timeout
+        deadline = (
+            None
+            if validated_timeout is None
+            else time.monotonic() + validated_timeout
+        )
         with self._condition:
             while True:
                 record = self.get_run(run_id)
@@ -960,7 +970,7 @@ def _validated_copy(record: RunRecord, **updates: Any) -> RunRecord:
 
 
 def _validated_task(value: object) -> str:
-    if not isinstance(value, str) or not value.strip():
+    if not isinstance(value, str) or not value.strip() or "\x00" in value:
         raise ValueError("task must contain non-whitespace text")
     normalized = value.strip()
     if len(normalized) > 4000:
@@ -986,12 +996,34 @@ def _validated_base_ref(value: object) -> str | None:
 def _validated_reason(value: object) -> str | None:
     if value is None:
         return None
-    if not isinstance(value, str):
+    if not isinstance(value, str) or "\x00" in value:
         raise ValueError("reason must be text")
     normalized = value.strip()
     if len(normalized) > 2000:
         raise ValueError("reason must be at most 2000 characters")
     return normalized or None
+
+
+def _validated_non_negative_timeout(
+    value: object, *, optional: bool = False
+) -> float | None:
+    if value is None:
+        if optional:
+            return None
+        raise ValueError("timeout must be a finite non-negative number")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("timeout must be a finite non-negative number")
+    try:
+        timeout = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("timeout must be a finite non-negative number") from exc
+    if (
+        not math.isfinite(timeout)
+        or timeout < 0
+        or timeout > threading.TIMEOUT_MAX
+    ):
+        raise ValueError("timeout must be a finite non-negative number")
+    return timeout
 
 
 def _validated_run_id(value: object) -> str:

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-import subprocess
+
+from .processes import run_isolated_capture
 
 
 _AUTOCRLF_ALIASES = {
@@ -51,7 +52,7 @@ def effective_core_autocrlf(
         }
     )
     try:
-        completed = subprocess.run(
+        completed = run_isolated_capture(
             (
                 "git",
                 "-C",
@@ -64,20 +65,20 @@ def effective_core_autocrlf(
                 "--get",
                 "core.autocrlf",
             ),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
             env=environment,
-            shell=False,
-            timeout=timeout_seconds,
+            timeout_seconds=timeout_seconds,
+            max_stdout_bytes=17,
+            max_stderr_bytes=1024,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except OSError as exc:
         raise RuntimeError("could not read the Git line-ending configuration") from exc
+    if completed.timed_out:
+        raise RuntimeError("could not read the Git line-ending configuration")
     if completed.returncode == 1:
         return "false"
     if completed.returncode != 0:
         raise RuntimeError("could not read the Git line-ending configuration")
-    if len(completed.stdout) > 16:
+    if completed.stdout_truncated or len(completed.stdout) > 16:
         raise RuntimeError("Git core.autocrlf is not a supported value")
     try:
         value = completed.stdout.decode("ascii", errors="strict").strip().casefold()

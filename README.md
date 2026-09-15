@@ -20,13 +20,16 @@ is the source of truth.
 - Accepts a clean, committed local Git repository and a natural-language
   maintenance task.
 - Builds a bounded repository map and lets the model use seven typed tools:
-  `list_files`, `read_file`, `search_code`, `apply_patch`, `get_diff`,
-  `run_check`, and `finish`.
+  `list_files`, `read_file`, `read_files`, `search_code`, `apply_patch`,
+  `get_diff`, and `finish`.
 - Produces a structured change plan and waits for explicit approval unless
   auto-approval was requested.
 - Applies model patches only in a run-owned candidate clone, then runs
   deterministic `pytest` or Maven checks in Docker.
-- Allows up to two verification repairs and one independent review repair.
+- Allows at most one verification repair. Independent review is one response;
+  rejection is terminal and preserves the candidate for inspection.
+- Enforces non-borrowable model budgets of 4,000 tokens for planning, 23,500
+  across implementation and repair, and 2,500 for review (30,000 total).
 - Checkpoints every workflow boundary in SQLite so an interrupted run can
   resume without intentionally repeating completed side effects.
 - Publishes `patch.diff`, `report.md`, `run.json`, `trace.jsonl`, and bounded
@@ -60,8 +63,7 @@ The fixed maintenance path is:
 
 ```text
 prepare -> baseline_check -> inspect_and_plan -> approval -> implement
-        -> verify -> repair (at most 2) -> review
-        -> review_repair (at most 1) -> finalize
+        -> verify -> repair (at most 1) -> review -> finalize
 ```
 
 Planning is read-only. Verification is deterministic and cannot be skipped by
@@ -169,14 +171,15 @@ Non-loopback model endpoints must use HTTPS and require
 `--allow-remote-model`. That authorization matters: task text and the code
 fragments selected by tool calls can be sent to the configured provider.
 
-### Saved Windows relay configuration
+### Saved Windows DeepSeek configuration
 
-For the configured relay at `https://thz10.airucas.com/v1`, the helper can
+For the official DeepSeek API at `https://api.deepseek.com`, the helper can
 discover models, run the doctor probe, and save the key, Base URL, and model as
-one Windows DPAPI CurrentUser-encrypted document:
+one Windows DPAPI CurrentUser-encrypted document. The configured model is
+`deepseek-v4-pro`:
 
 ```powershell
-./scripts/start-relay.ps1 -Reconfigure -ConfigureOnly
+./scripts/start-relay.ps1 -Reconfigure -ConfigureOnly -Model deepseek-v4-pro
 ./scripts/start-relay.ps1 -Repository D:\path\to\clean-repository -OpenBrowser
 ```
 
@@ -303,8 +306,11 @@ Additional boundaries:
   changes are rejected.
 - Host home, SSH configuration, model credentials, and the Docker socket are
   never mounted into tool or check containers.
-- Output and artifacts are bounded and redacted. Containers are named/labeled
-  per run and cleanup targets exact IDs; no global prune is used.
+- Logs and structured artifacts are bounded and redacted. `patch.diff` is kept
+  byte-for-byte applicable; a configured secret or high-confidence credential
+  pattern makes patch persistence fail closed instead of rewriting the diff.
+  Containers are named/labeled per run and cleanup targets exact IDs; no global
+  prune is used.
 
 The model provider is still an external trust boundary. Only use a remote
 endpoint for repositories whose relevant code and task text may be disclosed to
@@ -313,7 +319,7 @@ that provider.
 ## Measured benchmark results (v1)
 
 The locked 44-job evaluation completed with `gpt-5.6-sol` on 2026-09-12
-(UTC+8). Every number below is recomputable from
+(UTC+8). The published v1 table and aggregate statistics are recomputable from
 [`results.jsonl`](benchmarks/results/v1/results.jsonl), whose SHA-256 is
 `1f083cdf6ce1630ec50da47cadf3b16a7e628c09c23f10e697bc407549579761`.
 The relay's token prices were not independently verified, so cost is not
@@ -332,6 +338,14 @@ This is a negative result for the complete architecture on the locked suite.
 language. It solved nine fewer tasks than `baseline` and two fewer than
 `no-review`, so the results do not support either the complete-architecture or
 independent-review benefit claims.
+
+The immutable v1 scorer missed pytest `SUBFAILED` output for the trial-1
+`full` `py-bugfix-005` candidate. The corrected interpretation is 2/12 overall
+and 2/6 Python after applying the fixed attribution rule to the preserved
+scoring evidence; those corrected figures are intentionally not written into
+the immutable JSONL. They still miss every release threshold. See
+[`benchmarks/ERRATA.md`](benchmarks/ERRATA.md); the three published v1 result
+files and their digest are unchanged.
 
 Across all 44 runs, all evaluations completed and 14 were solved. Agent latency
 was 120.5 s p50 and 641.8 s p95, so the eight-minute p95 target was missed. The
@@ -357,6 +371,34 @@ The frozen suite contains six Python and six Java bug-fix tasks. Candidate
 Agents see a buggy setup, its public tests, and `issue.md`; independent scoring
 withholds `hidden_tests`, `gold.patch`, and expected failure signatures. A
 candidate is not solved merely because its workflow status is `succeeded`.
+
+Before a new formal run, tune only against the four non-formal development
+fixtures. With saved Windows relay configuration, the restricted helper runs
+the fixed four-task `full` command and writes to a fresh ignored directory:
+
+```powershell
+./scripts/start-relay.ps1 -Evaluate
+```
+
+The helper exits successfully only when at least 3/4 tasks are solved, every
+task stays within budget, and `actionable_tool_error_rate <= 5%`.
+
+After freezing the code, prompt, model, and budgets, the separate restricted
+formal acceptance entry point runs only the twelve-task `full` trial 1 and
+writes to a fresh `evaluation-results/formal-v1-regression-acceptance/`
+directory:
+
+```powershell
+./scripts/start-relay.ps1 -FormalEvaluate
+```
+
+It succeeds only at `>=8/12`, with Python and Java each at `>=4/6`, complete
+per-task usage within 30,000 tokens, no timeouts or budget failures, and p95
+latency at most 480 seconds. This is a v1 regression acceptance run, not a new
+holdout or a 44-job matrix rerun; it never writes `benchmarks/results/v1`.
+
+The generic CLI accepts that development suite only in single-variant mode;
+matrix, canary, shard, and merge modes remain restricted to the formal suite.
 
 Validate suite locks without Docker:
 
@@ -453,7 +495,9 @@ python ./scripts/smoke-day6.py
 
 For a reproducible walkthrough, follow [docs/DEMO.md](docs/DEMO.md). Detailed
 Chinese operating notes are in
-[docs/USER_GUIDE.zh-CN.md](docs/USER_GUIDE.zh-CN.md).
+[docs/USER_GUIDE.zh-CN.md](docs/USER_GUIDE.zh-CN.md). The failure-injection and
+boundary-test matrix is documented in
+[docs/EXTREME_TESTING.zh-CN.md](docs/EXTREME_TESTING.zh-CN.md).
 
 ## License
 

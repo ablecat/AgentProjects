@@ -1280,6 +1280,7 @@ def test_malformed_or_timed_out_create_recovers_owned_container_by_exact_id(
     ("kwargs", "message"),
     [
         ({"phase_timeout_seconds": 301}, "phase_timeout_seconds"),
+        ({"phase_timeout_seconds": 10**1000}, "phase_timeout_seconds"),
         ({"total_timeout_seconds": 1201}, "total_timeout_seconds"),
         ({"max_output_bytes": 1023}, "max_output_bytes"),
         ({"max_output_bytes": MAX_CHECK_OUTPUT_BYTES + 1}, "max_output_bytes"),
@@ -1690,7 +1691,7 @@ def test_host_git_timeouts_are_capped_by_remaining_run_budget(
     started = 100.0
     clock = [started]
     total_timeout = 10.0
-    original_run = subprocess.run
+    original_run = checks_module.run_isolated_capture
     observed: list[tuple[float | None, float]] = []
     check_runner = CheckRunner(
         repo,
@@ -1702,13 +1703,13 @@ def test_host_git_timeouts_are_capped_by_remaining_run_budget(
 
     def advance_after_git(*args, **kwargs):
         remaining = total_timeout - (clock[0] - started)
-        observed.append((kwargs.get("timeout"), remaining))
+        observed.append((kwargs.get("timeout_seconds"), remaining))
         completed = original_run(*args, **kwargs)
         clock[0] += 0.5
         return completed
 
     monkeypatch.setattr(checks_module.time, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(checks_module.subprocess, "run", advance_after_git)
+    monkeypatch.setattr(checks_module, "run_isolated_capture", advance_after_git)
 
     result = check_runner.run()
 
@@ -1727,7 +1728,7 @@ def test_fresh_copy_stops_host_git_after_deadline(
     started = 200.0
     clock = [started]
     deadline = started + 1.0
-    original_run = subprocess.run
+    original_run = checks_module.run_isolated_capture
     late_git_commands: list[tuple[str, ...]] = []
 
     def expire_after_fresh_clone(*args, **kwargs):
@@ -1740,7 +1741,7 @@ def test_fresh_copy_stops_host_git_after_deadline(
         return completed
 
     monkeypatch.setattr(checks_module.time, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(checks_module.subprocess, "run", expire_after_fresh_clone)
+    monkeypatch.setattr(checks_module, "run_isolated_capture", expire_after_fresh_clone)
     docker = FakeDockerRunner()
 
     result = CheckRunner(

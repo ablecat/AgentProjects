@@ -136,6 +136,261 @@ def test_security_headers_preserve_existing_values() -> None:
     assert messages[1] == {"type": "http.response.body", "body": b"ok"}
 
 
+def test_request_body_limit_replays_exact_boundary_and_rejects_stream_overflow() -> None:
+    async def exercise(chunks: list[dict[str, object]]) -> tuple[bytes, list[object]]:
+        received = bytearray()
+        sent: list[object] = []
+
+        async def downstream(_scope, receive, send):
+            while True:
+                message = await receive()
+                received.extend(message.get("body", b""))
+                if not message.get("more_body", False):
+                    break
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"ok"})
+
+        async def receive():
+            return chunks.pop(0)
+
+        async def send(message):
+            sent.append(message)
+
+        middleware = api._RequestBodyLimitMiddleware(downstream, max_bytes=4)
+        await middleware(
+            {"type": "http", "method": "POST", "headers": []}, receive, send
+        )
+        return bytes(received), sent
+
+    accepted_body, accepted_messages = asyncio.run(
+        exercise(
+            [
+                {"type": "http.request", "body": b"ab", "more_body": True},
+                {"type": "http.request", "body": b"cd", "more_body": False},
+            ]
+        )
+    )
+    rejected_body, rejected_messages = asyncio.run(
+        exercise(
+            [
+                {"type": "http.request", "body": b"abc", "more_body": True},
+                {"type": "http.request", "body": b"de", "more_body": False},
+            ]
+        )
+    )
+
+    assert accepted_body == b"abcd"
+    assert accepted_messages[0]["status"] == 200
+    assert rejected_body == b""
+    assert rejected_messages[0]["status"] == 413
+
+
+@pytest.mark.parametrize(
+    "method",
+    ("POST", "PUT", "PATCH", "GET", "HEAD", "DELETE", "OPTIONS"),
+)
+def test_request_body_limit_rejects_chunked_overflow_for_every_http_method(
+    method: str,
+) -> None:
+    downstream_called = False
+    chunks = [
+        {"type": "http.request", "body": b"abc", "more_body": True},
+        {"type": "http.request", "body": b"de", "more_body": False},
+    ]
+    sent: list[dict[str, object]] = []
+
+    async def downstream(_scope, _receive, _send):
+        nonlocal downstream_called
+        downstream_called = True
+
+    async def receive():
+        return chunks.pop(0)
+
+    async def send(message):
+        sent.append(message)
+
+    middleware = api._RequestBodyLimitMiddleware(downstream, max_bytes=4)
+    asyncio.run(
+        middleware(
+            {"type": "http", "method": method, "headers": []}, receive, send
+        )
+    )
+
+    assert downstream_called is False
+    assert sent[0]["status"] == 413
+
+
+def test_request_body_limit_rejects_bad_framing_and_slow_body() -> None:
+    async def exercise(
+        headers: list[tuple[bytes, bytes]],
+        receive,
+        *,
+        timeout_seconds: float = 1,
+    ) -> tuple[bool, list[object]]:
+        downstream_called = False
+        sent: list[object] = []
+
+        async def downstream(_scope, _receive, _send):
+            nonlocal downstream_called
+            downstream_called = True
+
+        async def send(message):
+            sent.append(message)
+
+        middleware = api._RequestBodyLimitMiddleware(
+            downstream, max_bytes=8, timeout_seconds=timeout_seconds
+        )
+        await middleware(
+            {"type": "http", "method": "POST", "headers": headers}, receive, send
+        )
+        return downstream_called, sent
+
+    async def short_body():
+        return {"type": "http.request", "body": b"{}", "more_body": False}
+
+    async def slow_body():
+        await asyncio.sleep(10)
+        return {"type": "http.request", "body": b"{}", "more_body": False}
+
+    called, mismatch = asyncio.run(
+        exercise([(b"content-length", b"3")], short_body)
+    )
+    assert called is False
+    assert mismatch[0]["status"] == 400
+
+    called, duplicate = asyncio.run(
+        exercise(
+            [(b"content-length", b"2"), (b"content-length", b"2")],
+            short_body,
+        )
+    )
+    assert called is False
+    assert duplicate[0]["status"] == 400
+
+    called, huge_length = asyncio.run(
+        exercise([(b"content-length", b"9" * 5000)], short_body)
+    )
+    assert called is False
+    assert huge_length[0]["status"] == 400
+
+    called, timed_out = asyncio.run(
+        exercise([], slow_body, timeout_seconds=0.01)
+    )
+    assert called is False
+    assert timed_out[0]["status"] == 408
+
+
+def test_api_authentication_rejects_oversized_body_without_receiving_it(
+    tmp_path: Path,
+) -> None:
+    app = api.create_app(
+        MinimalService(), bearer_token="token", allowed_roots=tmp_path
+    )
+    receive_calls = 0
+    sent: list[dict[str, object]] = []
+
+    async def receive():
+        nonlocal receive_calls
+        receive_calls += 1
+        return {
+            "type": "http.request",
+            "body": b"x" * (api.MAX_REQUEST_BYTES + 1),
+            "more_body": False,
+        }
+
+    async def send(message):
+        sent.append(message)
+
+    asyncio.run(
+        app(
+            {
+                "type": "http",
+                "asgi": {"version": "3.0"},
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/v1/runs",
+                "raw_path": b"/v1/runs",
+                "query_string": b"",
+                "root_path": "",
+                "headers": [],
+                "client": ("testclient", 50000),
+                "server": ("testserver", 80),
+            },
+            receive,
+            send,
+        )
+    )
+
+    assert receive_calls == 0
+    assert sent[0]["status"] == 401
+
+
+def test_api_disconnect_stops_before_service_dispatch(tmp_path: Path) -> None:
+    app = api.create_app(
+        MinimalService(), bearer_token="token", allowed_roots=tmp_path
+    )
+    receive_calls = 0
+    sent: list[dict[str, object]] = []
+
+    async def receive():
+        nonlocal receive_calls
+        receive_calls += 1
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        sent.append(message)
+
+    asyncio.run(
+        app(
+            {
+                "type": "http",
+                "asgi": {"version": "3.0"},
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/v1/runs",
+                "raw_path": b"/v1/runs",
+                "query_string": b"",
+                "root_path": "",
+                "headers": [(b"authorization", b"Bearer token")],
+                "client": ("testclient", 50000),
+                "server": ("testserver", 80),
+            },
+            receive,
+            send,
+        )
+    )
+
+    assert receive_calls == 1
+    assert sent == []
+
+
+def test_api_rejects_oversized_json_after_authentication(tmp_path: Path) -> None:
+    app = api.create_app(
+        MinimalService(), bearer_token="token", allowed_roots=tmp_path
+    )
+    body = b'{"unexpected":"' + b"x" * api.MAX_REQUEST_BYTES + b'"}'
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        unauthorized = client.post(
+            "/v1/runs", content=body, headers={"Content-Type": "application/json"}
+        )
+        rejected = client.post(
+            "/v1/runs",
+            content=body,
+            headers={
+                "Authorization": "Bearer token",
+                "Content-Type": "application/json",
+            },
+        )
+
+    assert unauthorized.status_code == 401
+    assert rejected.status_code == 413
+    assert rejected.json()["error"]["code"] == "request_too_large"
+    assert rejected.headers["X-Content-Type-Options"] == "nosniff"
+
+
 def test_readiness_supports_async_services_and_contains_failures(
     tmp_path: Path,
 ) -> None:

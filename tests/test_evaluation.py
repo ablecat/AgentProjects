@@ -5,6 +5,7 @@ from dataclasses import asdict
 from pathlib import Path
 import shutil
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -34,11 +35,12 @@ from repo_agent.evaluation import (
 from repo_agent.openai_provider import OpenAIConfig
 from repo_agent.openai_provider import ProviderUsage
 from repo_agent.patches import PatchFile, ValidatedPatch
-from repo_agent.models import ToolCall
+from repo_agent.models import ToolCall, ToolResult
 
 
 PROJECT_ROOT = Path(__file__).parents[1]
 BENCHMARKS = PROJECT_ROOT / "benchmarks"
+DEVELOPMENT_BENCHMARKS = BENCHMARKS / "tasks" / "python" / "development"
 
 
 def _model_config() -> OpenAIConfig:
@@ -78,6 +80,7 @@ def _synthetic_result(
             public_passed=solved,
             tool_calls=2,
             tool_errors=0 if solved else 1,
+            actionable_tool_errors=0 if solved else 1,
             duration_ms=100 + index,
             usage=ModelUsageRecord(
                 response_count=1,
@@ -162,6 +165,22 @@ def _write_check_artifact(path: Path, result: CheckRunResult) -> str:
     return evaluation_module.hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def test_runner_rejects_unrepresentable_timeout_and_prices(tmp_path: Path) -> None:
+    common = {
+        "benchmark_dir": BENCHMARKS,
+        "output_dir": tmp_path / "results",
+        "variant": "baseline",
+    }
+    with pytest.raises(ValueError, match="task_timeout_seconds"):
+        EvaluationRunner(**common, task_timeout_seconds=10**1000)
+    with pytest.raises(ValueError, match="token prices"):
+        EvaluationRunner(
+            **common,
+            input_cost_per_million=10**1000,
+            output_cost_per_million=1,
+        )
+
+
 def _materialize_formal_results(
     state_root: Path,
 ) -> tuple[tuple[ExperimentJob, ...], dict[tuple[str, int, str], Path]]:
@@ -199,6 +218,7 @@ def _materialize_formal_results(
             variant=variant,
             trial=trial,
             model="test-model",
+            base_url=_model_config().base_url,
             selected_task_ids=task_ids,
             task_timeout_seconds=1200,
             max_output_bytes=65536,
@@ -323,6 +343,52 @@ def test_committed_experiment_matrix_is_locked_to_44_runs() -> None:
     assert tuple(matrix["full"]["extra_trial_task_ids"]) == FULL_REPEAT_TASK_IDS
 
 
+@pytest.mark.parametrize(
+    ("base_url", "provider_profile", "reasoning"),
+    (
+        (
+            "https://api.deepseek.com/v1/",
+            "official_deepseek",
+            {
+                "basic_loop": None,
+                "planning": "none",
+                "implement": "low",
+                "repair": "low",
+                "review": "none",
+            },
+        ),
+        (
+            "https://relay.example.test/v1",
+            "provider_default",
+            {
+                "basic_loop": None,
+                "planning": None,
+                "implement": None,
+                "repair": None,
+                "review": None,
+            },
+        ),
+    ),
+)
+def test_request_policy_records_actual_phase_overrides(
+    base_url: str,
+    provider_profile: str,
+    reasoning: dict[str, str | None],
+) -> None:
+    policy = evaluation_module._request_policy("deepseek-v4-pro", base_url)
+
+    assert policy["provider_profile"] == provider_profile
+    assert policy["phase_reasoning_effort"] == reasoning
+    assert policy["tool_choice"] == {
+        "basic_loop": "auto (provider default)",
+        "planning_initial": "auto (provider default)",
+        "planning_follow_up": "submit_change_plan",
+        "implement": "auto (provider default)",
+        "repair": "auto (provider default)",
+        "review": "submit_review",
+    }
+
+
 def test_suite_loader_returns_no_hidden_contract_or_gold_content() -> None:
     suite = load_benchmark_suite(BENCHMARKS, task_ids=("py-bugfix-001",))
 
@@ -363,6 +429,7 @@ def test_runner_materializes_public_setup_and_skips_completed_result(
                 public_passed=True,
                 tool_calls=3,
                 tool_errors=1,
+                actionable_tool_errors=0,
                 duration_ms=25,
                 usage=ModelUsageRecord(
                     response_count=2,
@@ -410,6 +477,7 @@ def test_runner_materializes_public_setup_and_skips_completed_result(
     assert first.solved_task_count == 1
     assert first.pass_at_1 == 1.0
     assert first.tool_error_rate == pytest.approx(1 / 3)
+    assert first.actionable_tool_error_rate == 0.0
     assert first.tasks[0].changed_files == 1
     assert first.tasks[0].added_lines == 1
     assert first.tasks[0].removed_lines == 1
@@ -432,6 +500,27 @@ def test_runner_materializes_public_setup_and_skips_completed_result(
         if path.is_file() and path.name != "runs.sqlite3"
     )
     assert secret not in persisted
+
+
+def test_baseline_actionable_errors_use_durable_outcome_classification() -> None:
+    results = (
+        ToolResult("ok", "read_file", True, "ok"),
+        ToolResult(
+            "check", "run_check", False, '{"status":"failed"}', exit_code=1
+        ),
+        ToolResult(
+            "policy",
+            "run_check",
+            False,
+            '{"status":"policy_denied"}',
+            exit_code=1,
+        ),
+        ToolResult("args", "apply_patch", False, "", error="ValueError: requires diff"),
+        ToolResult("patch", "apply_patch", False, "", error="Patch rejected"),
+        ToolResult("transport", "read_file", False, "", error="Docker timed out"),
+    )
+
+    assert evaluation_module._actionable_tool_error_count(results) == 4
 
 
 def test_repeated_trials_are_limited_to_locked_full_tasks(tmp_path: Path) -> None:
@@ -852,6 +941,21 @@ def test_merge_rejects_unlocked_formal_budget_policy(tmp_path: Path) -> None:
         merge_experiment_results(BENCHMARKS, state_root)
 
 
+def test_merge_rejects_unlocked_formal_request_policy(tmp_path: Path) -> None:
+    state_root = tmp_path / "private-state"
+    _materialize_formal_results(state_root)
+    manifest = state_root / "experiment.json"
+    value = json.loads(manifest.read_text(encoding="utf-8"))
+    value["request_policy"]["phase_reasoning_effort"]["implement"] = "none"
+    manifest.write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(evaluation_module.EvaluationError, match="request policy"):
+        merge_experiment_results(BENCHMARKS, state_root)
+
+
 def test_scoring_error_retry_preserves_agent_execution(tmp_path: Path) -> None:
     agent_calls = 0
     score_calls = 0
@@ -1014,6 +1118,13 @@ def test_regression_test_contract_covers_python_and_java() -> None:
         failed,
         "tests/test_slug_regression.py::test_suffix FAILED",
     )
+    assert evaluation_module._attributable_regression_failure(
+        python_task,
+        ("tests/test_slug_regression.py",),
+        failed,
+        "SUBFAILED tests/test_slug_regression.py::test_suffix - subcase 7\n"
+        "=========================== 10 failed in 0.12s ===========================",
+    )
     assert not evaluation_module._attributable_regression_failure(
         python_task,
         ("tests/test_slug_regression.py",),
@@ -1032,6 +1143,144 @@ def test_regression_test_contract_covers_python_and_java() -> None:
         passed,
         "Failures:\nSlugRegressionTest",
     )
+
+
+def test_development_suite_is_available_only_to_single_mode(tmp_path: Path) -> None:
+    suite = load_benchmark_suite(DEVELOPMENT_BENCHMARKS)
+    formal_task = load_benchmark_suite(
+        BENCHMARKS, task_ids=("py-bugfix-001",)
+    ).tasks[0]
+
+    assert suite.formal_evaluation is False
+    assert formal_task.setup_patch == formal_task.root / "setup.patch"
+    assert formal_task.setup_patch.is_file()
+    assert all(task.setup_patch is None for task in suite.tasks)
+    assert [task.id for task in suite.tasks] == [
+        "py-development-001",
+        "py-development-002",
+        "py-development-003",
+        "py-development-004",
+    ]
+    assert (
+        load_benchmark_suite(
+            DEVELOPMENT_BENCHMARKS,
+            task_ids=("py-development-003",),
+        ).tasks[0].id
+        == "py-development-003"
+    )
+    with pytest.raises(evaluation_module.EvaluationError, match="single mode"):
+        experiment_jobs(DEVELOPMENT_BENCHMARKS)
+    with pytest.raises(evaluation_module.EvaluationError, match="single mode"):
+        canary_jobs(
+            DEVELOPMENT_BENCHMARKS,
+            task_id="py-development-001",
+        )
+
+    materialized = tmp_path / "development-workspace"
+    evaluation_module._copy_baseline_and_setup(suite.tasks[0], materialized)
+    assert (materialized / "tasklib" / "scanner.py").is_file()
+    assert not (materialized / "hidden_tests").exists()
+    assert not (materialized / "gold.patch").exists()
+
+
+def test_evaluation_preserves_safe_credential_reference_patch(tmp_path: Path) -> None:
+    patch = (
+        "diff --git a/tasklib/text.py b/tasklib/text.py\n"
+        "--- a/tasklib/text.py\n"
+        "+++ b/tasklib/text.py\n"
+        "@@ -7,4 +7,5 @@ _NON_ALNUM = re.compile(r\"[^a-z0-9]+\")\n"
+        " def slugify(value: str) -> str:\n"
+        '     \"\"\"Return a lowercase, URL-safe identifier.\"\"\"\n'
+        '     normalized = _NON_ALNUM.sub("-", value.casefold())\n'
+        '-    return normalized.lstrip("-")\n'
+        '+    password = os.getenv("REPO_PASSWORD")\n'
+        '+    return normalized.strip("-")\n'
+    )
+
+    def execute(*_args):
+        return AgentExecutionArtifact(
+            AgentExecution(
+                run_id="e" * 32,
+                status="succeeded",
+                public_passed=True,
+                tool_calls=1,
+                duration_ms=1,
+                usage=ModelUsageRecord(
+                    response_count=1,
+                    reported_response_count=1,
+                    input_tokens=10,
+                    cached_input_tokens=0,
+                    output_tokens=5,
+                    total_tokens=15,
+                    complete=True,
+                ),
+            ),
+            patch,
+        )
+
+    report = EvaluationRunner(
+        BENCHMARKS,
+        tmp_path / "results",
+        variant="full",
+        task_ids=("py-bugfix-001",),
+        model="test-model",
+        agent_executor=execute,
+        score_executor=lambda *_args: ScoreOutcome(
+            public_passed=True,
+            hidden_passed=True,
+            original_tests_unchanged=True,
+            build_unchanged=True,
+            regression_test_added=True,
+            regression_failed_on_buggy=True,
+            regression_passed_on_candidate=True,
+            policy_passed=True,
+        ),
+    ).run()
+
+    assert report.solved_task_count == 1
+    candidate = Path(report.result_dir) / "candidates" / "py-bugfix-001.patch"
+    assert candidate.read_text(encoding="utf-8") == patch
+
+
+def test_durable_usage_separates_check_failures_from_actionable_errors() -> None:
+    event = {
+        "event": "model_tool_summary",
+        "tool_calls": 4,
+        "tool_errors": 3,
+        "tool_outcomes": {
+            "ok": 1,
+            "check_failed": 2,
+            "invalid_args": 1,
+            "policy_denied": 0,
+            "transport_error": 0,
+            "patch_rejected": 0,
+            "other_error": 0,
+        },
+        "model_usage": {
+            "response_count": 2,
+            "reported_response_count": 2,
+            "input_tokens": 100,
+            "cached_input_tokens": 10,
+            "output_tokens": 20,
+            "total_tokens": 120,
+            "complete": True,
+        },
+    }
+    service = SimpleNamespace(
+        database=SimpleNamespace(events=lambda _run_id: (event,))
+    )
+    record = SimpleNamespace(
+        run_id="f" * 32,
+        metrics=SimpleNamespace(tool_calls=4),
+    )
+
+    usage, calls, errors, actionable = evaluation_module._durable_usage(
+        service, record
+    )
+
+    assert usage.complete is True
+    assert usage.total_tokens == 120
+    assert (calls, errors, actionable) == (4, 3, 1)
 
 
 def test_scoring_summaries_are_redacted_and_hashed(

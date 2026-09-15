@@ -14,6 +14,16 @@ from repo_agent.run_models import ARTIFACT_FILENAMES, RunRecord, utc_now
 RUN_ID = "d" * 32
 
 
+def _patch_adding(statement: str) -> str:
+    return (
+        "diff --git a/app.py b/app.py\n"
+        "--- a/app.py\n"
+        "+++ b/app.py\n"
+        "@@ -0,0 +1 @@\n"
+        f"+{statement}\n"
+    )
+
+
 def _record() -> RunRecord:
     now = utc_now()
     return RunRecord(
@@ -41,13 +51,18 @@ def test_artifact_store_creates_fixed_layout_and_writes_json(tmp_path: Path) -> 
     assert payload["status"] == "queued"
 
 
-def test_artifact_store_redacts_trace_report_patch_and_checks(tmp_path: Path) -> None:
+def test_artifact_store_redacts_trace_report_and_checks_and_rejects_secret_patch(
+    tmp_path: Path,
+) -> None:
     secret = "repo-agent-private-value"
     store = ArtifactStore(tmp_path, secrets=(secret,))
     store.initialize(RUN_ID)
 
     store.write_report(RUN_ID, f"Bearer abc.def and {secret}")
-    store.write_patch(RUN_ID, "+api_key=sk-abcdefghijklmnop")
+    with pytest.raises(ArtifactError, match="credential-like"):
+        store.write_patch(RUN_ID, "+api_key=sk-abcdefghijklmnop")
+    with pytest.raises(ArtifactError, match="credential-like"):
+        store.write_patch(RUN_ID, f"+value={secret}")
     store.write_check(RUN_ID, "verify-0.log", "password=hunter2")
     store.append_trace(
         RUN_ID,
@@ -71,10 +86,245 @@ def test_artifact_store_redacts_trace_report_patch_and_checks(tmp_path: Path) ->
     assert "[REDACTED]" in combined
 
 
+def test_artifact_store_preserves_non_secret_patch_bytes_exactly(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path, secrets=("actual-secret-value",))
+    store.initialize(RUN_ID)
+    patch = (
+        "diff --git a/app.py b/app.py\n"
+        "--- a/app.py\n"
+        "+++ b/app.py\n"
+        "@@ -1 +1 @@\n"
+        "-api_key = None\n"
+        '+api_key = "placeholder"\n'
+    )
+
+    store.write_patch(RUN_ID, patch)
+
+    assert store.path(RUN_ID, "patch").read_bytes() == patch.encode("utf-8")
+
+
+def test_patch_credential_detection_handles_short_secrets_and_plain_passwords(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path, secrets=("a",))
+    store.initialize(RUN_ID)
+    benign = (
+        "diff --git a/app.py b/app.py\n"
+        "--- a/app.py\n"
+        "+++ b/app.py\n"
+        "@@ -1 +1 @@\n"
+        '-note = "old"\n'
+        '+note = "fix a bug"\n'
+    )
+
+    store.write_patch(RUN_ID, benign)
+    assert store.path(RUN_ID, "patch").read_text(encoding="utf-8") == benign
+
+    unsafe_values = (
+        "hunter2",
+        "hunter_2",
+        'SecretStr("hunter2")',
+        '{"raw":"hunter2"}',
+        'os.getenv("PASSWORD","hunter2")',
+    )
+    for unsafe in unsafe_values:
+        with pytest.raises(ArtifactError, match="credential-like"):
+            store.write_patch(RUN_ID, f"+password={unsafe}\n")
+        assert store.path(RUN_ID, "patch").read_text(encoding="utf-8") == benign
+
+    with pytest.raises(ArtifactError, match="credential-like"):
+        store.write_patch(RUN_ID, '+OPENAI_API_KEY="hunter2"\n')
+    assert store.path(RUN_ID, "patch").read_text(encoding="utf-8") == benign
+    for assignment in (
+        '+os.environ["OPENAI_API_KEY"] = "hunter2"\n',
+        '+config["CLIENT_SECRET"] = "hunter2"\n',
+        '+$env:API_KEY = "hunter2"\n',
+    ):
+        with pytest.raises(ArtifactError, match="credential-like"):
+            store.write_patch(RUN_ID, assignment)
+        assert store.path(RUN_ID, "patch").read_text(encoding="utf-8") == benign
+
+
+@pytest.mark.parametrize(
+    "safe_value",
+    [
+        '"placeholder"',
+        "REPO_PASSWORD",
+        'os.getenv("REPO_PASSWORD")',
+        'os.environ["REPO_PASSWORD"]',
+        "process.env.REPO_PASSWORD",
+        "settings.password",
+        "$env:REPO_PASSWORD",
+        "${REPO_PASSWORD}",
+    ],
+)
+def test_patch_credential_detection_allows_strict_references_and_placeholders(
+    tmp_path: Path,
+    safe_value: str,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    store.initialize(RUN_ID)
+    patch = f"+password={safe_value}\n"
+
+    store.write_patch(RUN_ID, patch)
+
+    assert store.path(RUN_ID, "patch").read_text(encoding="utf-8") == patch
+
+
+@pytest.mark.parametrize("name", ["password", "api_key"])
+@pytest.mark.parametrize("operator", ["==", "!=", "<=", ">=", "=>", ":="])
+@pytest.mark.parametrize(
+    "expression",
+    [
+        '{name} {operator} "hunter2"',
+        '{name}: str {operator} "hunter2"',
+    ],
+)
+def test_patch_credential_detection_does_not_treat_operators_as_assignment(
+    tmp_path: Path,
+    name: str,
+    operator: str,
+    expression: str,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    store.initialize(RUN_ID)
+    patch = _patch_adding(expression.format(name=name, operator=operator))
+
+    store.write_patch(RUN_ID, patch)
+
+    assert store.path(RUN_ID, "patch").read_text(encoding="utf-8") == patch
+    assert redact_text(patch) == patch
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        'password = "placeholder"',
+        '"api_key": "<api-key>"',
+        'password: str = "placeholder"',
+        'config["api_key"] = os.environ["REPO_API_KEY"]',
+        "$env:PASSWORD = $env:REPO_PASSWORD",
+    ],
+)
+def test_patch_credential_detection_allows_placeholder_assignment_in_full_diff(
+    tmp_path: Path,
+    statement: str,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    store.initialize(RUN_ID)
+    patch = _patch_adding(statement)
+
+    store.write_patch(RUN_ID, patch)
+
+    assert store.path(RUN_ID, "patch").read_text(encoding="utf-8") == patch
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        'password = "hunter2"',
+        'api_key: "hunter2"',
+        'password: str = "hunter2"',
+        'config["api_key"] = "hunter2"',
+        '$env:PASSWORD = "hunter2"',
+    ],
+)
+def test_patch_credential_detection_rejects_assignment_in_full_diff(
+    tmp_path: Path,
+    statement: str,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    store.initialize(RUN_ID)
+
+    with pytest.raises(ArtifactError, match="credential-like"):
+        store.write_patch(RUN_ID, _patch_adding(statement))
+
+    assert store.path(RUN_ID, "patch").read_text(encoding="utf-8") == ""
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        '$password = "hunter2"',
+        '$apiKey = "hunter2"',
+        '${password} = "hunter2"',
+        'os.putenv("API_KEY", "hunter2")',
+        'os.environ.setdefault("password", "hunter2")',
+    ],
+)
+def test_patch_credential_detection_rejects_common_secret_writes(
+    tmp_path: Path,
+    statement: str,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    store.initialize(RUN_ID)
+
+    with pytest.raises(ArtifactError, match="credential-like"):
+        store.write_patch(RUN_ID, _patch_adding(statement))
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "$password = $env:REPO_PASSWORD",
+        '$apiKey = "placeholder"',
+        "${password} = REPO_PASSWORD",
+        'os.putenv("API_KEY", API_KEY)',
+        'os.putenv("API_KEY", "placeholder")',
+        'os.putenv("CACHE_KEY", "hunter2")',
+        'os.environ.setdefault("password", os.getenv("PASSWORD"))',
+        'os.environ.setdefault("password", "<password>")',
+    ],
+)
+def test_patch_credential_detection_allows_references_in_common_secret_writes(
+    tmp_path: Path,
+    statement: str,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    store.initialize(RUN_ID)
+    patch = _patch_adding(statement)
+
+    store.write_patch(RUN_ID, patch)
+
+    assert store.path(RUN_ID, "patch").read_text(encoding="utf-8") == patch
+
+
+def test_redact_text_masks_secret_literal_calls_but_preserves_placeholders() -> None:
+    value = (
+        'os.putenv("API_KEY", "hunter2")\n'
+        'os.environ.setdefault("password", "placeholder")\n'
+        'os.putenv("CACHE_KEY", "hunter2")'
+    )
+
+    assert redact_text(value) == (
+        'os.putenv("API_KEY", [REDACTED])\n'
+        'os.environ.setdefault("password", "placeholder")\n'
+        'os.putenv("CACHE_KEY", "hunter2")'
+    )
+
+
 def test_redact_value_masks_secret_named_fields_recursively() -> None:
     assert redact_value(
-        {"nested": [{"apiToken": "visible-looking"}], "normal": "ok"}
-    ) == {"nested": [{"apiToken": "[REDACTED]"}], "normal": "ok"}
+        {
+            "nested": [
+                {"apiToken": "visible-looking"},
+                {"OPENAI_API_KEY": "uppercase-secret"},
+                {"CLIENT_SECRET": "client-secret"},
+                {"REFRESH_TOKEN": "refresh-token"},
+                {"PRIVATE_KEY": "private-key"},
+            ],
+            "normal": "ok",
+        }
+    ) == {
+        "nested": [
+            {"apiToken": "[REDACTED]"},
+            {"OPENAI_API_KEY": "[REDACTED]"},
+            {"CLIENT_SECRET": "[REDACTED]"},
+            {"REFRESH_TOKEN": "[REDACTED]"},
+            {"PRIVATE_KEY": "[REDACTED]"},
+        ],
+        "normal": "ok",
+    }
 
 
 @pytest.mark.parametrize("name", ["../escape.log", "bad/name.log", "plain.txt"])
@@ -96,6 +346,25 @@ def test_artifact_store_rejects_unknown_kind_and_run_id(tmp_path: Path) -> None:
 
 def test_redact_text_preserves_non_secret_diagnostics() -> None:
     assert redact_text("pytest: 12 passed") == "pytest: 12 passed"
+
+
+def test_redact_text_ignores_ambiguous_short_secret_and_masks_full_assignment() -> None:
+    value = (
+        'pytest passed\npassword="correct horse battery staple"\n'
+        '"api_key": "another secret with spaces"\n'
+        "CLIENT_SECRET=hunter2\nREFRESH_TOKEN=hunter3\n"
+        'os.environ["OPENAI_API_KEY"] = "hunter4"\n'
+        '$env:API_KEY = "hunter5"\nnext=visible'
+    )
+
+    redacted = redact_text(value, secrets=("a",))
+
+    assert redacted == (
+        "pytest passed\npassword=[REDACTED]\n"
+        '"api_key": [REDACTED]\nCLIENT_SECRET=[REDACTED]\n'
+        'REFRESH_TOKEN=[REDACTED]\nos.environ["OPENAI_API_KEY"] = [REDACTED]\n'
+        "$env:API_KEY = [REDACTED]\nnext=visible"
+    )
 
 
 def test_trace_append_atomically_replaces_a_complete_jsonl_snapshot(

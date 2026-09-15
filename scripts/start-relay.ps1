@@ -7,18 +7,22 @@ param(
     [switch]$OpenBrowser,
     [switch]$Reconfigure,
     [switch]$ConfigureOnly,
-    [switch]$Verify
+    [switch]$Verify,
+    [switch]$Evaluate,
+    [switch]$FormalEvaluate
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+$relayInvocationParameterNames = @($PSBoundParameters.Keys)
 
 $scriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
 if ([string]::IsNullOrWhiteSpace($Repository)) {
     $Repository = Split-Path -Parent $scriptDirectory
 }
 
-$relayBaseUrl = "https://thz10.airucas.com/v1"
+$relayBaseUrl = "https://api.deepseek.com"
+$defaultModelId = "deepseek-v4-pro"
 $configFormat = "repo-maintainer-agent-relay"
 $configEnvelopeVersion = 1
 $configSchemaVersion = 1
@@ -56,6 +60,7 @@ function Set-ProcessApiKey {
     try {
         $keyPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureKey)
         $plainKey = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($keyPointer)
+        $plainKey = $plainKey.Trim()
         Assert-ApiKey -ApiKey $plainKey
         [Environment]::SetEnvironmentVariable(
             "REPO_AGENT_API_KEY",
@@ -76,6 +81,9 @@ function Assert-ApiKey {
 
     if ([string]::IsNullOrWhiteSpace($ApiKey)) {
         throw "The API key cannot be empty."
+    }
+    if ($ApiKey.Length -lt 8) {
+        throw "The API key is too short."
     }
     if ($ApiKey.Length -gt 8192 -or $ApiKey -match "[\u0000-\u001f\u007f]") {
         throw "The API key contains invalid characters or is too long."
@@ -237,11 +245,12 @@ function Write-RelayConfig {
         [Parameter(Mandatory = $true)][string]$ExpectedFingerprint
     )
 
+    $ApiKey = $ApiKey.Trim()
     Import-CurrentSecurityModule
     Assert-ApiKey -ApiKey $ApiKey
     Assert-ModelId -ModelId $ModelId
     if ($BaseUrl -cne $relayBaseUrl) {
-        throw "The relay Base URL is invalid."
+        throw "The DeepSeek Base URL is invalid."
     }
 
     $directory = Split-Path -Parent $Path
@@ -411,14 +420,15 @@ function Read-RelayConfig {
         ) {
             throw "Decrypted relay configuration has invalid metadata."
         }
-        Assert-ApiKey -ApiKey $inner.api_key
+        $canonicalApiKey = $inner.api_key.Trim()
+        Assert-ApiKey -ApiKey $canonicalApiKey
         Assert-ModelId -ModelId $inner.model
         $verifiedAt = [DateTimeOffset]::MinValue
         if (-not [DateTimeOffset]::TryParse($inner.verified_at, [ref]$verifiedAt)) {
             throw "Decrypted relay configuration has an invalid verification time."
         }
         return [pscustomobject]@{
-            ApiKey = $inner.api_key
+            ApiKey = $canonicalApiKey
             BaseUrl = $inner.base_url
             Model = $inner.model
             VerifiedAt = $verifiedAt
@@ -472,16 +482,16 @@ function Get-RelayModelIds {
         foreach ($entry in @($payload.data)) {
             $id = $entry.id
             if ($id -isnot [string] -or [string]::IsNullOrWhiteSpace($id)) {
-                throw "The relay returned an invalid model ID."
+                throw "DeepSeek returned an invalid model ID."
             }
             if ($id.Length -gt 512 -or $id -match "[\u0000-\u001f\u007f]") {
-                throw "The relay returned an unsafe model ID."
+                throw "DeepSeek returned an unsafe model ID."
             }
             $validatedIds.Add($id)
         }
         $modelIds = @($validatedIds | Sort-Object -Unique)
         if ($modelIds.Count -eq 0) {
-            throw "The relay returned no model IDs."
+            throw "DeepSeek returned no model IDs."
         }
         return $modelIds
     }
@@ -498,7 +508,7 @@ function Get-RelayModelIds {
 function Select-RelayModel {
     param([Parameter(Mandatory = $true)][string[]]$ModelIds)
 
-    Write-Host "Available relay models:"
+    Write-Host "Available DeepSeek models:"
     for ($index = 0; $index -lt $ModelIds.Count; $index++) {
         Write-Host ("  [{0}] {1}" -f ($index + 1), $ModelIds[$index])
     }
@@ -538,15 +548,405 @@ function Invoke-RelayDoctor {
 
     $pythonExecutable = $PythonInvocation[0]
     $pythonPrefix = @($PythonInvocation | Select-Object -Skip 1)
-    Write-Host "Verifying the relay with a native tool-call handshake..."
+    Write-Host "Verifying DeepSeek with a native tool-call handshake..."
     $doctorArguments = @(
         $pythonPrefix +
         @("-B", "-m", "repo_agent", "doctor", "--allow-remote-model")
     )
     & $pythonExecutable @doctorArguments
     if ($LASTEXITCODE -ne 0) {
-        throw "Relay verification failed; the UI was not started."
+        throw "DeepSeek verification failed; the UI was not started."
     }
+}
+
+function Invoke-RelayEvaluation {
+    param([Parameter(Mandatory = $true)][object[]]$PythonInvocation)
+
+    $pythonExecutable = $PythonInvocation[0]
+    $pythonPrefix = @($PythonInvocation | Select-Object -Skip 1)
+    $projectRoot = Split-Path -Parent $scriptDirectory
+    $benchmarkDirectory = Join-Path (
+        $projectRoot
+    ) "benchmarks\tasks\python\development"
+    if (-not (Test-Path -LiteralPath $benchmarkDirectory -PathType Container)) {
+        throw "The fixed development benchmark suite is unavailable."
+    }
+    $runId = "{0}-{1}" -f (
+        [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssfffZ")
+    ), ([Guid]::NewGuid().ToString("N"))
+    $outputDirectory = Join-Path (
+        (Join-Path $projectRoot "evaluation-results\development-v1")
+    ) $runId
+    $evaluationArguments = @(
+        $pythonPrefix +
+        @(
+            "-B",
+            "-m",
+            "repo_agent",
+            "eval",
+            "--variant",
+            "full",
+            "--benchmark-dir",
+            $benchmarkDirectory,
+            "--output-dir",
+            $outputDirectory,
+            "--execute",
+            "--allow-remote-model",
+            "--task-timeout-seconds",
+            "1200",
+            "--max-output-bytes",
+            "65536",
+            "--format",
+            "json"
+        )
+    )
+    Write-Host "Running the fixed four-task development evaluation..."
+    Write-Host "Evaluation output: $outputDirectory"
+    & $pythonExecutable @evaluationArguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "Development evaluation failed with code $LASTEXITCODE."
+    }
+    Assert-DevelopmentEvaluationAcceptance `
+        -SummaryPath (Get-EvaluationSummaryPath `
+            -OutputDirectory $outputDirectory `
+            -SuiteId "repo-agent-python-development-v1") `
+        -ExpectedModelId $env:REPO_AGENT_MODEL
+}
+
+function Get-EvaluationSummaryPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$OutputDirectory,
+        [Parameter(Mandatory = $true)][string]$SuiteId
+    )
+
+    $variantDirectory = Join-Path (
+        (Join-Path $OutputDirectory $SuiteId)
+    ) "full"
+    return Join-Path (Join-Path $variantDirectory "trial-1") "summary.json"
+}
+
+function Assert-DevelopmentEvaluationAcceptance {
+    param(
+        [Parameter(Mandatory = $true)][string]$SummaryPath,
+        [Parameter(Mandatory = $true)][string]$ExpectedModelId
+    )
+
+    if (-not (Test-Path -LiteralPath $SummaryPath -PathType Leaf)) {
+        throw "Development evaluation summary is missing."
+    }
+    try {
+        $report = Get-Content `
+            -LiteralPath $SummaryPath `
+            -Raw `
+            -Encoding UTF8 | ConvertFrom-Json
+        $taskCount = [Convert]::ToInt32($report.task_count)
+        $solvedTaskCount = [Convert]::ToInt32($report.solved_task_count)
+        if ($null -eq $report.actionable_tool_error_rate) {
+            throw "missing actionable tool error rate"
+        }
+        $actionableRate = [Convert]::ToDouble(
+            $report.actionable_tool_error_rate,
+            [Globalization.CultureInfo]::InvariantCulture
+        )
+        $tasks = @($report.tasks)
+        $taskIds = @($tasks | ForEach-Object { [string]$_.task_id })
+        $rowSolvedTaskCount = @(
+            $tasks | Where-Object { $_.solved -eq $true }
+        ).Count
+        $invalidTaskRows = @(
+            $tasks | Where-Object {
+                $_.status -cne "completed" -or
+                $_.model -cne $ExpectedModelId -or
+                $_.language -cne "python" -or
+                $_.solved -isnot [bool]
+            }
+        )
+    }
+    catch {
+        throw "Development evaluation summary is invalid."
+    }
+
+    if (
+        $report.status -cne "completed" -or
+        $report.suite_id -cne "repo-agent-python-development-v1" -or
+        $report.variant -cne "full" -or
+        $report.model -cne $ExpectedModelId -or
+        [Convert]::ToInt32($report.trial) -ne 1 -or
+        $taskCount -ne 4 -or
+        $solvedTaskCount -lt 0 -or
+        $solvedTaskCount -gt $taskCount -or
+        $tasks.Count -ne 4
+    ) {
+        throw "Development evaluation did not complete the fixed four-task full suite."
+    }
+    $expectedTaskIds = @(
+        "py-development-001",
+        "py-development-002",
+        "py-development-003",
+        "py-development-004"
+    )
+    $taskIdDifferences = @(
+        Compare-Object `
+            -ReferenceObject $expectedTaskIds `
+            -DifferenceObject $taskIds `
+            -CaseSensitive
+    )
+    if ($taskIdDifferences.Count -ne 0) {
+        throw "Development evaluation task identity does not match the fixed suite."
+    }
+    if (
+        $invalidTaskRows.Count -ne 0 -or
+        $rowSolvedTaskCount -ne $solvedTaskCount
+    ) {
+        throw "Development evaluation task rows do not match its aggregate totals."
+    }
+    if ($solvedTaskCount -lt 3) {
+        throw "Development evaluation acceptance failed: fewer than 3 of 4 tasks solved."
+    }
+    if (@($tasks | Where-Object { $_.budget_passed -ne $true }).Count -ne 0) {
+        throw "Development evaluation acceptance failed: a task exceeded its budget."
+    }
+    if (
+        [Double]::IsNaN($actionableRate) -or
+        [Double]::IsInfinity($actionableRate) -or
+        $actionableRate -lt 0.0 -or
+        $actionableRate -gt 0.05
+    ) {
+        throw "Development evaluation acceptance failed: actionable tool error rate exceeds 5%."
+    }
+    Write-Host (
+        "Development acceptance passed: {0}/4 solved; actionable tool error rate {1:P2}." -f
+        $solvedTaskCount,
+        $actionableRate
+    )
+}
+
+function Invoke-RelayFormalEvaluation {
+    param([Parameter(Mandatory = $true)][object[]]$PythonInvocation)
+
+    $pythonExecutable = $PythonInvocation[0]
+    $pythonPrefix = @($PythonInvocation | Select-Object -Skip 1)
+    $projectRoot = Split-Path -Parent $scriptDirectory
+    $benchmarkDirectory = Join-Path $projectRoot "benchmarks"
+    if (-not (Test-Path -LiteralPath $benchmarkDirectory -PathType Container)) {
+        throw "The fixed formal benchmark suite is unavailable."
+    }
+    $runId = "{0}-{1}" -f (
+        [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssfffZ")
+    ), ([Guid]::NewGuid().ToString("N"))
+    $outputDirectory = Join-Path (
+        (Join-Path $projectRoot (
+            "evaluation-results\formal-v1-regression-acceptance"
+        ))
+    ) $runId
+    if (Test-Path -LiteralPath $outputDirectory) {
+        throw "The fresh formal acceptance output directory already exists."
+    }
+    $evaluationArguments = @(
+        $pythonPrefix +
+        @(
+            "-B",
+            "-m",
+            "repo_agent",
+            "eval",
+            "--variant",
+            "full",
+            "--trial",
+            "1",
+            "--benchmark-dir",
+            $benchmarkDirectory,
+            "--output-dir",
+            $outputDirectory,
+            "--execute",
+            "--allow-remote-model",
+            "--allow-bootstrap",
+            "--task-timeout-seconds",
+            "1200",
+            "--max-output-bytes",
+            "65536",
+            "--format",
+            "json"
+        )
+    )
+    Write-Host "Running the fixed 12-task formal full trial-1 acceptance..."
+    Write-Host "Formal acceptance output: $outputDirectory"
+    & $pythonExecutable @evaluationArguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "Formal acceptance evaluation failed with code $LASTEXITCODE."
+    }
+    Assert-FormalEvaluationAcceptance `
+        -SummaryPath (Get-EvaluationSummaryPath `
+            -OutputDirectory $outputDirectory `
+            -SuiteId "repo-agent-python-java-day3-v1") `
+        -ExpectedModelId $env:REPO_AGENT_MODEL
+}
+
+function Assert-FormalEvaluationAcceptance {
+    param(
+        [Parameter(Mandatory = $true)][string]$SummaryPath,
+        [Parameter(Mandatory = $true)][string]$ExpectedModelId
+    )
+
+    if (-not (Test-Path -LiteralPath $SummaryPath -PathType Leaf)) {
+        throw "Formal acceptance summary is missing."
+    }
+    Assert-NotReparsePoint `
+        -Path $SummaryPath `
+        -Description "Formal acceptance summary"
+    try {
+        $report = Get-Content `
+            -LiteralPath $SummaryPath `
+            -Raw `
+            -Encoding UTF8 | ConvertFrom-Json
+        $taskCount = [Convert]::ToInt32($report.task_count)
+        $completedTaskCount = [Convert]::ToInt32($report.completed_task_count)
+        $solvedTaskCount = [Convert]::ToInt32($report.solved_task_count)
+        $trial = [Convert]::ToInt32($report.trial)
+        $pythonTaskCount = [Convert]::ToInt32(
+            $report.language_success.python.tasks
+        )
+        $pythonSolved = [Convert]::ToInt32(
+            $report.language_success.python.solved
+        )
+        $javaTaskCount = [Convert]::ToInt32(
+            $report.language_success.java.tasks
+        )
+        $javaSolved = [Convert]::ToInt32(
+            $report.language_success.java.solved
+        )
+        if ($null -eq $report.latency_ms.p95) {
+            throw "missing p95 latency"
+        }
+        $p95Milliseconds = [Convert]::ToDouble(
+            $report.latency_ms.p95,
+            [Globalization.CultureInfo]::InvariantCulture
+        )
+        $tasks = @($report.tasks)
+        $taskIds = @($tasks | ForEach-Object { [string]$_.task_id })
+        $rowSolvedTaskCount = @(
+            $tasks | Where-Object { $_.solved -eq $true }
+        ).Count
+        $pythonRows = @(
+            $tasks | Where-Object { $_.language -ceq "python" }
+        )
+        $javaRows = @(
+            $tasks | Where-Object { $_.language -ceq "java" }
+        )
+        $pythonRowSolved = @(
+            $pythonRows | Where-Object { $_.solved -eq $true }
+        ).Count
+        $javaRowSolved = @(
+            $javaRows | Where-Object { $_.solved -eq $true }
+        ).Count
+        $invalidTaskRows = @(
+            $tasks | Where-Object {
+                $_.status -cne "completed" -or
+                $_.model -cne $ExpectedModelId -or
+                $_.solved -isnot [bool] -or
+                (
+                    $_.task_id -clike "py-*" -and
+                    $_.language -cne "python"
+                ) -or
+                (
+                    $_.task_id -clike "java-*" -and
+                    $_.language -cne "java"
+                )
+            }
+        )
+    }
+    catch {
+        throw "Formal acceptance summary is invalid."
+    }
+
+    if (
+        $report.status -cne "completed" -or
+        $report.suite_id -cne "repo-agent-python-java-day3-v1" -or
+        $report.variant -cne "full" -or
+        $trial -ne 1 -or
+        $report.model -cne $ExpectedModelId -or
+        $taskCount -ne 12 -or
+        $completedTaskCount -ne 12 -or
+        $tasks.Count -ne 12
+    ) {
+        throw "Formal acceptance did not complete the fixed full trial-1 suite."
+    }
+
+    $expectedTaskIds = @(
+        1..6 | ForEach-Object { "py-bugfix-{0:D3}" -f $_ }
+    ) + @(
+        1..6 | ForEach-Object { "java-bugfix-{0:D3}" -f $_ }
+    )
+    $taskIdDifferences = @(
+        Compare-Object `
+            -ReferenceObject $expectedTaskIds `
+            -DifferenceObject $taskIds `
+            -CaseSensitive
+    )
+    if ($taskIdDifferences.Count -ne 0) {
+        throw "Formal acceptance task identity does not match the frozen suite."
+    }
+    if (
+        $invalidTaskRows.Count -ne 0 -or
+        $rowSolvedTaskCount -ne $solvedTaskCount -or
+        $pythonRows.Count -ne $pythonTaskCount -or
+        $pythonRowSolved -ne $pythonSolved -or
+        $javaRows.Count -ne $javaTaskCount -or
+        $javaRowSolved -ne $javaSolved
+    ) {
+        throw "Formal acceptance task rows do not match its aggregate totals."
+    }
+    if ($solvedTaskCount -lt 8) {
+        throw "Formal acceptance failed: fewer than 8 of 12 tasks solved."
+    }
+    if ($pythonTaskCount -ne 6 -or $pythonSolved -lt 4) {
+        throw "Formal acceptance failed: fewer than 4 of 6 Python tasks solved."
+    }
+    if ($javaTaskCount -ne 6 -or $javaSolved -lt 4) {
+        throw "Formal acceptance failed: fewer than 4 of 6 Java tasks solved."
+    }
+
+    $budgetFailures = @(
+        $tasks | Where-Object { $_.budget_passed -ne $true }
+    )
+    $timeoutFailures = @(
+        $tasks | Where-Object { $_.agent.timed_out -ne $false }
+    )
+    $budgetCategories = @(
+        $tasks | Where-Object {
+            $_.failure_category -cin @("budget_exceeded", "agent_timeout")
+        }
+    )
+    $usageFailures = @(
+        $tasks | Where-Object {
+            $_.agent.usage.complete -ne $true -or
+            $null -eq $_.agent.usage.total_tokens -or
+            [Convert]::ToInt64($_.agent.usage.total_tokens) -gt 30000
+        }
+    )
+    if (
+        $report.tokens.complete -ne $true -or
+        $budgetFailures.Count -ne 0 -or
+        $timeoutFailures.Count -ne 0 -or
+        $budgetCategories.Count -ne 0 -or
+        $usageFailures.Count -ne 0
+    ) {
+        throw "Formal acceptance failed: a task exceeded its budget or timed out."
+    }
+    if (
+        [Double]::IsNaN($p95Milliseconds) -or
+        [Double]::IsInfinity($p95Milliseconds) -or
+        $p95Milliseconds -lt 0.0 -or
+        $p95Milliseconds -gt 480000.0
+    ) {
+        throw "Formal acceptance failed: p95 latency exceeds 480 seconds."
+    }
+    Write-Host (
+        "Formal acceptance passed: {0}/12 solved; Python {1}/6; Java {2}/6; p95 {3:N0} ms." -f
+        $solvedTaskCount,
+        $pythonSolved,
+        $javaSolved,
+        $p95Milliseconds
+    )
 }
 
 function Set-RelayEnvironment {
@@ -555,6 +955,7 @@ function Set-RelayEnvironment {
         [Parameter(Mandatory = $true)][string]$ModelId
     )
 
+    $ApiKey = $ApiKey.Trim()
     Assert-ApiKey -ApiKey $ApiKey
     Assert-ModelId -ModelId $ModelId
     [Environment]::SetEnvironmentVariable(
@@ -593,8 +994,64 @@ function Invoke-RelayLauncher {
     $promptedKey = $null
     $pythonInvocation = $null
     try {
+        $evaluationConflicts = @(
+            $relayInvocationParameterNames | Where-Object {
+                $_ -cin @(
+                    "Repository",
+                    "Model",
+                    "Port",
+                    "OpenBrowser",
+                    "Reconfigure",
+                    "ConfigureOnly",
+                    "Verify",
+                    "FormalEvaluate"
+                )
+            }
+        )
+        if (
+            $Evaluate -and
+            (
+                $evaluationConflicts.Count -ne 0 -or
+                $FormalEvaluate -or
+                $OpenBrowser -or
+                $Reconfigure -or
+                $ConfigureOnly -or
+                $Verify -or
+                -not [string]::IsNullOrWhiteSpace($Model)
+            )
+        ) {
+            throw "-Evaluate cannot be combined with startup, configuration, verification, or formal evaluation options."
+        }
+        $formalConflicts = @(
+            $relayInvocationParameterNames | Where-Object {
+                $_ -cin @(
+                    "Repository",
+                    "Model",
+                    "Port",
+                    "OpenBrowser",
+                    "Reconfigure",
+                    "ConfigureOnly",
+                    "Verify",
+                    "Evaluate"
+                )
+            }
+        )
+        if (
+            $FormalEvaluate -and
+            (
+                $formalConflicts.Count -ne 0 -or
+                $Evaluate -or
+                $OpenBrowser -or
+                $Reconfigure -or
+                $ConfigureOnly -or
+                $Verify -or
+                -not [string]::IsNullOrWhiteSpace($Model)
+            )
+        ) {
+            throw "-FormalEvaluate cannot be combined with startup, configuration, verification, or development evaluation options."
+        }
         $repositoryPath = $null
-        if (-not $ConfigureOnly) {
+        if (-not $ConfigureOnly -and -not $Evaluate -and -not $FormalEvaluate) {
             $repositoryPath = (
                 Resolve-Path -LiteralPath $Repository -ErrorAction Stop
             ).Path
@@ -616,6 +1073,15 @@ function Invoke-RelayLauncher {
         $initialFingerprint = Get-RelayConfigFingerprint -Path $configPath
         $configurationExists = $initialFingerprint -cne "missing"
         $shouldConfigure = $Reconfigure -or -not $configurationExists
+        if (($Evaluate -or $FormalEvaluate) -and $shouldConfigure) {
+            $evaluationMode = if ($FormalEvaluate) {
+                "-FormalEvaluate"
+            }
+            else {
+                "-Evaluate"
+            }
+            throw "$evaluationMode requires an existing saved relay configuration."
+        }
         if (
             -not $shouldConfigure -and
             -not [string]::IsNullOrWhiteSpace($Model)
@@ -625,7 +1091,7 @@ function Invoke-RelayLauncher {
 
         if ($shouldConfigure) {
             $promptedKey = Read-Host (
-                "Relay API key (masked as *; DPAPI-encrypted when saved)"
+            "DeepSeek API key (masked as *; DPAPI-encrypted when saved)"
             ) -AsSecureString
             Set-ProcessApiKey -SecureKey $promptedKey
             $promptedKey.Dispose()
@@ -639,12 +1105,15 @@ function Invoke-RelayLauncher {
             $modelIds = @(Get-RelayModelIds -BaseUrl $relayBaseUrl)
             $selectedModel = $Model.Trim()
             if ([string]::IsNullOrWhiteSpace($selectedModel)) {
-                $selectedModel = Select-RelayModel -ModelIds $modelIds
+                if ($modelIds -cnotcontains $defaultModelId) {
+                    throw "The default DeepSeek model is currently unavailable."
+                }
+                $selectedModel = $defaultModelId
             }
             else {
                 Assert-ModelId -ModelId $selectedModel
                 if ($modelIds -cnotcontains $selectedModel) {
-                    throw "The requested model ID was not returned by the relay."
+                    throw "The requested model ID was not returned by DeepSeek."
                 }
             }
             [Environment]::SetEnvironmentVariable(
@@ -661,7 +1130,7 @@ function Invoke-RelayLauncher {
                 -BaseUrl $relayBaseUrl `
                 -ModelId $selectedModel `
                 -ExpectedFingerprint $initialFingerprint
-            Write-Host "Encrypted relay configuration saved: $configPath"
+            Write-Host "Encrypted DeepSeek configuration saved: $configPath"
         }
         else {
             $loadedConfig = Read-RelayConfig -Path $configPath
@@ -672,7 +1141,7 @@ function Invoke-RelayLauncher {
             $loadedConfig.ApiKey = $null
             $loadedConfig = $null
             Write-Host (
-                "Loaded saved relay configuration for model: {0}" -f
+                "Loaded saved DeepSeek configuration for model: {0}" -f
                 $loadedModel
             )
             if ($Verify) {
@@ -688,6 +1157,14 @@ function Invoke-RelayLauncher {
 
         if ($null -eq $pythonInvocation) {
             $pythonInvocation = @(Get-CheckedPythonInvocation)
+        }
+        if ($FormalEvaluate) {
+            Invoke-RelayFormalEvaluation -PythonInvocation $pythonInvocation
+            return
+        }
+        if ($Evaluate) {
+            Invoke-RelayEvaluation -PythonInvocation $pythonInvocation
+            return
         }
         $pythonExecutable = $pythonInvocation[0]
         $pythonPrefix = @($pythonInvocation | Select-Object -Skip 1)

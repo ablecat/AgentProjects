@@ -175,6 +175,7 @@ def main() -> int:
     containers = ContainerRegistry(docker, run_id)
     report: dict[str, object] = {
         "schema_version": 1,
+        "run_label": containers.label,
         "status": "failed",
         "exit_code": EXIT_RUNTIME_ERROR,
         "offline": True,
@@ -264,6 +265,7 @@ def main() -> int:
         _verify_runtime_isolation(
             docker, checks, "python", python_id, python_workspace
         )
+        _verify_init_process_reaping(docker, checks, python_id)
         _verify_runtime_isolation(
             docker, checks, "maven", maven_id, maven_workspace
         )
@@ -954,6 +956,24 @@ def _verify_runtime_isolation(
     )
 
 
+def _verify_init_process_reaping(
+    docker: DockerCli, checks: list[dict[str, object]], container_id: str
+) -> None:
+    outcome = _exec(
+        docker,
+        container_id,
+        ("python", "/workspace/process_lifecycle_probe.py"),
+        allowed=(0, 1),
+    )
+    passed = outcome.exit_code == 0 and outcome.output.strip() == "process-tree-reaped"
+    detail = (
+        "the --init process reaped the terminated descendant"
+        if passed
+        else f"process lifecycle probe failed: {_bounded_detail(outcome.output)}"
+    )
+    _require(checks, "python.runtime.init_reaps_descendants", passed, detail)
+
+
 def _verify_network_isolation(
     docker: DockerCli,
     checks: list[dict[str, object]],
@@ -1130,6 +1150,60 @@ def _create_python_fixture(workspace: Path) -> None:
         "from calculator import add\n\n\n"
         "def test_addition() -> None:\n"
         "    assert add(20, 22) == 42\n",
+        encoding="utf-8",
+        newline="",
+    )
+    shutil.copyfile(
+        PROJECT_ROOT / "src" / "repo_agent" / "processes.py",
+        workspace / "repo_agent_processes.py",
+    )
+    (workspace / "process_lifecycle_probe.py").write_text(
+        """\
+from __future__ import annotations
+
+import pathlib
+import sys
+import time
+
+sys.dont_write_bytecode = True
+
+from repo_agent_processes import run_isolated_capture
+
+
+parent_code = (
+    "import subprocess, sys; "
+    "child = subprocess.Popen([sys.executable, '-c', "
+    "'import time; time.sleep(30)']); "
+    "print(child.pid, flush=True)"
+)
+captured = run_isolated_capture(
+    (sys.executable, "-c", parent_code),
+    timeout_seconds=5,
+    max_stdout_bytes=128,
+    max_stderr_bytes=128,
+)
+if captured.returncode != 0 or captured.timed_out or captured.stdout_truncated:
+    print("process-boundary-result-invalid")
+    raise SystemExit(1)
+try:
+    child_pid = int(captured.stdout.strip())
+except ValueError:
+    print("process-boundary-pid-invalid")
+    raise SystemExit(1)
+
+stat_path = pathlib.Path(f"/proc/{child_pid}/stat")
+deadline = time.monotonic() + 3
+while stat_path.exists() and time.monotonic() < deadline:
+    time.sleep(0.02)
+if stat_path.exists():
+    try:
+        state = stat_path.read_text(encoding="ascii").rsplit(") ", 1)[1].split()[0]
+    except (IndexError, OSError, UnicodeError):
+        state = "unknown"
+    print(f"descendant-state={state}")
+    raise SystemExit(1)
+print("process-tree-reaped")
+""",
         encoding="utf-8",
         newline="",
     )

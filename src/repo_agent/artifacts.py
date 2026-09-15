@@ -17,11 +17,92 @@ from .run_models import ARTIFACT_FILENAMES, ArtifactKind, RunRecord, utc_now
 _SECRET_PATTERNS = (
     re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+\-/]+=*"),
     re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"),
-    re.compile(
-        r"(?i)(api[_-]?key|access[_-]?token|authorization|password)"
-        r"(\s*[:=]\s*)([^\s,;]+)"
-    ),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+)
+
+_PATCH_SECRET_PATTERNS = _SECRET_PATTERNS
+_MIN_CONFIGURED_SECRET_SCAN_LENGTH = 8
+_PATCH_ASSIGNMENT_PATTERN = re.compile(
+    r"(?im)(?<![A-Za-z0-9_$-])"
+    r"(?P<quote>[\"']?)(?P<name>[A-Za-z][A-Za-z0-9_-]{0,127})(?P=quote)"
+    r"\s*(?P<separator>:(?!=)|=(?!=|>))\s*(?P<value>[^\r\n]*)"
+)
+_PATCH_SUBSCRIPT_ASSIGNMENT_PATTERN = re.compile(
+    r"(?im)(?<![A-Za-z0-9_$-])(?:[A-Za-z_][A-Za-z0-9_.]*)"
+    r"\[\s*(?P<quote>[\"'])(?P<name>[A-Za-z][A-Za-z0-9_-]{0,127})"
+    r"(?P=quote)\s*\]\s*(?P<separator>=(?!=|>))\s*(?P<value>[^\r\n]*)"
+)
+_PATCH_POWERSHELL_ASSIGNMENT_PATTERN = re.compile(
+    r"(?im)(?<![A-Za-z0-9_$-])\$(?:env:)?(?P<brace>\{)?\s*"
+    r"(?P<name>[A-Za-z][A-Za-z0-9_-]{0,127})\s*(?(brace)\})"
+    r"\s*(?P<separator>=(?!=|>))\s*(?P<value>[^\r\n]*)"
+)
+_PATCH_ASSIGNMENT_PATTERNS = (
+    _PATCH_POWERSHELL_ASSIGNMENT_PATTERN,
+    _PATCH_SUBSCRIPT_ASSIGNMENT_PATTERN,
+    _PATCH_ASSIGNMENT_PATTERN,
+)
+_PATCH_SECRET_LITERAL_CALL_PATTERN = re.compile(
+    r"(?im)(?:os\.putenv|os\.environ\.setdefault)\(\s*"
+    r"(?P<key_quote>[\"'])(?P<name>[A-Za-z][A-Za-z0-9_-]{0,127})"
+    r"(?P=key_quote)\s*,\s*(?P<value_quote>[\"'])"
+    r"(?P<value>(?:\\.|[^\\\r\n])*?)(?P=value_quote)"
+)
+_SAFE_PATCH_VALUE_MARKERS = frozenset(
+    {
+        "",
+        "***",
+        "<api-key>",
+        "<password>",
+        "<redacted>",
+        "<secret>",
+        "<token>",
+        "[redacted]",
+        "changeme",
+        "dummy",
+        "example",
+        "fake",
+        "none",
+        "null",
+        "placeholder",
+        "redacted",
+        "replace-me",
+        "replace_me",
+        "test",
+        "undefined",
+        "your-api-key",
+        "your-password",
+        "your-secret",
+        "your-token",
+    }
+)
+_SAFE_PATCH_REFERENCE_PATTERNS = (
+    re.compile(r"(?:os\.)?getenv\(\s*[\"'][A-Z_][A-Z0-9_]*[\"']\s*\)"),
+    re.compile(r"System\.getenv\(\s*[\"'][A-Z_][A-Z0-9_]*[\"']\s*\)"),
+    re.compile(r"os\.environ\[\s*[\"'][A-Z_][A-Z0-9_]*[\"']\s*\]"),
+    re.compile(
+        r"(?:config|env|process\.env|request|self|settings)\."
+        r"[A-Za-z_][A-Za-z0-9_]*"
+    ),
+    re.compile(
+        r"(?:config|request|settings)\[\s*[\"'][A-Za-z_][A-Za-z0-9_]*"
+        r"[\"']\s*\]"
+    ),
+    re.compile(r"\$(?:env:)?[A-Za-z_][A-Za-z0-9_]*"),
+    re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}"),
+)
+_SAFE_PATCH_IDENTIFIERS = frozenset(
+    {"api_key", "credential", "key", "password", "secret", "token", "value"}
+)
+_SAFE_PATCH_TYPE = (
+    r"(?:str|bytes|SecretStr|string)(?:\s*\|\s*(?:None|undefined|null))*"
+)
+_SAFE_PATCH_TYPE_PATTERN = re.compile(_SAFE_PATCH_TYPE)
+_PATCH_TYPED_ASSIGNMENT_PATTERN = re.compile(
+    rf"{_SAFE_PATCH_TYPE}\s*=(?!=|>)\s*(?P<value>.*)"
+)
+_PATCH_TYPED_OPERATOR_PATTERN = re.compile(
+    rf"{_SAFE_PATCH_TYPE}\s*(?:==|!=|<=|>=|=>|:=).*"
 )
 
 
@@ -33,13 +114,96 @@ def redact_text(value: str, *, secrets: tuple[str, ...] = ()) -> str:
     """Remove configured and high-confidence credential forms from text."""
 
     result = value
-    for secret in sorted((item for item in secrets if item), key=len, reverse=True):
+    for secret in sorted(
+        (
+            item
+            for item in secrets
+            if len(item) >= _MIN_CONFIGURED_SECRET_SCAN_LENGTH
+        ),
+        key=len,
+        reverse=True,
+    ):
         result = result.replace(secret, "[REDACTED]")
     result = _SECRET_PATTERNS[0].sub("Bearer [REDACTED]", result)
     result = _SECRET_PATTERNS[1].sub("[REDACTED]", result)
-    result = _SECRET_PATTERNS[2].sub(r"\1\2[REDACTED]", result)
-    result = _SECRET_PATTERNS[3].sub("[REDACTED]", result)
+    result = _SECRET_PATTERNS[2].sub("[REDACTED]", result)
+    result = _redact_secret_assignments(result)
+    result = _redact_secret_literal_calls(result)
     return result
+
+
+def patch_contains_credential(value: str, *, secrets: tuple[str, ...] = ()) -> bool:
+    """Return whether an executable patch contains high-confidence credentials."""
+
+    if any(_contains_configured_secret(value, secret) for secret in secrets if secret):
+        return True
+    if any(pattern.search(value) is not None for pattern in _PATCH_SECRET_PATTERNS):
+        return True
+    for pattern in _PATCH_ASSIGNMENT_PATTERNS:
+        for match in pattern.finditer(value):
+            if not _is_secret_key(match.group("name")):
+                continue
+            candidate = _patch_assignment_value(match)
+            if candidate is None:
+                continue
+            if not _safe_patch_assignment_value(candidate):
+                return True
+    for match in _PATCH_SECRET_LITERAL_CALL_PATTERN.finditer(value):
+        if _secret_literal_call_contains_credential(match):
+            return True
+    return False
+
+
+def _contains_configured_secret(value: str, secret: str) -> bool:
+    return len(secret) >= _MIN_CONFIGURED_SECRET_SCAN_LENGTH and secret in value
+
+
+def _safe_patch_type_value(value: str) -> bool:
+    candidate = value.strip().removesuffix(",").removesuffix(";").strip()
+    return _SAFE_PATCH_TYPE_PATTERN.fullmatch(candidate) is not None
+
+
+def _patch_assignment_value(match: re.Match[str]) -> str | None:
+    candidate = match.group("value").strip()
+    if match.group("separator") != ":":
+        return candidate
+    typed_assignment = _PATCH_TYPED_ASSIGNMENT_PATTERN.fullmatch(candidate)
+    if typed_assignment is not None:
+        return typed_assignment.group("value").strip()
+    if _safe_patch_type_value(candidate):
+        return None
+    if _PATCH_TYPED_OPERATOR_PATTERN.fullmatch(candidate) is not None:
+        return None
+    return candidate
+
+
+def _secret_literal_call_contains_credential(match: re.Match[str]) -> bool:
+    if not _is_secret_key(match.group("name")):
+        return False
+    quote = match.group("value_quote")
+    return not _safe_patch_assignment_value(quote + match.group("value") + quote)
+
+
+def _safe_patch_assignment_value(value: str) -> bool:
+    candidate = value.strip().removesuffix(",").removesuffix(";").strip()
+    quoted = (
+        len(candidate) >= 2
+        and candidate[0] in {"'", '"'}
+        and candidate[-1] == candidate[0]
+    )
+    normalized = candidate[1:-1] if quoted else candidate
+    folded = normalized.casefold()
+    if folded in _SAFE_PATCH_VALUE_MARKERS:
+        return True
+    if quoted:
+        return False
+    if candidate == "...":
+        return True
+    if re.fullmatch(r"[A-Z][A-Z0-9_]*", candidate):
+        return True
+    if any(pattern.fullmatch(candidate) for pattern in _SAFE_PATCH_REFERENCE_PATTERNS):
+        return True
+    return candidate in _SAFE_PATCH_IDENTIFIERS
 
 
 def redact_value(value: Any, *, secrets: tuple[str, ...] = ()) -> Any:
@@ -62,14 +226,56 @@ def redact_value(value: Any, *, secrets: tuple[str, ...] = ()) -> Any:
 
 
 def _is_secret_key(value: str) -> bool:
-    normalized = re.sub(r"(?<!^)(?=[A-Z])", "_", value).lower()
+    normalized = value.replace("-", "_")
+    normalized = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", normalized)
+    normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", normalized).casefold()
     return bool(
         re.search(
-            r"(?:^|[_-])(?:token|secret|password|authorization)(?:$|[_-])"
-            r"|(?:^|[_-])api[_-]?key(?:$|[_-])",
+            r"(?:^|[_-])(?:token|secret|password|passwd|authorization)"
+            r"(?:$|[_-])|(?:^|[_-])(?:api|private)[_-]?key(?:$|[_-])",
             normalized,
         )
     )
+
+
+def _redact_secret_assignments(value: str) -> str:
+    chunks: list[str] = []
+    cursor = 0
+    matches = sorted(
+        (
+            match
+            for pattern in _PATCH_ASSIGNMENT_PATTERNS
+            for match in pattern.finditer(value)
+            if _is_secret_key(match.group("name"))
+            and _patch_assignment_value(match) is not None
+        ),
+        key=lambda match: (match.start(), -match.end()),
+    )
+    for match in matches:
+        if match.start() < cursor:
+            continue
+        chunks.append(value[cursor : match.start("value")])
+        chunks.append("[REDACTED]")
+        cursor = match.end("value")
+    if not chunks:
+        return value
+    chunks.append(value[cursor:])
+    return "".join(chunks)
+
+
+def _redact_secret_literal_calls(value: str) -> str:
+    chunks: list[str] = []
+    cursor = 0
+    for match in _PATCH_SECRET_LITERAL_CALL_PATTERN.finditer(value):
+        if not _secret_literal_call_contains_credential(match):
+            continue
+        chunks.append(value[cursor : match.start("value_quote")])
+        chunks.append("[REDACTED]")
+        cursor = match.end()
+    if not chunks:
+        return value
+    chunks.append(value[cursor:])
+    return "".join(chunks)
 
 
 class ArtifactStore:
@@ -104,7 +310,9 @@ class ArtifactStore:
 
     def write_patch(self, run_id: str, patch: str) -> Path:
         path = self.path(run_id, "patch")
-        self._atomic_write(path, redact_text(patch, secrets=self._secrets))
+        if patch_contains_credential(patch, secrets=self._secrets):
+            raise ArtifactError("candidate patch contains credential-like content")
+        self._atomic_write(path, patch)
         return path
 
     def write_report(self, run_id: str, report: str) -> Path:
@@ -186,6 +394,7 @@ class ArtifactStore:
 __all__ = [
     "ArtifactError",
     "ArtifactStore",
+    "patch_contains_credential",
     "redact_text",
     "redact_value",
 ]

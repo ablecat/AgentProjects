@@ -161,6 +161,54 @@ def test_maven_fixture_has_no_remote_dependencies_or_schema(tmp_path: Path) -> N
     assert (workspace / ".jansi").is_dir()
 
 
+def test_python_fixture_contains_current_process_lifecycle_probe(tmp_path: Path) -> None:
+    workspace = tmp_path / "python"
+
+    smoke_day6._create_python_fixture(workspace)
+
+    copied = workspace / "repo_agent_processes.py"
+    probe = workspace / "process_lifecycle_probe.py"
+    assert copied.read_bytes() == (
+        Path(smoke_day6.PROJECT_ROOT) / "src" / "repo_agent" / "processes.py"
+    ).read_bytes()
+    compile(probe.read_text(encoding="utf-8"), str(probe), "exec")
+    assert "process-tree-reaped" in probe.read_text(encoding="utf-8")
+
+
+def test_init_process_reaping_requires_the_exact_success_marker() -> None:
+    class RecordingDocker:
+        def __init__(self, outcome: CommandOutcome) -> None:
+            self.outcome = outcome
+            self.commands: list[tuple[str, ...]] = []
+
+        def invoke(self, args, **_kwargs):
+            self.commands.append(tuple(args))
+            return self.outcome
+
+    container_id = "a" * 64
+    checks: list[dict[str, object]] = []
+    docker = RecordingDocker(CommandOutcome(0, "process-tree-reaped\n"))
+
+    smoke_day6._verify_init_process_reaping(docker, checks, container_id)
+
+    assert checks == [
+        {
+            "name": "python.runtime.init_reaps_descendants",
+            "ok": True,
+            "detail": "the --init process reaped the terminated descendant",
+        }
+    ]
+    assert docker.commands == [
+        (
+            "container",
+            "exec",
+            container_id,
+            "python",
+            "/workspace/process_lifecycle_probe.py",
+        )
+    ]
+
+
 def test_base_image_contract_uses_portable_digest_not_local_image_id(
     tmp_path: Path,
 ) -> None:

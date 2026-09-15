@@ -37,11 +37,11 @@ Agent 不会读取当前仓库的未提交内容。真实维护任务发现 dirt
 
 ## 3. 配置并验证模型
 
-当前中转站使用 `https://thz10.airucas.com/v1` 作为 API Base URL。首次配置或
-轮换 Key 时，在项目根目录运行：
+当前使用 DeepSeek 官方 `https://api.deepseek.com` 作为 API Base URL，模型为
+`deepseek-v4-pro`。首次配置或轮换 Key 时，在项目根目录运行：
 
 ```powershell
-.\scripts\start-relay.ps1 -Reconfigure -ConfigureOnly
+.\scripts\start-relay.ps1 -Reconfigure -ConfigureOnly -Model deepseek-v4-pro
 ```
 
 脚本会通过显示星号遮罩的 PowerShell 提示读取 API Key，不把密钥写入命令历史、`.env`
@@ -57,14 +57,42 @@ Base URL 和模型才会作为一个整体由 Windows DPAPI 加密并原子保�
 .\scripts\start-relay.ps1 -Repository D:\path\to\clean-repository
 ```
 
-需要重新执行真实模型握手时加 `-Verify`；这会产生少量模型调用费用。已知精确
-模型 ID 时，可在首次配置或 `-Reconfigure` 时加 `-Model MODEL_ID`。配置损坏、
+需要重新执行真实模型握手时加 `-Verify`；这会产生少量模型调用费用。脚本默认
+选择 `deepseek-v4-pro`；如需显式选择其他已发现的模型，可在首次配置或
+`-Reconfigure` 时加 `-Model MODEL_ID`。配置损坏、
 换机、换 Windows 用户或管理员强制重置账户凭据后，需要重新配置。脚本退出时仍
 会清除它设置的进程级模型环境变量。
 
+只针对 4 个 development fixture 做在线调优时，可运行：
+
+```powershell
+.\scripts\start-relay.ps1 -Evaluate
+```
+
+该模式使用已保存的 DPAPI 配置，执行固定的 `full` single-mode 评测，并为每次执行
+创建新的 `evaluation-results/development-v1/` 子目录。它不接受自定义评测路径，
+也不会把 Key 放入参数、日志或评测产物。`-Evaluate` 必须单独使用，不能与启动、
+配置、复验或正式评测参数组合。只有至少解决 3/4、四项均未超预算且
+`actionable_tool_error_rate <= 5%` 时，命令才以成功状态退出。
+
+代码、prompt、模型和预算冻结后，运行正式候选验收：
+
+```powershell
+.\scripts\start-relay.ps1 -FormalEvaluate
+```
+
+该入口只运行冻结正式套件的 `full` trial 1 共 12 题，不接受仓库、端口、模型、
+任务、variant 或输出路径参数，也不能和启动、配置、复验或 `-Evaluate` 组合。
+每次运行都创建新的
+`evaluation-results/formal-v1-regression-acceptance/` 子目录，并从真实的
+`repo-agent-python-java-day3-v1/full/trial-1/summary.json` 验收：总计至少 8/12、
+Python 与 Java 各至少 4/6、所有任务都在 30,000 token 内且无超时、p95 不超过
+480 秒。此结果必须称为 v1 regression acceptance；该模式不运行 baseline、
+no-review、重复 trial、matrix 或 merge，也不会改写 `benchmarks/results/v1`。
+
 DPAPI 防止其他普通账户或离线复制者直接读取配置，但不防同一已登录账户中的恶意
 程序、管理员读取进程内存、配置文件删除或旧密文回放。若怀疑 Key 泄露，应先在
-中转站撤销旧 Key，再使用 `-Reconfigure -ConfigureOnly` 保存新 Key。
+DeepSeek 控制台撤销旧 Key，再使用 `-Reconfigure -ConfigureOnly` 保存新 Key。
 
 非本机回环地址必须使用 HTTPS，并在 `doctor`、`run` 或网页任务中显式允许远程
 模型。`doctor` 会优先探测 Responses API，在不支持时尝试 Chat Completions，并
@@ -94,7 +122,7 @@ repo-agent serve --repo D:\path\to\clean-repository --allow-bootstrap --open
 页面中的 `Remote model` 必须由用户主动勾选；未勾选时，非 loopback 模型地址会
 被策略拒绝。页面不会接受另一个宿主路径或任意 Docker 镜像。
 
-第三方中转站会收到任务提示和完成任务所需的代码片段。只对允许发送至该站点的
+DeepSeek API 会收到任务提示和完成任务所需的代码片段。只对允许发送至该服务的
 仓库使用 `Remote model`。
 
 ## 5. 使用 CLI 运行任务
@@ -206,7 +234,8 @@ REST 提交的 `repo_path` 必须是绝对路径，并位于服务启动时声�
 
 每次运行固定生成：
 
-- `patch.diff`：供人工审阅的 unified diff。
+- `patch.diff`：供人工审阅且保持原字节可应用的 unified diff；若候选包含已配置
+  密钥或高置信凭据格式，任务会在写入前失败，不会用脱敏文本改写补丁。
 - `report.md`：任务、计划、检查和风险摘要。
 - `run.json`：最终结构化状态与指标。
 - `trace.jsonl`：追加式、已脱敏的执行事件。
@@ -216,7 +245,13 @@ REST 提交的 `repo_path` 必须是绝对路径，并位于服务启动时声�
 
 - 原仓库永不以读写方式挂载，不会自动 apply、commit 或 push。
 - Agent 只修改无 hardlink 的临时候选 clone；每次验证使用新的副本。
-- 模型只获得七个受限工具，不提供 shell、网络、Git push 或 Docker socket。
+- 模型只获得七个受限工具：`list_files`、`read_file`、`read_files`、
+  `search_code`、`apply_patch`、`get_diff` 和 `finish`；不提供 shell、网络、
+  Git push 或 Docker socket。检查由工作流在独立 Docker 阶段执行，模型不能直接
+  调用检查命令。
+- 每次任务的模型预算固定为规划 4,000 token、实现与最多一次修复合计 23,500、
+  独立审查 2,500；阶段间不可借用，总量硬上限为 30,000 token。审查只有一次
+  响应，拒绝后任务失败但候选 patch 和证据会保留。
 - 路径策略拒绝绝对路径、`..`、`.git`、敏感文件、symlink、submodule、LFS、
   二进制、rename、mode change 和越界路径。
 - verify 容器使用非 root UID/GID `10001`、只读 rootfs、`network=none`、2 CPU、

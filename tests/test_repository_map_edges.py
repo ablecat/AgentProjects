@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 import subprocess
-from types import SimpleNamespace
 
 import pytest
 
 import repo_agent.repository_map as repository_map
 from repo_agent.policy import RepositoryPathError
+from repo_agent.processes import CapturedProcess
 
 
 def _git(repository: Path, *arguments: str) -> str:
@@ -168,100 +168,115 @@ def test_python_symbol_parser_contains_invalid_and_large_sources(
     assert repository_map._python_symbols(large) == ()
 
 
-class _FakeStdout:
-    def __init__(
-        self, chunks: list[bytes] | None = None, *, error: bool = False
-    ) -> None:
-        self.chunks = list(chunks or [])
-        self.error = error
-        self.closed = False
-
-    def read(self, _size: int) -> bytes:
-        if self.error:
-            raise OSError("pipe read failed")
-        return self.chunks.pop(0) if self.chunks else b""
-
-    def close(self) -> None:
-        self.closed = True
-
-
-class _FakeProcess:
-    def __init__(
-        self,
-        *,
-        chunks: list[bytes] | None = None,
-        returncode: int = 0,
-        timeout: bool = False,
-        read_error: bool = False,
-    ) -> None:
-        self.stdout = _FakeStdout(chunks, error=read_error)
-        self.returncode = returncode
-        self.timeout = timeout
-        self.killed = False
-        self.wait_calls = 0
-
-    def wait(self, timeout=None):
-        self.wait_calls += 1
-        if self.timeout and self.wait_calls == 1:
-            raise subprocess.TimeoutExpired("git", timeout)
-        return self.returncode
-
-    def kill(self) -> None:
-        self.killed = True
-        self.returncode = -9
-
-    def poll(self):
-        return self.returncode
-
-
 def test_git_path_listing_is_bounded_and_decodes_invalid_names(
     tmp_path: Path, monkeypatch
 ) -> None:
-    process = _FakeProcess(chunks=[b"abc\xff\x00second.py\x00"])
+    process = CapturedProcess(
+        0, b"abc\xff\x00second.py\x00", b"", False, False, False
+    )
     monkeypatch.setattr(
-        repository_map.subprocess, "Popen", lambda *_args, **_kwargs: process
+        repository_map,
+        "run_isolated_capture",
+        lambda *_args, **_kwargs: process,
     )
 
     paths, truncated = repository_map._listed_paths(tmp_path)
 
     assert paths == ["abc\ufffd", "second.py"]
     assert truncated is False
-    assert process.stdout.closed is True
 
-    bounded = _FakeProcess(chunks=[b"abcdef\x00"])
-    monkeypatch.setattr(repository_map, "MAX_SCAN_BYTES", 4)
+    bounded = CapturedProcess(
+        1, b"complete.py\x00partial.py", b"", True, False, False
+    )
     monkeypatch.setattr(
-        repository_map.subprocess, "Popen", lambda *_args, **_kwargs: bounded
+        repository_map,
+        "run_isolated_capture",
+        lambda *_args, **_kwargs: bounded,
     )
     paths, truncated = repository_map._listed_paths(tmp_path)
-    assert paths == ["abcd"]
+    assert paths == ["complete.py"]
     assert truncated is True
-    assert bounded.killed is True
+
+    complete_boundary = CapturedProcess(
+        1, b"complete.py\x00", b"", True, False, False
+    )
+    monkeypatch.setattr(
+        repository_map,
+        "run_isolated_capture",
+        lambda *_args, **_kwargs: complete_boundary,
+    )
+    paths, truncated = repository_map._listed_paths(tmp_path)
+    assert paths == ["complete.py"]
+    assert truncated is True
+
+    no_complete_record = CapturedProcess(1, b"partial.py", b"", True, False, False)
+    monkeypatch.setattr(
+        repository_map,
+        "run_isolated_capture",
+        lambda *_args, **_kwargs: no_complete_record,
+    )
+    paths, truncated = repository_map._listed_paths(tmp_path)
+    assert paths == []
+    assert truncated is True
+
+
+def test_truncated_git_path_cannot_expose_an_ignored_prefix(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    _git(repository, "init", "--quiet")
+    (repository / ".gitignore").write_text("notes.py\n", encoding="utf-8")
+    (repository / "notes.py").write_text(
+        "def private_notes():\n    return 'ignored'\n", encoding="utf-8"
+    )
+    (repository / "notes.py-long").write_text("tracked\n", encoding="utf-8")
+    _git(repository, "add", ".gitignore", "notes.py-long")
+
+    monkeypatch.setattr(
+        repository_map, "MAX_SCAN_BYTES", len(b".gitignore\x00notes.py")
+    )
+
+    paths, truncated = repository_map._listed_paths(repository)
+    result = repository_map.build_repository_map(repository)
+
+    assert paths == [".gitignore"]
+    assert truncated is True
+    assert result.truncated is True
+    assert "- notes.py\n" not in result.output
+    assert "private_notes" not in result.output
 
 
 def test_git_path_listing_maps_timeout_exit_and_pipe_failures(
     tmp_path: Path, monkeypatch
 ) -> None:
-    timeout = _FakeProcess(timeout=True)
+    timeout = CapturedProcess(-9, b"", b"", False, False, True)
     monkeypatch.setattr(
-        repository_map.subprocess, "Popen", lambda *_args, **_kwargs: timeout
+        repository_map,
+        "run_isolated_capture",
+        lambda *_args, **_kwargs: timeout,
     )
     with pytest.raises(OSError, match="timed out"):
         repository_map._listed_paths(tmp_path)
-    assert timeout.killed is True
 
-    failed = _FakeProcess(returncode=2)
+    failed = CapturedProcess(2, b"", b"", False, False, False)
     monkeypatch.setattr(
-        repository_map.subprocess, "Popen", lambda *_args, **_kwargs: failed
+        repository_map,
+        "run_isolated_capture",
+        lambda *_args, **_kwargs: failed,
     )
     with pytest.raises(OSError, match="exited with code 2"):
         repository_map._listed_paths(tmp_path)
 
-    unreadable = _FakeProcess(read_error=True)
+    def unreadable(*_args, **_kwargs):
+        raise OSError("failed to process stdout")
+
     monkeypatch.setattr(
-        repository_map.subprocess, "Popen", lambda *_args, **_kwargs: unreadable
+        repository_map,
+        "run_isolated_capture",
+        unreadable,
     )
-    with pytest.raises(OSError, match="failed to read"):
+    with pytest.raises(OSError, match="failed to process stdout"):
         repository_map._listed_paths(tmp_path)
 
 
@@ -276,16 +291,20 @@ def test_git_text_and_environment_are_failure_tolerant(
     assert environment["GIT_TERMINAL_PROMPT"] == "0"
 
     monkeypatch.setattr(
-        repository_map.subprocess,
-        "run",
-        lambda *_args, **_kwargs: SimpleNamespace(returncode=1, stdout=b"secret"),
+        repository_map,
+        "run_isolated_capture",
+        lambda *_args, **_kwargs: CapturedProcess(
+            1, b"secret", b"", False, False, False
+        ),
     )
     assert repository_map._git_text(tmp_path, "rev-parse", "HEAD") == ""
 
     monkeypatch.setattr(
-        repository_map.subprocess,
-        "run",
-        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=b"abc\xff\n"),
+        repository_map,
+        "run_isolated_capture",
+        lambda *_args, **_kwargs: CapturedProcess(
+            0, b"abc\xff\n", b"", False, False, False
+        ),
     )
     assert repository_map._git_text(tmp_path, "rev-parse", "HEAD") == "abc\ufffd"
 

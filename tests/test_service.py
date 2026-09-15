@@ -125,7 +125,7 @@ def test_run_agent_rejects_non_boolean_mutation_capability(tmp_path) -> None:
     assert RecordingSandbox.instances == []
 
 
-@pytest.mark.parametrize("task", ["", "   ", None, 42])
+@pytest.mark.parametrize("task", ["", "   ", "bad\x00task", None, 42])
 def test_run_agent_rejects_empty_or_non_text_tasks_before_sandbox(
     task, tmp_path
 ) -> None:

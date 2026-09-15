@@ -12,7 +12,6 @@ import math
 import os
 from pathlib import Path
 import re
-import subprocess
 import threading
 import time
 from typing import Any, Callable, Mapping
@@ -25,6 +24,7 @@ from .artifacts import ArtifactError
 from .checks import MAX_PHASE_TIMEOUT_SECONDS, MAX_RUN_TIMEOUT_SECONDS
 from .models import RunResult
 from .persistence import RunNotFoundError
+from .processes import run_isolated_capture
 from .run_models import ARTIFACT_FILENAMES, RunRecord
 from .sandbox import (
     DEFAULT_POLICY,
@@ -183,31 +183,21 @@ class RepoAgentRequestHandler(BaseHTTPRequestHandler):
             )
             return
         try:
-            length = int(self.headers.get("Content-Length", ""))
-        except ValueError:
-            length = -1
-        if length < 0:
-            self._send_api_error(
-                HTTPStatus.LENGTH_REQUIRED,
-                "length_required",
-                "A valid Content-Length is required",
-            )
-            return
-        if length > MAX_REQUEST_BYTES:
-            self._send_api_error(
-                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
-                "request_too_large",
-                f"Request body must be at most {MAX_REQUEST_BYTES} bytes",
-            )
+            length = self._validated_content_length()
+        except _WebRequestError as exc:
+            self._send_api_error(exc.status, exc.code, exc.message)
             return
 
         try:
-            raw_body = self.rfile.read(length)
+            raw_body = self._read_exact_body(length)
             payload = json.loads(
                 raw_body.decode("utf-8"),
                 parse_constant=_reject_json_constant,
             )
             request = _validated_run_request(payload)
+        except _WebRequestError as exc:
+            self._send_api_error(exc.status, exc.code, exc.message)
+            return
         except (TimeoutError, OSError):
             self._send_api_error(
                 HTTPStatus.REQUEST_TIMEOUT,
@@ -474,28 +464,9 @@ class RepoAgentRequestHandler(BaseHTTPRequestHandler):
                 "unsupported_media_type",
                 "Content-Type must be application/json",
             )
+        length = self._validated_content_length()
         try:
-            length = int(self.headers.get("Content-Length", ""))
-        except ValueError as exc:
-            raise _WebRequestError(
-                HTTPStatus.LENGTH_REQUIRED,
-                "length_required",
-                "A valid Content-Length is required",
-            ) from exc
-        if length < 0:
-            raise _WebRequestError(
-                HTTPStatus.LENGTH_REQUIRED,
-                "length_required",
-                "A valid Content-Length is required",
-            )
-        if length > MAX_REQUEST_BYTES:
-            raise _WebRequestError(
-                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
-                "request_too_large",
-                f"Request body must be at most {MAX_REQUEST_BYTES} bytes",
-            )
-        try:
-            raw = self.rfile.read(length)
+            raw = self._read_exact_body(length)
         except (TimeoutError, OSError) as exc:
             raise _WebRequestError(
                 HTTPStatus.REQUEST_TIMEOUT,
@@ -512,6 +483,49 @@ class RepoAgentRequestHandler(BaseHTTPRequestHandler):
                 "invalid_json",
                 "Request body must be valid UTF-8 JSON",
             ) from exc
+
+    def _validated_content_length(self) -> int:
+        values = self.headers.get_all("Content-Length") or []
+        if len(values) > 1:
+            raise _WebRequestError(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_request",
+                "Request must contain exactly one Content-Length header",
+            )
+        raw_length = values[0] if values else ""
+        if (
+            not raw_length
+            or len(raw_length) > 128
+            or any(character not in "0123456789" for character in raw_length)
+        ):
+            raise _WebRequestError(
+                HTTPStatus.LENGTH_REQUIRED,
+                "length_required",
+                "A valid Content-Length is required",
+            )
+        significant_length = raw_length.lstrip("0") or "0"
+        maximum_length = str(MAX_REQUEST_BYTES)
+        if (
+            len(significant_length) > len(maximum_length)
+            or len(significant_length) == len(maximum_length)
+            and significant_length > maximum_length
+        ):
+            raise _WebRequestError(
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                "request_too_large",
+                f"Request body must be at most {MAX_REQUEST_BYTES} bytes",
+            )
+        return int(significant_length)
+
+    def _read_exact_body(self, length: int) -> bytes:
+        raw = self.rfile.read(length)
+        if len(raw) != length:
+            raise _WebRequestError(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_request",
+                "Request body length does not match Content-Length",
+            )
+        return raw
 
     def _send_agent_service_error(
         self, exc: BaseException, *, artifact: bool = False
@@ -627,12 +641,14 @@ def _durable_service_state(service: RunService | None) -> dict[str, object]:
             "ready": False,
             "queue_depth": 0,
             "model_configured": configured,
+            "model": os.environ["REPO_AGENT_MODEL"].strip() if configured else None,
         }
     return {
         "enabled": True,
         "ready": service.ready(),
         "queue_depth": service.queue_depth,
         "model_configured": configured,
+        "model": os.environ["REPO_AGENT_MODEL"].strip() if configured else None,
     }
 
 
@@ -693,7 +709,11 @@ def _validated_agent_decision(payload: object) -> dict[str, Any]:
         raise ValueError("approve must be a boolean")
     reason = payload.get("reason")
     if reason is not None:
-        if not isinstance(reason, str) or len(reason.strip()) > 2000:
+        if (
+            not isinstance(reason, str)
+            or "\x00" in reason
+            or len(reason.strip()) > 2000
+        ):
             raise ValueError("reason must be at most 2000 characters")
         reason = reason.strip() or None
     return {"approve": approve, "reason": reason}
@@ -726,8 +746,8 @@ def _validated_run_request(payload: object) -> dict[str, object]:
     if not isinstance(task, str) or not task.strip():
         raise ValueError("task must contain non-whitespace text")
     task = task.strip()
-    if len(task) > MAX_TASK_LENGTH:
-        raise ValueError(f"task must be at most {MAX_TASK_LENGTH} characters")
+    if len(task) > MAX_TASK_LENGTH or "\x00" in task:
+        raise ValueError(f"task must be at most {MAX_TASK_LENGTH} safe characters")
 
     image = payload.get("image", "repo-agent-python:0.1")
     if not isinstance(image, str) or image not in ALLOWED_IMAGES:
@@ -770,7 +790,12 @@ def _bounded_number(
 ) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{name} must be a number from {minimum:g} to {maximum:g}")
-    converted = float(value)
+    try:
+        converted = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError(
+            f"{name} must be a number from {minimum:g} to {maximum:g}"
+        ) from exc
     if not math.isfinite(converted) or not minimum <= converted <= maximum:
         raise ValueError(f"{name} must be a number from {minimum:g} to {maximum:g}")
     return converted
@@ -904,18 +929,20 @@ def _application_state(repo_path: Path) -> dict[str, object]:
 
 def _capture(argv: tuple[str, ...], *, timeout: float = 5.0) -> str:
     try:
-        completed = subprocess.run(
+        completed = run_isolated_capture(
             argv,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            shell=False,
-            timeout=timeout,
+            timeout_seconds=timeout,
+            max_stdout_bytes=65536,
+            max_stderr_bytes=65536,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except OSError as exc:
         raise OSError(f"command failed to start: {_exception_detail(exc)}") from exc
-    stdout = completed.stdout[:65536].decode("utf-8", errors="replace").strip()
-    stderr = completed.stderr[:65536].decode("utf-8", errors="replace").strip()
+    if completed.timed_out:
+        raise OSError("command failed to start: command timed out")
+    if completed.stdout_truncated or completed.stderr_truncated:
+        raise RuntimeError("command output exceeded the safe limit")
+    stdout = completed.stdout.decode("utf-8", errors="replace").strip()
+    stderr = completed.stderr.decode("utf-8", errors="replace").strip()
     if completed.returncode != 0:
         raise RuntimeError(stderr or stdout or f"command exited {completed.returncode}")
     return stdout
@@ -923,19 +950,21 @@ def _capture(argv: tuple[str, ...], *, timeout: float = 5.0) -> str:
 
 def _git_capture(repo_path: Path, *args: str) -> str:
     try:
-        completed = subprocess.run(
+        completed = run_isolated_capture(
             ("git", "-C", str(repo_path), *args),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
             env=_sanitized_git_environment(),
-            shell=False,
-            timeout=5,
+            timeout_seconds=5,
+            max_stdout_bytes=65536,
+            max_stderr_bytes=65536,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except OSError as exc:
         raise OSError(f"Git command failed: {_exception_detail(exc)}") from exc
-    stdout = completed.stdout[:65536].decode("utf-8", errors="replace").strip()
-    stderr = completed.stderr[:65536].decode("utf-8", errors="replace").strip()
+    if completed.timed_out:
+        raise OSError("Git command failed: command timed out")
+    if completed.stdout_truncated or completed.stderr_truncated:
+        raise RuntimeError("Git command output exceeded the safe limit")
+    stdout = completed.stdout.decode("utf-8", errors="replace").strip()
+    stderr = completed.stderr.decode("utf-8", errors="replace").strip()
     if completed.returncode != 0:
         raise RuntimeError(stderr or stdout or f"Git exited {completed.returncode}")
     return stdout
@@ -988,7 +1017,7 @@ def serve(
         if data_dir is not None
         else _default_data_dir(repository)
     )
-    configured_secret = os.environ.get("REPO_AGENT_API_KEY", "")
+    configured_secret = os.environ.get("REPO_AGENT_API_KEY", "").strip()
     with RunService(
         state_dir,
         allowed_repo_roots=(repository,),

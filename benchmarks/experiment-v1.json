@@ -28,7 +28,23 @@
     "total_run_count": 44
   },
   "request_policy": {
-    "tool_choice": "auto (provider default)",
+    "tool_choice": {
+      "basic_loop": "auto (provider default)",
+      "planning_initial": "auto (provider default)",
+      "planning_follow_up": "submit_change_plan",
+      "implement": "auto (provider default)",
+      "repair": "auto (provider default)",
+      "review": "submit_review"
+    },
+    "phase_reasoning_effort": {
+      "provider_default": null,
+      "official_deepseek": {
+        "planning": "none",
+        "implement": "low",
+        "repair": "low",
+        "review": "none"
+      }
+    },
     "parallel_tool_calls": false,
     "store": false,
     "temperature": null,

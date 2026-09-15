@@ -7,11 +7,14 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 
 import pytest
 
+import repo_agent.processes as process_module
 import repo_agent.sandbox as sandbox_module
 from repo_agent.models import ToolCall
+from repo_agent.processes import IsolatedProcess
 from repo_agent.sandbox import (
     CommandOutcome,
     DockerSandbox,
@@ -223,23 +226,37 @@ def test_host_git_uses_sanitized_environment_and_safe_checkout_order(
     monkeypatch.setenv("GIT_CONFIG_VALUE_0", str(tmp_path / "hostile-hooks"))
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(hostile_global))
     monkeypatch.setenv("GIT_TERMINAL_PROMPT", "1")
+    blocked_credentials = {
+        "REPO_AGENT_API_KEY",
+        "REPO_AGENT_BEARER_TOKEN",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "AZURE_OPENAI_API_KEY",
+    }
+    for index, name in enumerate(blocked_credentials):
+        mixed_case_name = name.lower() if index % 2 else name
+        monkeypatch.setenv(mixed_case_name, f"must-not-reach-git-{index}")
+    monkeypatch.setenv("REPO_AGENT_TEST_MARKER", "preserved")
 
-    real_run = subprocess.run
+    real_capture = sandbox_module.run_isolated_capture
     git_calls: list[tuple[tuple[str, ...], dict[str, str]]] = []
 
-    def recording_run(argv, **kwargs):
+    def recording_capture(argv, **kwargs):
         if tuple(argv)[0] == "git":
             git_calls.append((tuple(argv), dict(kwargs["env"])))
-        return real_run(argv, **kwargs)
+        return real_capture(argv, **kwargs)
 
-    monkeypatch.setattr(sandbox_module.subprocess, "run", recording_run)
+    monkeypatch.setattr(sandbox_module, "run_isolated_capture", recording_capture)
     with DockerSandbox(committed_repo, command_runner=FakeDockerRunner()):
         pass
 
     assert git_calls
     for _, environment in git_calls:
+        normalized_names = {name.upper() for name in environment}
         assert "GIT_DIR" not in environment
         assert "GIT_CONFIG_COUNT" not in environment
+        assert normalized_names.isdisjoint(blocked_credentials)
+        assert environment["REPO_AGENT_TEST_MARKER"] == "preserved"
         assert environment["GIT_CONFIG_GLOBAL"] == os.devnull
         assert environment["GIT_CONFIG_SYSTEM"] == os.devnull
         assert environment["GIT_CONFIG_NOSYSTEM"] == "1"
@@ -745,14 +762,22 @@ def test_execute_requires_an_active_context(committed_repo: Path) -> None:
 
 def test_subprocess_runner_enforces_byte_limit_and_timeout() -> None:
     runner = SubprocessCommandRunner()
+    started = time.monotonic()
     limited = runner(
-        (sys.executable, "-c", "import sys; sys.stdout.write('x' * 10000)"),
-        timeout_seconds=5,
+        (
+            sys.executable,
+            "-c",
+            "import sys,time; sys.stdout.write('x'*32); "
+            "sys.stdout.flush(); time.sleep(30)",
+        ),
+        timeout_seconds=10,
         max_output_bytes=31,
     )
-    assert limited.exit_code == 0
+    assert limited.exit_code != 0
     assert limited.output == "x" * 31
     assert limited.truncated
+    assert limited.timed_out is False
+    assert time.monotonic() - started < 5
 
     timed_out = runner(
         (sys.executable, "-c", "import time; time.sleep(2)"),
@@ -760,6 +785,124 @@ def test_subprocess_runner_enforces_byte_limit_and_timeout() -> None:
         max_output_bytes=31,
     )
     assert timed_out.timed_out
+
+
+@pytest.mark.parametrize(
+    ("timeout_seconds", "max_output_bytes"),
+    (
+        (float("nan"), 1),
+        (float("inf"), 1),
+        (10**1000, 1),
+        (-1, 1),
+        (True, 1),
+        (1, 0),
+        (1, True),
+    ),
+)
+def test_subprocess_runner_rejects_extreme_numeric_limits(
+    timeout_seconds: object, max_output_bytes: object
+) -> None:
+    with pytest.raises(ValueError):
+        SubprocessCommandRunner()(
+            (sys.executable, "-c", "pass"),
+            timeout_seconds=timeout_seconds,  # type: ignore[arg-type]
+            max_output_bytes=max_output_bytes,  # type: ignore[arg-type]
+        )
+
+
+def _process_state(process_id: int) -> str:
+    if os.name == "nt":
+        completed = subprocess.run(
+            (
+                "tasklist",
+                "/FI",
+                f"PID eq {process_id}",
+                "/FO",
+                "CSV",
+                "/NH",
+            ),
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+        marker = f'"{process_id}"'.encode("ascii")
+        return "running" if marker in completed.stdout else "gone"
+    stat_path = Path(f"/proc/{process_id}/stat")
+    try:
+        stat_fields = stat_path.read_text(encoding="ascii").rsplit(") ", 1)[1]
+    except (IndexError, OSError, UnicodeError):
+        stat_fields = ""
+    if stat_fields.startswith("Z "):
+        return "zombie"
+    try:
+        os.kill(process_id, 0)
+    except ProcessLookupError:
+        return "gone"
+    return "running"
+
+
+def _kill_test_process(process_id: int) -> None:
+    if _process_state(process_id) != "running":
+        return
+    if os.name == "nt":
+        subprocess.run(
+            ("taskkill", "/PID", str(process_id), "/T", "/F"),
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    else:
+        os.kill(process_id, 9)
+
+
+@pytest.mark.parametrize(
+    ("parent_delay", "expected_timeout"),
+    ((0, False), (30, True)),
+)
+def test_subprocess_runner_terminates_descendants_without_unbounded_pipe_wait(
+    tmp_path: Path, parent_delay: int, expected_timeout: bool
+) -> None:
+    child_pid_file = tmp_path / f"child-{parent_delay}.pid"
+    parent_script = "\n".join(
+        (
+            "import pathlib, subprocess, sys, time",
+            "child = subprocess.Popen([",
+            "    sys.executable, '-c', 'import time; time.sleep(30)'",
+            "])",
+            f"pathlib.Path({str(child_pid_file)!r}).write_text(str(child.pid))",
+            f"time.sleep({parent_delay})",
+        )
+    )
+    started = time.monotonic()
+    outcome = SubprocessCommandRunner()(
+        (sys.executable, "-c", parent_script),
+        timeout_seconds=1,
+        max_output_bytes=64,
+    )
+    elapsed = time.monotonic() - started
+    assert child_pid_file.is_file()
+    child_pid = int(child_pid_file.read_text(encoding="utf-8"))
+
+    try:
+        deadline = time.monotonic() + 5
+        while _process_state(child_pid) == "running" and time.monotonic() < deadline:
+            time.sleep(0.05)
+        state = _process_state(child_pid)
+        if os.name == "nt":
+            assert state == "gone"
+        else:
+            # A process group can terminate descendants but only their parent or
+            # a subreaper/init process can wait for and remove their zombie entry.
+            assert state in {"gone", "zombie"}
+    finally:
+        _kill_test_process(child_pid)
+
+    assert outcome.timed_out is expected_timeout
+    assert elapsed < 5
 
 
 def test_injected_runner_cannot_bypass_output_limit(committed_repo: Path) -> None:
@@ -799,15 +942,74 @@ def test_subprocess_runner_kills_child_when_wait_is_interrupted(monkeypatch) -> 
             self.returncode = -9
 
     process = InterruptedProcess()
-    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(
+        process_module,
+        "start_isolated_process",
+        lambda *args, **kwargs: IsolatedProcess(
+            process, process_group=None, windows_job=None  # type: ignore[arg-type]
+        ),
+    )
 
     with pytest.raises(KeyboardInterrupt):
-        SubprocessCommandRunner()(
-            ("unused",), timeout_seconds=1, max_output_bytes=8
+        process_module.run_isolated_capture(
+            ("unused",),
+            timeout_seconds=1,
+            max_stdout_bytes=8,
+            max_stderr_bytes=0,
+            merge_stderr=True,
         )
 
     assert process.killed
     assert process.wait_count == 2
+    assert process.stdout.closed
+
+
+def test_subprocess_runner_cleans_up_when_output_reader_cannot_start(
+    monkeypatch,
+) -> None:
+    class PendingProcess:
+        def __init__(self) -> None:
+            self.stdout = io.BytesIO()
+            self.returncode = None
+            self.killed = False
+
+        def wait(self, timeout=None):
+            del timeout
+            if self.returncode is None:
+                raise AssertionError("process must be terminated before waiting")
+            return self.returncode
+
+        def poll(self):
+            return self.returncode
+
+        def kill(self) -> None:
+            self.killed = True
+            self.returncode = -9
+
+    process = PendingProcess()
+    monkeypatch.setattr(
+        process_module,
+        "start_isolated_process",
+        lambda *args, **kwargs: IsolatedProcess(
+            process, process_group=None, windows_job=None  # type: ignore[arg-type]
+        ),
+    )
+
+    def fail_to_start(_thread) -> None:
+        raise RuntimeError("thread capacity exhausted")
+
+    monkeypatch.setattr(process_module.threading.Thread, "start", fail_to_start)
+
+    with pytest.raises(RuntimeError, match="capacity exhausted"):
+        process_module.run_isolated_capture(
+            ("unused",),
+            timeout_seconds=1,
+            max_stdout_bytes=8,
+            max_stderr_bytes=0,
+            merge_stderr=True,
+        )
+
+    assert process.killed
     assert process.stdout.closed
 
 

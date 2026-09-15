@@ -648,9 +648,8 @@ def eval_command(
         if report_dir is not None and not merge:
             raise ValueError("--report-dir is only valid with --merge")
         selected_task_ids = tuple(task_id or ())
-        configured_secrets = tuple(
-            value for value in (os.environ.get(_API_KEY_ENV),) if value
-        )
+        configured_secret = (os.environ.get(_API_KEY_ENV) or "").strip()
+        configured_secrets = (configured_secret,) if configured_secret else ()
         if matrix_only:
             if execute or variant is not None or selected_task_ids:
                 raise ValueError(
@@ -1045,7 +1044,7 @@ def _new_run_service(
     allow_bootstrap: bool,
     start_worker: bool = True,
 ) -> RunService:
-    api_key = os.environ.get(_API_KEY_ENV)
+    api_key = (os.environ.get(_API_KEY_ENV) or "").strip()
     secrets = (api_key,) if api_key else ()
     return RunService(
         data_dir,
@@ -1266,6 +1265,11 @@ def _emit_evaluation_report(report: EvaluationReport, output_format: str) -> Non
     typer.echo(f"solved: {report.solved_task_count}")
     if report.tool_error_rate is not None:
         typer.echo(f"tool_error_rate: {report.tool_error_rate:.3f}")
+    if report.actionable_tool_error_rate is not None:
+        typer.echo(
+            "actionable_tool_error_rate: "
+            f"{report.actionable_tool_error_rate:.3f}"
+        )
     typer.echo(f"result_dir: {report.result_dir}")
     for result in report.tasks:
         outcome = "pass" if result.solved else result.failure_category or "fail"

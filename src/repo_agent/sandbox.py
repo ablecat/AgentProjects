@@ -12,7 +12,6 @@ import shutil
 import stat
 import subprocess
 import tempfile
-import threading
 import time
 from dataclasses import dataclass
 from typing import Callable, Literal, Protocol, Sequence, TypeAlias, cast
@@ -21,6 +20,7 @@ import uuid
 from .models import CandidateArtifact, ToolCall, ToolResult
 from .patches import ValidatedPatch
 from .policy import DEFAULT_PATH_POLICY, RepositoryPathError
+from .processes import run_isolated_capture
 from .repository_map import build_repository_map
 from .tools import ApplyPatchSpec, CommandSpec, RepoMapSpec, build_tool_command
 
@@ -148,60 +148,20 @@ class SubprocessCommandRunner:
         timeout_seconds: float,
         max_output_bytes: int,
     ) -> CommandOutcome:
-        process = subprocess.Popen(
-            list(argv),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            shell=False,
+        timeout = _positive_finite_number(timeout_seconds, "timeout_seconds")
+        output_limit = _positive_integer(max_output_bytes, "max_output_bytes")
+        completed = run_isolated_capture(
+            argv,
+            timeout_seconds=timeout,
+            max_stdout_bytes=output_limit,
+            max_stderr_bytes=0,
+            merge_stderr=True,
         )
-        stdout = process.stdout
-        assert stdout is not None
-
-        captured = bytearray()
-        truncated = False
-        reader_error: list[BaseException] = []
-
-        def drain_output() -> None:
-            nonlocal truncated
-            try:
-                while True:
-                    chunk = stdout.read(8192)
-                    if not chunk:
-                        break
-                    remaining = max_output_bytes - len(captured)
-                    if remaining > 0:
-                        captured.extend(chunk[:remaining])
-                    if len(chunk) > max(remaining, 0):
-                        truncated = True
-            except BaseException as exc:  # pragma: no cover - OS pipe failures
-                reader_error.append(exc)
-
-        reader = threading.Thread(target=drain_output, daemon=True)
-        reader.start()
-        timed_out = False
-        try:
-            process.wait(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            process.kill()
-            process.wait()
-        except BaseException:
-            if process.poll() is None:
-                process.kill()
-                process.wait()
-            raise
-        finally:
-            reader.join()
-            stdout.close()
-
-        if reader_error:
-            raise OSError(f"failed to read process output: {reader_error[0]}")
         return CommandOutcome(
-            exit_code=process.returncode,
-            output=bytes(captured).decode("utf-8", errors="replace"),
-            truncated=truncated,
-            timed_out=timed_out,
+            exit_code=completed.returncode,
+            output=completed.stdout.decode("utf-8", errors="replace"),
+            truncated=completed.stdout_truncated,
+            timed_out=completed.timed_out,
         )
 
 
@@ -613,6 +573,9 @@ class DockerSandbox:
             "--no-renames",
             "HEAD",
             "--",
+            stdout_overflow_error=(
+                f"candidate patch exceeds {_MAX_ARTIFACT_BYTES} bytes"
+            ),
         )
         if len(candidate_patch) > _MAX_ARTIFACT_BYTES:
             raise SandboxError(
@@ -1078,7 +1041,10 @@ def _validated_container_name(
 def _positive_finite_number(value: object, field: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{field} must be a positive finite number")
-    converted = float(value)
+    try:
+        converted = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError(f"{field} must be a positive finite number") from exc
     if not math.isfinite(converted) or converted <= 0:
         raise ValueError(f"{field} must be a positive finite number")
     return converted
@@ -1177,18 +1143,20 @@ def _failed_result(
 
 def _run_git(*args: str, cwd: Path | None = None) -> str:
     try:
-        completed = subprocess.run(
+        completed = run_isolated_capture(
             ("git", *args),
             cwd=cwd,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
             env=_sanitized_git_environment(),
-            shell=False,
-            timeout=30,
+            timeout_seconds=30,
+            max_stdout_bytes=_CONTROL_OUTPUT_BYTES,
+            max_stderr_bytes=_CONTROL_OUTPUT_BYTES,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except OSError as exc:
         raise SandboxError(f"Git command failed to start: {_exception_detail(exc)}") from exc
+    if completed.timed_out:
+        raise SandboxError("Git command timed out after 30 seconds")
+    if completed.stdout_truncated or completed.stderr_truncated:
+        raise SandboxError("Git command output exceeded its safe limit")
     stdout = completed.stdout.decode("utf-8", errors="replace").strip()
     stderr = completed.stderr.decode("utf-8", errors="replace").strip()
     if completed.returncode != 0:
@@ -1203,36 +1171,53 @@ def _run_git_input(
     repo: Path, input_bytes: bytes, *args: str
 ) -> subprocess.CompletedProcess[bytes]:
     try:
-        return subprocess.run(
+        completed = run_isolated_capture(
             ("git", "-C", str(repo), *args),
-            input=input_bytes,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            input_bytes=input_bytes,
             env=_sanitized_git_environment(),
-            shell=False,
-            timeout=30,
+            timeout_seconds=30,
+            max_stdout_bytes=_CONTROL_OUTPUT_BYTES,
+            max_stderr_bytes=_CONTROL_OUTPUT_BYTES,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except OSError as exc:
         raise SandboxError(
             f"Git patch command failed to complete: {_exception_detail(exc)}"
         ) from exc
+    if completed.timed_out:
+        raise SandboxError("Git patch command timed out after 30 seconds")
+    return subprocess.CompletedProcess(
+        ("git", "-C", str(repo), *args),
+        completed.returncode,
+        completed.stdout,
+        completed.stderr,
+    )
 
 
-def _git_bytes(repo: Path, *args: str) -> bytes:
+def _git_bytes(
+    repo: Path,
+    *args: str,
+    stdout_overflow_error: str | None = None,
+) -> bytes:
     try:
-        completed = subprocess.run(
+        completed = run_isolated_capture(
             ("git", "-C", str(repo), *args),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
             env=_sanitized_git_environment(),
-            shell=False,
-            timeout=30,
+            timeout_seconds=30,
+            max_stdout_bytes=_MAX_ARTIFACT_BYTES + 1,
+            max_stderr_bytes=_CONTROL_OUTPUT_BYTES,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except OSError as exc:
         raise SandboxError(
             f"Git command failed to complete: {_exception_detail(exc)}"
         ) from exc
+    if completed.timed_out:
+        raise SandboxError("Git command timed out after 30 seconds")
+    if completed.stdout_truncated:
+        raise SandboxError(
+            stdout_overflow_error or "Git command stdout exceeded its safe limit"
+        )
+    if completed.stderr_truncated:
+        raise SandboxError("Git command stderr exceeded its safe limit")
     if completed.returncode != 0:
         raise SandboxError(f"Git command exited with code {completed.returncode}")
     return completed.stdout
@@ -1300,10 +1285,18 @@ def _git_output(repo: Path, *args: str) -> str:
 
 
 def _sanitized_git_environment() -> dict[str, str]:
+    blocked_credentials = {
+        "ANTHROPIC_API_KEY",
+        "AZURE_OPENAI_API_KEY",
+        "OPENAI_API_KEY",
+        "REPO_AGENT_API_KEY",
+        "REPO_AGENT_BEARER_TOKEN",
+    }
     environment = {
         key: value
         for key, value in os.environ.items()
         if not key.upper().startswith("GIT_")
+        and key.upper() not in blocked_credentials
     }
     environment.update(
         {

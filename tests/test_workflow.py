@@ -305,8 +305,8 @@ def test_resume_after_commit_then_process_crash_skips_side_effect(
         assert crash_node not in _names(resumed_operations)
 
 
-def test_verify_can_repair_twice_then_succeed(tmp_path: Path) -> None:
-    operations = RecordingOperations(verify=[False, False, True])
+def test_verify_can_repair_once_then_succeed(tmp_path: Path) -> None:
+    operations = RecordingOperations(verify=[False, True])
     with SQLiteCheckpointStore(tmp_path / "runs.sqlite3") as store:
         result = WorkflowEngine(store, operations).start(
             repo_path=str(tmp_path),
@@ -316,29 +316,24 @@ def test_verify_can_repair_twice_then_succeed(tmp_path: Path) -> None:
         )
 
     assert result.status == "succeeded"
-    assert result.metrics.repair_attempts == 2
-    assert result.metrics.tool_calls == 5
-    assert result.metrics.tokens == 170
-    assert [check.attempt for check in result.checks] == [0, 1, 2]
-    assert [check.ok for check in result.checks] == [False, False, True]
+    assert result.metrics.repair_attempts == 1
+    assert result.metrics.tool_calls == 4
+    assert result.metrics.tokens == 150
+    assert [check.attempt for check in result.checks] == [0, 1]
+    assert [check.ok for check in result.checks] == [False, True]
     assert _names(operations)[3:] == [
         "implement",
-        "verify",
-        "repair",
         "verify",
         "repair",
         "verify",
         "review",
         "finalize",
     ]
-    assert operations.keys_by_node["repair"] == [
-        f"{RUN_ID}:repair:1",
-        f"{RUN_ID}:repair:2",
-    ]
+    assert operations.keys_by_node["repair"] == [f"{RUN_ID}:repair:1"]
 
 
-def test_verify_stops_unverified_after_two_repairs(tmp_path: Path) -> None:
-    operations = RecordingOperations(verify=[False, False, False])
+def test_verify_stops_unverified_after_one_repair(tmp_path: Path) -> None:
+    operations = RecordingOperations(verify=[False, False])
     with SQLiteCheckpointStore(tmp_path / "runs.sqlite3") as store:
         result = WorkflowEngine(store, operations).start(
             repo_path=str(tmp_path),
@@ -348,42 +343,14 @@ def test_verify_stops_unverified_after_two_repairs(tmp_path: Path) -> None:
         )
 
     assert result.status == "unverified"
-    assert result.metrics.repair_attempts == 2
-    assert len(result.checks) == 3
+    assert result.metrics.repair_attempts == 1
+    assert len(result.checks) == 2
     assert "review" not in _names(operations)
     assert "finalize" not in _names(operations)
 
 
-def test_review_repair_runs_once_then_reverifies_and_reviews(tmp_path: Path) -> None:
-    operations = RecordingOperations(verify=[True, True], review=[False, True])
-    with SQLiteCheckpointStore(tmp_path / "runs.sqlite3") as store:
-        result = WorkflowEngine(store, operations).start(
-            repo_path=str(tmp_path),
-            task="Fix greeting",
-            run_id=RUN_ID,
-            auto_approve=True,
-        )
-
-    assert result.status == "succeeded"
-    assert result.metrics.review_repairs == 1
-    assert _names(operations)[3:] == [
-        "implement",
-        "verify",
-        "review",
-        "review_repair",
-        "verify",
-        "review",
-        "finalize",
-    ]
-    assert operations.keys_by_node["review_repair"] == [
-        f"{RUN_ID}:review_repair:1"
-    ]
-
-
-def test_second_review_rejection_fails_without_second_review_repair(
-    tmp_path: Path,
-) -> None:
-    operations = RecordingOperations(verify=[True, True], review=[False, False])
+def test_review_rejection_is_terminal_without_automatic_repair(tmp_path: Path) -> None:
+    operations = RecordingOperations(verify=[True], review=[False])
     with SQLiteCheckpointStore(tmp_path / "runs.sqlite3") as store:
         result = WorkflowEngine(store, operations).start(
             repo_path=str(tmp_path),
@@ -393,9 +360,65 @@ def test_second_review_rejection_fails_without_second_review_repair(
         )
 
     assert result.status == "failed"
-    assert result.metrics.review_repairs == 1
-    assert _names(operations).count("review_repair") == 1
+    assert result.metrics.review_repairs == 0
+    assert _names(operations)[3:] == [
+        "implement",
+        "verify",
+        "review",
+    ]
+    assert "review_repair" not in _names(operations)
     assert "finalize" not in _names(operations)
+
+
+def test_review_capacity_policy_failure_is_terminal_and_uses_zero_tokens(
+    tmp_path: Path,
+) -> None:
+    class CapacityOperations(RecordingOperations):
+        def review(self, context: OperationContext) -> NodeOutcome:
+            self._record(context)
+            return NodeOutcome(
+                ok=False,
+                summary="Candidate exceeds the fixed full-review capacity",
+                error=(
+                    "review_capacity_exceeded: the complete candidate cannot fit "
+                    "within the fixed 2500-token review budget; split the task"
+                ),
+                detail={
+                    "failure_status": "policy_denied",
+                    "failure_code": "review_capacity_exceeded",
+                    "tool_calls": 0,
+                    "tokens": 0,
+                },
+            )
+
+    operations = CapacityOperations(verify=[True])
+    with SQLiteCheckpointStore(tmp_path / "runs.sqlite3") as store:
+        result = WorkflowEngine(store, operations).start(
+            repo_path=str(tmp_path),
+            task="Fix greeting",
+            run_id=RUN_ID,
+            auto_approve=True,
+        )
+        review = next(
+            checkpoint
+            for checkpoint in store.list_checkpoints(RUN_ID)
+            if checkpoint.node == "review" and checkpoint.phase == "completed"
+        )
+
+    assert result.status == "failed"
+    assert result.current_node is None
+    assert result.error is not None
+    assert result.error.startswith("review_capacity_exceeded:")
+    assert result.metrics.tool_calls == 2
+    assert result.metrics.tokens == 100
+    assert result.metrics.review_repairs == 0
+    assert _names(operations)[3:] == ["implement", "verify", "review"]
+    assert review.result["detail"] == {
+        "failure_status": "policy_denied",
+        "failure_code": "review_capacity_exceeded",
+        "tool_calls": 0,
+        "tokens": 0,
+    }
 
 
 def test_operation_exception_is_durable_and_resume_is_idempotent(tmp_path: Path) -> None:
@@ -463,7 +486,9 @@ def test_prepare_policy_failure_preserves_public_policy_status(tmp_path: Path) -
     assert _names(operations) == ["prepare"]
 
 
-def test_usage_counters_are_bounded_by_public_metrics(tmp_path: Path) -> None:
+def test_usage_counters_preserve_actual_overage_for_failure_reporting(
+    tmp_path: Path,
+) -> None:
     class ExcessiveUsageOperations(RecordingOperations):
         def implement(self, context: OperationContext) -> NodeOutcome:
             self._record(context)
@@ -478,9 +503,9 @@ def test_usage_counters_are_bounded_by_public_metrics(tmp_path: Path) -> None:
             auto_approve=True,
         )
 
-    assert result.status == "failed"
-    assert "less than or equal to 30" in (result.error or "")
-    assert "verify" not in _names(operations)
+    assert result.status == "succeeded"
+    assert result.metrics.tool_calls == 32
+    assert result.metrics.tokens == 31
 
 
 def test_rejection_is_terminal_and_never_implements(tmp_path: Path) -> None:

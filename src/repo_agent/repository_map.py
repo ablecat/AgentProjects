@@ -8,10 +8,9 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import stat
-import subprocess
-import threading
 
 from .policy import DEFAULT_PATH_POLICY, RepositoryPathError
+from .processes import run_isolated_capture
 
 
 MAX_MAP_FILES = 500
@@ -175,60 +174,24 @@ def _listed_paths(repository: Path) -> tuple[list[str], bool]:
         "--exclude-standard",
         "-z",
     )
-    process = subprocess.Popen(
+    completed = run_isolated_capture(
         argv,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        timeout_seconds=10,
+        max_stdout_bytes=MAX_SCAN_BYTES,
+        max_stderr_bytes=0,
         env=_git_environment(),
-        shell=False,
+        terminate_on_stdout_limit=True,
     )
-    stdout = process.stdout
-    assert stdout is not None
-    captured = bytearray()
-    truncated = False
-    reader_error: list[BaseException] = []
-
-    def drain_output() -> None:
-        nonlocal truncated
-        try:
-            while True:
-                chunk = stdout.read(8192)
-                if not chunk:
-                    break
-                remaining = MAX_SCAN_BYTES - len(captured)
-                if remaining > 0:
-                    captured.extend(chunk[:remaining])
-                if len(chunk) > max(remaining, 0):
-                    truncated = True
-                    process.kill()
-                    break
-        except BaseException as exc:  # pragma: no cover - OS pipe failures
-            reader_error.append(exc)
-
-    reader = threading.Thread(target=drain_output, daemon=True)
-    reader.start()
-    try:
-        process.wait(timeout=10)
-    except subprocess.TimeoutExpired as exc:
-        process.kill()
-        process.wait()
-        raise OSError("git ls-files timed out") from exc
-    except BaseException:
-        if process.poll() is None:
-            process.kill()
-        process.wait()
-        raise
-    finally:
-        reader.join()
-        stdout.close()
-    if reader_error:
-        raise OSError(f"failed to read git ls-files output: {reader_error[0]}")
-    if process.returncode != 0 and not truncated:
-        raise OSError(f"git ls-files exited with code {process.returncode}")
-    records = bytes(captured).split(b"\x00")
+    if completed.timed_out:
+        raise OSError("git ls-files timed out")
+    if completed.returncode != 0 and not completed.stdout_truncated:
+        raise OSError(f"git ls-files exited with code {completed.returncode}")
+    captured = completed.stdout
+    if completed.stdout_truncated and not captured.endswith(b"\x00"):
+        captured = captured.rsplit(b"\x00", 1)[0] if b"\x00" in captured else b""
+    records = captured.split(b"\x00")
     paths = [record.decode("utf-8", errors="replace") for record in records if record]
-    return paths, truncated
+    return paths, completed.stdout_truncated
 
 
 def _python_symbols(path: Path) -> tuple[str, ...]:
@@ -253,16 +216,21 @@ def _python_symbols(path: Path) -> tuple[str, ...]:
 
 
 def _git_text(repository: Path, *args: str) -> str:
-    completed = subprocess.run(
-        ("git", "-C", str(repository), *args),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        env=_git_environment(),
-        shell=False,
-        timeout=10,
-    )
-    if completed.returncode != 0:
+    try:
+        completed = run_isolated_capture(
+            ("git", "-C", str(repository), *args),
+            timeout_seconds=10,
+            max_stdout_bytes=128,
+            max_stderr_bytes=0,
+            env=_git_environment(),
+        )
+    except OSError:
+        return ""
+    if (
+        completed.timed_out
+        or completed.returncode != 0
+        or completed.stdout_truncated
+    ):
         return ""
     return completed.stdout.decode("ascii", errors="replace").strip()
 

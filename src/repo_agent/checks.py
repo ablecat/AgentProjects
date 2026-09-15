@@ -20,6 +20,7 @@ import xml.etree.ElementTree as ElementTree
 from .patches import ValidatedPatch, validate_patch
 from .git_config import effective_core_autocrlf
 from .policy import DEFAULT_PATH_POLICY, RepositoryPathError
+from .processes import run_isolated_capture
 from .sandbox import (
     CommandOutcome,
     DEFAULT_POLICY,
@@ -35,6 +36,7 @@ MAX_CHECK_OUTPUT_BYTES = 256 * 1024
 DEFAULT_CHECK_OUTPUT_BYTES = 64 * 1024
 
 _CONTROL_TIMEOUT_SECONDS = 30.0
+_MAX_GIT_OUTPUT_BYTES = 16 * 1024 * 1024
 _CHECK_ROOT_RE = re.compile(r"^repo-agent-check-[0-9a-z_]+$")
 _CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _CONTAINER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
@@ -1900,20 +1902,20 @@ def _apply_candidate(
         ("apply", "--check", "--index", "--whitespace=error-all", "--"),
         ("apply", "--index", "--whitespace=error-all", "--"),
     ):
-        try:
-            completed = subprocess.run(
-                ("git", "-C", str(repository), *arguments),
-                input=payload,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=_sanitized_git_environment(),
-                shell=False,
-                timeout=timeout_seconds,
-            )
-        except subprocess.TimeoutExpired as exc:
+        completed = run_isolated_capture(
+            ("git", "-C", str(repository), *arguments),
+            input_bytes=payload,
+            env=_sanitized_git_environment(),
+            timeout_seconds=timeout_seconds,
+            max_stdout_bytes=DEFAULT_CHECK_OUTPUT_BYTES,
+            max_stderr_bytes=DEFAULT_CHECK_OUTPUT_BYTES,
+        )
+        if completed.timed_out:
             raise CheckTimeoutError(
                 f"candidate Git apply timed out after {timeout_seconds:g} seconds"
-            ) from exc
+            )
+        if completed.stdout_truncated or completed.stderr_truncated:
+            raise CheckPolicyError("candidate Git apply output exceeded its safe limit")
         if completed.returncode != 0:
             detail = completed.stderr.decode("utf-8", errors="replace").strip()
             raise CheckPolicyError(
@@ -1936,20 +1938,19 @@ def _git_bytes(
     *args: str,
     timeout_seconds: float = _CONTROL_TIMEOUT_SECONDS,
 ) -> bytes:
-    try:
-        completed = subprocess.run(
-            ("git", "-C", str(repository), *args),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=_sanitized_git_environment(),
-            shell=False,
-            timeout=timeout_seconds,
-        )
-    except subprocess.TimeoutExpired as exc:
+    completed = run_isolated_capture(
+        ("git", "-C", str(repository), *args),
+        env=_sanitized_git_environment(),
+        timeout_seconds=timeout_seconds,
+        max_stdout_bytes=_MAX_GIT_OUTPUT_BYTES,
+        max_stderr_bytes=DEFAULT_CHECK_OUTPUT_BYTES,
+    )
+    if completed.timed_out:
         raise CheckTimeoutError(
             f"Git operation timed out after {timeout_seconds:g} seconds"
-        ) from exc
+        )
+    if completed.stdout_truncated or completed.stderr_truncated:
+        raise CheckPolicyError("Git operation output exceeded its safe limit")
     if completed.returncode != 0:
         detail = completed.stderr.decode("utf-8", errors="replace").strip()
         raise CheckError(detail or f"Git exited with code {completed.returncode}")
@@ -1959,20 +1960,19 @@ def _git_bytes(
 def _run_git(
     *args: str, timeout_seconds: float = _CONTROL_TIMEOUT_SECONDS
 ) -> None:
-    try:
-        completed = subprocess.run(
-            ("git", *args),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=_sanitized_git_environment(),
-            shell=False,
-            timeout=timeout_seconds,
-        )
-    except subprocess.TimeoutExpired as exc:
+    completed = run_isolated_capture(
+        ("git", *args),
+        env=_sanitized_git_environment(),
+        timeout_seconds=timeout_seconds,
+        max_stdout_bytes=DEFAULT_CHECK_OUTPUT_BYTES,
+        max_stderr_bytes=DEFAULT_CHECK_OUTPUT_BYTES,
+    )
+    if completed.timed_out:
         raise CheckTimeoutError(
             f"Git operation timed out after {timeout_seconds:g} seconds"
-        ) from exc
+        )
+    if completed.stdout_truncated or completed.stderr_truncated:
+        raise CheckPolicyError("Git operation output exceeded its safe limit")
     if completed.returncode != 0:
         detail = completed.stderr.decode("utf-8", errors="replace").strip()
         raise CheckError(detail or f"Git exited with code {completed.returncode}")
@@ -1981,7 +1981,10 @@ def _run_git(
 def _bounded_timeout(value: object, field: str, maximum: float) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{field} must be a positive finite number")
-    converted = float(value)
+    try:
+        converted = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError(f"{field} must be a positive finite number") from exc
     if not math.isfinite(converted) or not 0 < converted <= maximum:
         raise ValueError(f"{field} must be at most {maximum:g} seconds")
     return converted

@@ -15,12 +15,14 @@ LangGraph 工作流、Python/Maven 沙箱和冻结评测集。锁定的 v1 模�
 
 - 接收一个 clean、已有提交的 Git 仓库和自然语言维护任务。
 - 构建有界仓库地图，并只向模型提供七个类型化工具：`list_files`、
-  `read_file`、`search_code`、`apply_patch`、`get_diff`、`run_check` 和
+  `read_file`、`read_files`、`search_code`、`apply_patch`、`get_diff` 和
   `finish`。
 - 生成结构化修改计划；除非显式选择自动批准，否则等待人工审批。
 - 只在当前运行拥有的候选 clone 中应用模型补丁，并在 Docker 中运行确定性的
   `pytest` 或 Maven 检查。
-- 验证失败最多修复两次，独立审查后最多再修复一次。
+- 验证失败最多修复一次；独立审查固定为一次模型响应，拒绝后保留候选并终止。
+- 模型预算按阶段固定且不可借用：规划 4,000 token，实现与修复合计 23,500，
+  审查 2,500，总上限 30,000。
 - 在 SQLite 中记录每个工作流边界；中断后可恢复，且不会主动重复已完成并已记录
   的副作用。
 - 生成 `patch.diff`、`report.md`、`run.json`、`trace.jsonl` 和有界测试日志。
@@ -52,8 +54,7 @@ flowchart LR
 
 ```text
 prepare -> baseline_check -> inspect_and_plan -> approval -> implement
-        -> verify -> repair（最多 2 次）-> review
-        -> review_repair（最多 1 次）-> finalize
+        -> verify -> repair（最多 1 次）-> review -> finalize
 ```
 
 规划阶段只读，模型不能跳过确定性验证。最终状态 `succeeded` 表示工作流完成了
@@ -155,14 +156,14 @@ repo-agent doctor --allow-remote-model --format json
 这是数据出站授权：任务文本和工具为完成任务选取的代码片段可能被发送给所配置的
 模型服务。
 
-### 保存 Windows 中转站配置
+### 保存 Windows DeepSeek 配置
 
-对于当前配置的 `https://thz10.airucas.com/v1`，辅助脚本可以发现可用模型、执行
-doctor 探针，并把 Key、Base URL、模型作为一个整体使用 Windows DPAPI
-CurrentUser 加密保存：
+对于 DeepSeek 官方 API `https://api.deepseek.com`，辅助脚本可以发现可用模型、
+执行 doctor 探针，并把 Key、Base URL、模型作为一个整体使用 Windows DPAPI
+CurrentUser 加密保存。当前配置模型为 `deepseek-v4-pro`：
 
 ```powershell
-./scripts/start-relay.ps1 -Reconfigure -ConfigureOnly
+./scripts/start-relay.ps1 -Reconfigure -ConfigureOnly -Model deepseek-v4-pro
 ./scripts/start-relay.ps1 -Repository D:\path\to\clean-repository -OpenBrowser
 ```
 
@@ -282,16 +283,18 @@ Windows 默认把持久化数据保存到 `%LOCALAPPDATA%\repo-agent`，可用 `
 - 绝对路径、路径穿越、`.git`、疑似凭据路径、symlink/reparse 逃逸、hardlink
   目标、二进制补丁、rename、submodule 和 mode change 均被拒绝。
 - 宿主 HOME、SSH 配置、模型凭据、Docker socket 不会挂载进工具或验证容器。
-- 输出和产物有大小限制并进行脱敏；容器按 run 命名/打标签，仅按精确 ID 回收，
-  不运行全局 prune。
+- 日志和结构化产物有大小限制并进行脱敏；`patch.diff` 为保持可应用性按原字节
+  保存，若命中已配置密钥或高置信凭据格式则直接拒绝持久化，不会改写 diff。
+  容器按 run 命名/打标签，仅按精确 ID 回收，不运行全局 prune。
 
 模型服务本身仍是外部信任边界。只有当仓库允许把相关代码和任务文本发送给该服务
 时，才应授权远程模型。
 
 ## v1 实测结果
 
-锁定的 44-job 评测已于 2026-09-12（UTC+8）使用 `gpt-5.6-sol` 完成。下列
-数字均可从 [`results.jsonl`](benchmarks/results/v1/results.jsonl) 重新计算；该文件
+锁定的 44-job 评测已于 2026-09-12（UTC+8）使用 `gpt-5.6-sol` 完成。下列已发布
+v1 表格和汇总统计均可从 [`results.jsonl`](benchmarks/results/v1/results.jsonl)
+重新计算；该文件
 SHA-256 为
 `1f083cdf6ce1630ec50da47cadf3b16a7e628c09c23f10e697bc407549579761`。
 中转站 token 单价未经独立核实，因此不报告费用。
@@ -308,6 +311,12 @@ SHA-256 为
 Python 和 Java 也未分别达到 4/6；它比 `baseline` 少解决 9 题，比
 `no-review` 少解决 2 题。因此，本次结果不支持“完整架构提升成功率”或“独立
 review 带来收益”这两个正向结论。
+
+不可变的 v1 scorer 没有识别 trial-1 `full` 中 `py-bugfix-005` 的 pytest
+`SUBFAILED` 输出。对保留的 scoring evidence 应用修正后的归因规则，该结果等价于
+总计 2/12、Python 2/6；这些修正数字不会回写不可变 JSONL，且仍未达到任一发布
+门槛。详情见 [`benchmarks/ERRATA.md`](benchmarks/ERRATA.md)；v1 的
+三个发布结果文件及其摘要值均未改写。
 
 全部 44 次运行均完成评测，其中 14 次解决任务。Agent 延迟为 p50 120.5 秒、
 p95 641.8 秒，未达到 p95 不超过 8 分钟的目标。30 个失败包括 29 个
@@ -330,6 +339,33 @@ p95 641.8 秒，未达到 p95 不超过 8 分钟的目标。30 个失败包括 2
 冻结评测集包含 6 个 Python 和 6 个 Java bug-fix 任务。候选 Agent 只能看到带 Bug
 的 setup、公开测试和 `issue.md`；独立 scorer 不向 Agent 暴露 `hidden_tests`、
 `gold.patch` 或预期失败签名。不能直接用工作流 `succeeded` 判断题目通过。
+
+正式运行前只使用 4 个非正式 development fixture 调优。已保存 Windows 中转站
+配置时，以下受限入口会运行固定的四题 `full` 命令，并写入新的忽略目录：
+
+```powershell
+./scripts/start-relay.ps1 -Evaluate
+```
+
+仅当至少解决 3/4、四项任务均未超预算且
+`actionable_tool_error_rate <= 5%` 时，该入口才以成功状态退出。
+
+冻结代码、prompt、模型和预算后，使用另一个受限入口只运行正式 12 题的 `full`
+trial 1：
+
+```powershell
+./scripts/start-relay.ps1 -FormalEvaluate
+```
+
+每次结果写入新的
+`evaluation-results/formal-v1-regression-acceptance/` 子目录。只有总计至少
+8/12、Python 与 Java 各至少 4/6、每题 usage 完整且不超过 30,000 token、无超时
+或预算失败、p95 不超过 480 秒时才成功。该结果只能标记为 v1 regression
+acceptance，不是新的 holdout，也不会运行 44-job matrix 或写入
+`benchmarks/results/v1`。
+
+通用 CLI 仅允许在 single-variant 模式使用该 development suite；matrix、canary、
+shard 和 merge 仍只接受正式套件。
 
 不使用 Docker 检查结构和内容锁：
 
@@ -417,7 +453,8 @@ python ./scripts/smoke-day6.py
 ```
 
 完整演示流程见 [docs/DEMO.md](docs/DEMO.md)，更细的操作说明见
-[docs/USER_GUIDE.zh-CN.md](docs/USER_GUIDE.zh-CN.md)。
+[docs/USER_GUIDE.zh-CN.md](docs/USER_GUIDE.zh-CN.md)，故障注入与边界测试矩阵见
+[docs/EXTREME_TESTING.zh-CN.md](docs/EXTREME_TESTING.zh-CN.md)。
 
 ## 许可证
 

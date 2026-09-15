@@ -100,6 +100,7 @@ let currentResult = null;
 let currentMode = "agent";
 let currentRunId = null;
 let pollTimer = null;
+let configuredModel = "Model API";
 
 async function fetchJson(url, options = {}) {
   const response = await fetch(url, {
@@ -146,7 +147,9 @@ function renderState(state) {
   const service = state.service || {};
   elements.serviceStatus.textContent = service.ready ? "Ready" : service.enabled ? "Unavailable" : "Disabled";
   elements.serviceQueue.textContent = Number.isInteger(service.queue_depth) ? String(service.queue_depth) : "-";
-  elements.serviceModel.textContent = service.model_configured ? "Configured" : "Not configured";
+  configuredModel = service.model_configured && typeof service.model === "string" && service.model ? service.model : "Model API";
+  elements.serviceModel.textContent = service.model_configured ? configuredModel : "Not configured";
+  if (currentMode === "agent") elements.providerBadge.textContent = configuredModel;
 
   const docker = state.docker || {};
   elements.headerStatusText.textContent = !service.ready ? "Agent unavailable" : !service.model_configured ? "Model not configured" : docker.available ? "Agent ready" : "Docker offline";
@@ -201,7 +204,7 @@ function switchMode(mode) {
   currentMode = mode;
   elements.agentSettings.hidden = mode !== "agent";
   elements.demoSettings.hidden = mode !== "demo";
-  elements.providerBadge.textContent = mode === "agent" ? "OpenAI" : "Demo provider";
+  elements.providerBadge.textContent = mode === "agent" ? configuredModel : "Demo provider";
   elements.runButtonLabel.textContent = mode === "agent" ? "Create maintenance run" : "Run inspection";
   elements.task.value = mode === "agent" ? "Fix the reported bug and add a focused regression test" : "Inspect repository status and TODO markers";
 }

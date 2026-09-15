@@ -19,13 +19,15 @@ from .openai_provider import (
     _decode_json_value,
     _protocol_identifier,
     _responses_output_text,
+    is_official_deepseek_base_url,
 )
 
 
 _TOOL_NAME = "repo_agent_doctor_check"
 _SYSTEM_PROMPT = (
     "You are verifying an Agent API connection. Follow the requested function "
-    "call exactly. Do not reveal credentials or add unrelated content."
+    "call exactly and call at most one tool per response. Do not reveal "
+    "credentials or add unrelated content."
 )
 
 
@@ -122,17 +124,19 @@ def _run_responses_doctor(
             ],
         }
     ]
+    first_payload: dict[str, object] = {
+        "model": client.config.model,
+        "instructions": instructions,
+        "input": deepcopy(input_items),
+        "tools": [deepcopy(tool)],
+        "parallel_tool_calls": False,
+        "store": False,
+    }
+    _set_deepseek_non_thinking(client.config, first_payload)
+    first_payload["tool_choice"] = {"type": "function", "name": _TOOL_NAME}
     first = client.post_json(
         "/responses",
-        {
-            "model": client.config.model,
-            "instructions": instructions,
-            "input": deepcopy(input_items),
-            "tools": [deepcopy(tool)],
-            "tool_choice": {"type": "function", "name": _TOOL_NAME},
-            "parallel_tool_calls": False,
-            "store": False,
-        },
+        first_payload,
     )
     output = first.get("output")
     if not isinstance(output, list) or not all(
@@ -157,16 +161,18 @@ def _run_responses_doctor(
             "output": tool_output,
         }
     )
+    second_payload: dict[str, object] = {
+        "model": client.config.model,
+        "instructions": instructions,
+        "input": continued_input,
+        "tools": [deepcopy(tool)],
+        "parallel_tool_calls": False,
+        "store": False,
+    }
+    _set_deepseek_non_thinking(client.config, second_payload)
     second = client.post_json(
         "/responses",
-        {
-            "model": client.config.model,
-            "instructions": instructions,
-            "input": continued_input,
-            "tools": [deepcopy(tool)],
-            "parallel_tool_calls": False,
-            "store": False,
-        },
+        second_payload,
     )
     second_output = second.get("output")
     if not isinstance(second_output, list):
@@ -272,6 +278,14 @@ def _responses_tool(challenge: str) -> dict[str, object]:
         },
         "strict": True,
     }
+
+
+def _set_deepseek_non_thinking(
+    config: OpenAIConfig,
+    payload: dict[str, object],
+) -> None:
+    if is_official_deepseek_base_url(config.base_url):
+        payload["reasoning"] = {"effort": "none"}
 
 
 def _doctor_instructions(confirmation: str) -> str:

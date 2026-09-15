@@ -140,6 +140,13 @@ and at most 30,000 reported tokens. Single-variant `--variant ... --execute`
 runs remain available for focused debugging but are not a replacement for the
 locked formal matrix.
 
+The four fixtures under `tasks/python/development` are explicitly non-formal.
+They may be run only through single-variant mode for prompt and workflow tuning;
+matrix, canary, shard, and merge paths reject them. On Windows, the restricted
+`scripts/start-relay.ps1 -Evaluate` entry point loads the DPAPI-protected model
+configuration and runs the fixed four-task `full` command. It never places the
+key in command arguments or evaluation artifacts.
+
 ## Locked 44-run experiment
 
 The formal comparison is fixed before execution:
@@ -218,6 +225,10 @@ records input, cached-input, output, and total tokens while `cost_usd` remains
 `null` and `price_source` is `unavailable`.
 
 ## Claims policy
+
+The immutable v1 result has a documented pytest `SUBFAILED` attribution issue.
+See [`ERRATA.md`](ERRATA.md). New acceptance output must live in a new directory
+and be labeled v1 regression acceptance rather than an independent holdout.
 
 Publishing raw results does not automatically justify a positive architecture
 claim. The predeclared thresholds are:

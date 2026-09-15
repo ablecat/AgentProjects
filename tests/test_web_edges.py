@@ -7,6 +7,7 @@ from http.client import HTTPConnection
 from io import BytesIO
 import json
 from pathlib import Path
+import socket
 import subprocess
 import threading
 from types import SimpleNamespace
@@ -17,6 +18,7 @@ import pytest
 import repo_agent.web as web
 from repo_agent.artifacts import ArtifactError
 from repo_agent.persistence import RunNotFoundError
+from repo_agent.processes import CapturedProcess
 from repo_agent.run_models import RunRecord
 from repo_agent.service import (
     InvalidRunTransitionError,
@@ -174,6 +176,51 @@ def _raw_post(
     raw = response.read()
     connection.close()
     return response.status, json.loads(raw.decode("utf-8"))
+
+
+def _short_post(
+    server: web.RepoAgentHTTPServer, path: str, body: bytes
+) -> tuple[int, object]:
+    declared_length = len(body) + 1
+    request = (
+        f"POST {path} HTTP/1.1\r\n"
+        f"Host: {web.HOST}:{server.server_address[1]}\r\n"
+        "Content-Type: application/json\r\n"
+        f"Content-Length: {declared_length}\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode("ascii") + body
+    with socket.create_connection(server.server_address, timeout=5) as connection:
+        connection.sendall(request)
+        connection.shutdown(socket.SHUT_WR)
+        chunks: list[bytes] = []
+        while chunk := connection.recv(8192):
+            chunks.append(chunk)
+    raw_response = b"".join(chunks)
+    head, raw_body = raw_response.split(b"\r\n\r\n", 1)
+    status = int(head.split(b"\r\n", 1)[0].split(b" ", 2)[1])
+    return status, json.loads(raw_body.decode("utf-8"))
+
+
+def _duplicate_length_post(
+    server: web.RepoAgentHTTPServer, path: str, body: bytes
+) -> tuple[int, object]:
+    request = (
+        f"POST {path} HTTP/1.1\r\n"
+        f"Host: {web.HOST}:{server.server_address[1]}\r\n"
+        "Content-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        f"Content-Length: {len(body) + 1000}\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode("ascii") + body
+    with socket.create_connection(server.server_address, timeout=5) as connection:
+        connection.sendall(request)
+        chunks: list[bytes] = []
+        while chunk := connection.recv(8192):
+            chunks.append(chunk)
+    raw_response = b"".join(chunks)
+    head, raw_body = raw_response.split(b"\r\n\r\n", 1)
+    status = int(head.split(b"\r\n", 1)[0].split(b" ", 2)[1])
+    return status, json.loads(raw_body.decode("utf-8"))
 
 
 def test_server_rejects_non_loopback_bind(committed_repository: Path) -> None:
@@ -379,6 +426,44 @@ def test_agent_json_reader_maps_body_timeout() -> None:
     assert rejected.value.code == "request_timeout"
 
 
+def test_short_http_body_is_rejected_before_any_run_is_dispatched(
+    committed_repository: Path, tmp_path: Path
+) -> None:
+    service = EdgeService(committed_repository, tmp_path / "artifacts")
+
+    def unexpected_run(**_kwargs):
+        raise AssertionError("short request must not be dispatched")
+
+    with _running_server(
+        committed_repository, run_function=unexpected_run, service=service
+    ) as (_base_url, server):
+        for path in ("/api/runs", "/api/agent/runs"):
+            status, payload = _short_post(server, path, b"{}")
+            assert status == HTTPStatus.BAD_REQUEST
+            assert payload["error"]["code"] == "invalid_request"
+
+    assert service.actions == []
+
+
+def test_duplicate_content_length_is_rejected_before_any_run_is_dispatched(
+    committed_repository: Path, tmp_path: Path
+) -> None:
+    service = EdgeService(committed_repository, tmp_path / "artifacts")
+
+    def unexpected_run(**_kwargs):
+        raise AssertionError("ambiguous request must not be dispatched")
+
+    with _running_server(
+        committed_repository, run_function=unexpected_run, service=service
+    ) as (_base_url, server):
+        for path in ("/api/runs", "/api/agent/runs"):
+            status, payload = _duplicate_length_post(server, path, b"{}")
+            assert status == HTTPStatus.BAD_REQUEST
+            assert payload["error"]["code"] == "invalid_request"
+
+    assert service.actions == []
+
+
 @pytest.mark.parametrize(
     ("error", "artifact", "status", "code"),
     [
@@ -480,6 +565,7 @@ def test_agent_run_and_decision_validation_normalize_safe_values() -> None:
         {"approve": True, "unexpected": 1},
         {"approve": 1},
         {"approve": True, "reason": 1},
+        {"approve": True, "reason": "bad\x00reason"},
         {"approve": True, "reason": "x" * 2001},
     ],
 )
@@ -496,9 +582,11 @@ def test_legacy_run_validation_checks_all_numeric_boundaries() -> None:
     bad_payloads = [
         [],
         {"task": "x" * (web.MAX_TASK_LENGTH + 1)},
+        {"task": "bad\x00task"},
         {"task": "ok", "max_steps": True},
         {"task": "ok", "timeout_seconds": True},
         {"task": "ok", "timeout_seconds": "30"},
+        {"task": "ok", "timeout_seconds": 10**1000},
         {"task": "ok", "timeout_seconds": 121},
         {"task": "ok", "max_output_bytes": 1000},
     ]
@@ -519,6 +607,7 @@ def test_durable_service_state_tracks_model_configuration(monkeypatch) -> None:
         "ready": False,
         "queue_depth": 0,
         "model_configured": False,
+        "model": None,
     }
 
     for name in ("REPO_AGENT_API_KEY", "REPO_AGENT_BASE_URL", "REPO_AGENT_MODEL"):
@@ -529,6 +618,7 @@ def test_durable_service_state_tracks_model_configuration(monkeypatch) -> None:
     assert enabled["ready"] is True
     assert enabled["queue_depth"] == 2
     assert enabled["model_configured"] is True
+    assert enabled["model"] == "configured"
 
 
 def test_application_state_contains_git_and_docker_failures(
@@ -573,10 +663,10 @@ def test_command_capture_maps_spawn_timeout_and_exit_errors(
     monkeypatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(
-        web.subprocess,
-        "run",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            subprocess.TimeoutExpired("tool", 1)
+        web,
+        "run_isolated_capture",
+        lambda *_args, **_kwargs: CapturedProcess(
+            -9, b"", b"", False, False, True
         ),
     )
     with pytest.raises(OSError, match="failed to start"):
@@ -585,12 +675,15 @@ def test_command_capture_maps_spawn_timeout_and_exit_errors(
         web._git_capture(tmp_path, "status")
 
     monkeypatch.setattr(
-        web.subprocess,
-        "run",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            returncode=2,
-            stdout=b"public stdout",
-            stderr=b"private stderr",
+        web,
+        "run_isolated_capture",
+        lambda *_args, **_kwargs: CapturedProcess(
+            2,
+            b"public stdout",
+            b"private stderr",
+            False,
+            False,
+            False,
         ),
     )
     with pytest.raises(RuntimeError, match="private stderr"):
@@ -665,7 +758,7 @@ def test_serve_validates_configuration_and_runs_injected_services(
     monkeypatch.setattr(web, "RunService", FakeRunService)
     monkeypatch.setattr(web, "RepoAgentHTTPServer", FakeServer)
     monkeypatch.setattr(web.webbrowser, "open", opened.append)
-    monkeypatch.setenv("REPO_AGENT_API_KEY", "configured-test-secret")
+    monkeypatch.setenv("REPO_AGENT_API_KEY", "  configured-test-secret  ")
 
     for port, bootstrap in ((0, False), (65536, False), (True, False), (8765, 1)):
         with pytest.raises(ValueError):

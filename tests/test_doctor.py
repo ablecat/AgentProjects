@@ -124,6 +124,13 @@ def test_responses_doctor_preserves_reasoning_call_and_exact_call_id() -> None:
         assert headers["authorization"] == "Bearer fake-doctor-key"
         request = json.loads(raw)
         assert request["parallel_tool_calls"] is False
+        if index == 0:
+            assert request["tool_choice"] == {
+                "type": "function",
+                "name": "repo_agent_doctor_check",
+            }
+        else:
+            assert "tool_choice" not in request
         tool = request["tools"][0]
         assert tool["strict"] is True
         assert tool["parameters"]["additionalProperties"] is False
@@ -205,6 +212,13 @@ def test_doctor_falls_back_to_chat_for_clear_capability_errors(
         assert path == "/chat/completions"
         request = json.loads(raw)
         assert request["parallel_tool_calls"] is False
+        if index == 1:
+            assert request["tool_choice"] == {
+                "type": "function",
+                "function": {"name": "repo_agent_doctor_check"},
+            }
+        else:
+            assert "tool_choice" not in request
         tool = request["tools"][0]
         assert tool["type"] == "function"
         assert tool["function"]["strict"] is True

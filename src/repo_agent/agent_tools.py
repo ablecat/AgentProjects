@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import asdict
 import json
 from pathlib import PurePosixPath
@@ -16,6 +17,9 @@ from .tools import ToolDefinition
 
 MAX_AGENT_FILE_RESULTS = 500
 MAX_AGENT_SEARCH_RESULTS = 200
+MAX_AGENT_BATCH_FILES = 4
+MAX_AGENT_BATCH_LINES = 200
+MAX_AGENT_BATCH_BYTES = 16 * 1024
 
 
 AGENT_TOOL_DEFINITIONS: tuple[ToolDefinition, ...] = (
@@ -46,6 +50,30 @@ AGENT_TOOL_DEFINITIONS: tuple[ToolDefinition, ...] = (
                 "end_line": {"type": "integer", "minimum": 1},
             },
             "required": ["path"],
+            "additionalProperties": False,
+        },
+    ),
+    ToolDefinition(
+        "read_files",
+        (
+            "Read the first 200 lines from 1 to 4 non-sensitive repository files "
+            "in one bounded response."
+        ),
+        {
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 512,
+                    },
+                    "minItems": 1,
+                    "maxItems": MAX_AGENT_BATCH_FILES,
+                }
+            },
+            "required": ["paths"],
             "additionalProperties": False,
         },
     ),
@@ -139,6 +167,7 @@ class AgentToolExecutor:
         phase_timeout_seconds: float = 300.0,
         total_timeout_seconds: float = 1200.0,
         max_output_bytes: int = 65536,
+        mutation_callback: Callable[[str], None] | None = None,
     ) -> None:
         self.sandbox = sandbox
         self.repo_path = repo_path
@@ -147,10 +176,16 @@ class AgentToolExecutor:
         self.phase_timeout_seconds = phase_timeout_seconds
         self.total_timeout_seconds = total_timeout_seconds
         self.max_output_bytes = max_output_bytes
+        self.mutation_callback = mutation_callback
+        self._mutation_persistence_failed = False
 
     @property
     def workspace_revision(self) -> int:
         return self.sandbox.workspace_revision
+
+    @property
+    def mutation_persistence_failed(self) -> bool:
+        return self._mutation_persistence_failed
 
     def execute(self, call: ToolCall) -> ToolResult:
         try:
@@ -158,6 +193,8 @@ class AgentToolExecutor:
                 return self._list_files(call)
             if call.name == "read_file":
                 return self._delegate(call, "read_file", dict(call.arguments))
+            if call.name == "read_files":
+                return self._read_files(call)
             if call.name == "search_code":
                 return self._search_code(call)
             if call.name == "apply_patch":
@@ -229,15 +266,70 @@ class AgentToolExecutor:
         result = self._delegate(call, "search", delegated)
         return _limit_lines(result, limit)
 
+    def _read_files(self, call: ToolCall) -> ToolResult:
+        arguments = _arguments(call, {"paths"})
+        raw_paths = arguments.get("paths")
+        if not isinstance(raw_paths, list):
+            raise ValueError("read_files paths must be an array")
+        if not 1 <= len(raw_paths) <= MAX_AGENT_BATCH_FILES:
+            raise ValueError(
+                f"read_files requires 1 to {MAX_AGENT_BATCH_FILES} paths"
+            )
+        paths = [DEFAULT_PATH_POLICY.validate(path, access="read") for path in raw_paths]
+        if len(set(paths)) != len(paths):
+            raise ValueError("read_files paths must be unique")
+
+        sections: list[str] = []
+        failures: list[str] = []
+        exit_code: int | None = 0
+        truncated = False
+        for path in paths:
+            result = self._delegate(
+                call,
+                "read_file",
+                {"path": path, "start_line": 1, "end_line": MAX_AGENT_BATCH_LINES},
+            )
+            sections.append(f"===== {path} =====\n{result.output}")
+            truncated = truncated or result.truncated
+            if not result.ok:
+                failures.append(f"{path}: {result.error or 'read failed'}")
+                if exit_code == 0:
+                    exit_code = result.exit_code
+
+        output, output_truncated = _limit_utf8_bytes(
+            "\n".join(sections), MAX_AGENT_BATCH_BYTES
+        )
+        return ToolResult(
+            call.id,
+            call.name,
+            not failures,
+            output,
+            error="; ".join(failures) or None,
+            exit_code=exit_code,
+            truncated=truncated or output_truncated,
+        )
+
     def _apply_patch(self, call: ToolCall) -> ToolResult:
         arguments = _arguments(call, {"unified_diff"})
         if "unified_diff" not in arguments:
             raise ValueError("apply_patch requires unified_diff")
-        return self._delegate(
+        result = self._delegate(
             call,
             "apply_patch",
             {"patch": arguments["unified_diff"]},
         )
+        if result.ok and self.mutation_callback is not None:
+            try:
+                candidate = self.sandbox.candidate_artifact()
+                self.mutation_callback("" if candidate is None else candidate.patch)
+            except Exception as exc:
+                self._mutation_persistence_failed = True
+                detail = str(exc).strip()
+                raise RuntimeError(
+                    "candidate patch persistence failed"
+                    + (f": {detail}" if detail else "")
+                ) from exc
+        return result
 
     def _run_check(self, call: ToolCall) -> ToolResult:
         arguments = _arguments(call, {"check_id"})
@@ -322,9 +414,19 @@ def _limit_lines(result: ToolResult, limit: int) -> ToolResult:
     )
 
 
+def _limit_utf8_bytes(value: str, limit: int) -> tuple[str, bool]:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= limit:
+        return value, False
+    return encoded[:limit].decode("utf-8", errors="ignore"), True
+
+
 __all__ = [
     "AGENT_TOOL_DEFINITIONS",
     "AgentToolExecutor",
+    "MAX_AGENT_BATCH_BYTES",
+    "MAX_AGENT_BATCH_FILES",
+    "MAX_AGENT_BATCH_LINES",
     "MAX_AGENT_FILE_RESULTS",
     "MAX_AGENT_SEARCH_RESULTS",
 ]

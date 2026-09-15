@@ -39,4 +39,22 @@ jobs:
       - run: docker build --pull=false -t repo-agent-maven:0.1 docker/maven
       - run: python scripts/smoke-day1.py
       - run: python scripts/smoke-day2.py
+      - run: python scripts/smoke-day3.py
       - run: python scripts/smoke-day6.py
+
+  windows-process-lifecycle:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev]"
+      - run: >-
+          python -m pytest
+          tests/test_processes.py
+          tests/test_sandbox.py
+          tests/test_repository_map_edges.py

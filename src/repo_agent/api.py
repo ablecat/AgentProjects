@@ -38,6 +38,8 @@ from .service import (
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8770
+MAX_REQUEST_BYTES = 64 * 1024
+REQUEST_BODY_TIMEOUT_SECONDS = 10.0
 MAX_TASK_LENGTH = 4000
 MAX_REASON_LENGTH = 2000
 MAX_BASE_REF_LENGTH = 255
@@ -224,6 +226,174 @@ class _SecurityHeadersMiddleware:
         await self.app(scope, receive, send_with_headers)
 
 
+class _RequestBodyLimitMiddleware:
+    """Buffer one small request body before application-level JSON parsing."""
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        max_bytes: int = MAX_REQUEST_BYTES,
+        timeout_seconds: float = REQUEST_BODY_TIMEOUT_SECONDS,
+    ) -> None:
+        self.app = app
+        self._max_bytes = max_bytes
+        self._timeout_seconds = timeout_seconds
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        length_values = [
+            value
+            for name, value in scope.get("headers", ())
+            if name.lower() == b"content-length"
+        ]
+        if len(length_values) > 1:
+            await self._reject(
+                scope,
+                receive,
+                send,
+                400,
+                "invalid_request",
+                "Request must contain at most one Content-Length header",
+            )
+            return
+
+        declared_length: int | None = None
+        if length_values:
+            raw_length = length_values[0]
+            if (
+                not raw_length
+                or len(raw_length) > 128
+                or not raw_length.isdigit()
+            ):
+                await self._reject(
+                    scope,
+                    receive,
+                    send,
+                    400,
+                    "invalid_request",
+                    "Content-Length must be a non-negative decimal integer",
+                )
+                return
+            significant_length = raw_length.lstrip(b"0") or b"0"
+            maximum_length = str(self._max_bytes).encode("ascii")
+            if (
+                len(significant_length) > len(maximum_length)
+                or len(significant_length) == len(maximum_length)
+                and significant_length > maximum_length
+            ):
+                await self._reject_too_large(scope, receive, send)
+                return
+            declared_length = int(significant_length)
+
+        messages: list[Message] = []
+        total = 0
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._timeout_seconds
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                await self._reject_timeout(scope, receive, send)
+                return
+            try:
+                message = await asyncio.wait_for(receive(), timeout=remaining)
+            except TimeoutError:
+                await self._reject_timeout(scope, receive, send)
+                return
+            if message.get("type") == "http.disconnect":
+                return
+            if message.get("type") != "http.request":
+                await self._reject(
+                    scope,
+                    receive,
+                    send,
+                    400,
+                    "invalid_request",
+                    "Request body framing is invalid",
+                )
+                return
+            body = message.get("body", b"")
+            if not isinstance(body, bytes):
+                await self._reject(
+                    scope,
+                    receive,
+                    send,
+                    400,
+                    "invalid_request",
+                    "Request body framing is invalid",
+                )
+                return
+            total += len(body)
+            if total > self._max_bytes:
+                await self._reject_too_large(scope, receive, send)
+                return
+            messages.append(message)
+            if not message.get("more_body", False):
+                break
+
+        if declared_length is not None and total != declared_length:
+            await self._reject(
+                scope,
+                receive,
+                send,
+                400,
+                "invalid_request",
+                "Request body length does not match Content-Length",
+            )
+            return
+
+        index = 0
+
+        async def replay() -> Message:
+            nonlocal index
+            if index >= len(messages):
+                return {"type": "http.disconnect"}
+            message = messages[index]
+            index += 1
+            return message
+
+        await self.app(scope, replay, send)
+
+    async def _reject_too_large(
+        self, scope: Scope, receive: Receive, send: Send
+    ) -> None:
+        await self._reject(
+            scope,
+            receive,
+            send,
+            413,
+            "request_too_large",
+            f"Request body must be at most {self._max_bytes} bytes",
+        )
+
+    async def _reject_timeout(
+        self, scope: Scope, receive: Receive, send: Send
+    ) -> None:
+        await self._reject(
+            scope,
+            receive,
+            send,
+            408,
+            "request_timeout",
+            "Request body timed out",
+        )
+
+    @staticmethod
+    async def _reject(
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+        status_code: int,
+        code: str,
+        message: str,
+    ) -> None:
+        response = _error_response(status_code, code, message)
+        await response(scope, receive, send)
+
+
 def create_app(
     service: RunServiceLike,
     *,
@@ -247,6 +417,7 @@ def create_app(
     )
     app.state.run_service = service
     app.state.allowed_roots = roots
+    app.add_middleware(_RequestBodyLimitMiddleware)
     app.add_middleware(_BearerAuthMiddleware, token=token)
     app.add_middleware(_SecurityHeadersMiddleware)
 
@@ -812,6 +983,8 @@ def _error_response(
 __all__ = [
     "DEFAULT_HOST",
     "DEFAULT_PORT",
+    "MAX_REQUEST_BYTES",
+    "REQUEST_BODY_TIMEOUT_SECONDS",
     "ApiError",
     "CreateRunRequest",
     "DecisionRequest",

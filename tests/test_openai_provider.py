@@ -2,25 +2,37 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import FrozenInstanceError
+from email.message import Message
+from io import BytesIO
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import socket
 import threading
 import time
+from urllib.error import HTTPError
 import pytest
 
+import repo_agent.openai_provider as provider_module
 from repo_agent.models import FinalAnswer, ToolCall, ToolResult
 from repo_agent.openai_provider import (
+    APIKind,
+    ESTIMATED_UTF8_BYTES_PER_TOKEN,
+    MAX_TASK_CHARACTERS,
+    MAX_RESPONSE_TOKEN_BUDGET,
+    REQUEST_PROTOCOL_TOKEN_MARGIN,
     OpenAIConfig,
     OpenAIConfigurationError,
     OpenAIHTTPClient,
     OpenAIHTTPError,
     OpenAIProtocolError,
     OpenAIProvider,
+    OpenAIRequestCapacityError,
     OpenAIResponseTooLargeError,
     OpenAITimeoutError,
     OpenAITransportError,
     RemoteModelNotAllowedError,
+    _estimate_request_input_tokens,
     strict_response_tools,
 )
 from repo_agent.tools import TOOL_DEFINITIONS
@@ -121,6 +133,31 @@ def test_config_loads_only_explicit_contract_and_redacts_key() -> None:
     assert "must-be-ignored" not in repr(loaded)
 
 
+def test_request_input_token_estimate_uses_exact_serialized_utf8_size() -> None:
+    payload = {"model": "fake-model", "input": "\u6d4b\u8bd5"}
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    assert _estimate_request_input_tokens(payload) == (
+        len(encoded) + ESTIMATED_UTF8_BYTES_PER_TOKEN - 1
+    ) // ESTIMATED_UTF8_BYTES_PER_TOKEN + REQUEST_PROTOCOL_TOKEN_MARGIN
+
+
+@pytest.mark.parametrize(
+    "value",
+    (False, True, 0, -1, 1.5, "100", MAX_RESPONSE_TOKEN_BUDGET + 1, 10**1000),
+)
+def test_response_token_budget_rejects_invalid_values(value: object) -> None:
+    provider = OpenAIProvider(config("http://localhost:8123/v1"))
+
+    with pytest.raises(OpenAIConfigurationError, match="response token budget"):
+        provider.set_response_token_budget(value)  # type: ignore[arg-type]
+
+
 def test_responses_usage_is_aggregated_across_rounds() -> None:
     def responder(path, headers, raw, index):
         del headers, raw
@@ -162,8 +199,17 @@ def test_responses_usage_is_aggregated_across_rounds() -> None:
 
     with fake_openai_server(responder) as (base_url, _):
         provider = OpenAIProvider(config(f"{base_url}/v1"))
+        assert provider.last_response_usage is None
         call = provider.next_step("inspect", ())
         assert isinstance(call, ToolCall)
+        first_usage = provider.last_response_usage
+        assert first_usage is not None
+        assert first_usage.response_count == 1
+        assert first_usage.reported_response_count == 1
+        assert first_usage.input_tokens == 10
+        assert first_usage.cached_input_tokens == 3
+        assert first_usage.output_tokens == 4
+        assert first_usage.total_tokens == 14
         final = provider.next_step(
             "inspect",
             (ToolResult(call.id, call.name, True, "clean"),),
@@ -177,6 +223,18 @@ def test_responses_usage_is_aggregated_across_rounds() -> None:
     assert provider.usage.output_tokens == 7
     assert provider.usage.total_tokens == 37
     assert provider.usage.complete is True
+    assert provider.last_response_usage is not first_usage
+    assert provider.last_response_usage is not None
+    assert provider.last_response_usage.response_count == 1
+    assert provider.last_response_usage.reported_response_count == 1
+    assert provider.last_response_usage.input_tokens == 20
+    assert provider.last_response_usage.cached_input_tokens == 0
+    assert provider.last_response_usage.output_tokens == 3
+    assert provider.last_response_usage.total_tokens == 23
+    with pytest.raises(FrozenInstanceError):
+        first_usage.input_tokens = 999  # type: ignore[misc]
+    with pytest.raises(AttributeError):
+        provider.last_response_usage = first_usage  # type: ignore[misc]
 
 
 def test_missing_usage_is_not_reported_as_zero_tokens() -> None:
@@ -202,6 +260,194 @@ def test_missing_usage_is_not_reported_as_zero_tokens() -> None:
     assert provider.usage.cached_input_tokens is None
     assert provider.usage.total_tokens is None
     assert provider.usage.complete is False
+    assert provider.last_response_usage is not None
+    assert provider.last_response_usage.response_count == 1
+    assert provider.last_response_usage.reported_response_count == 0
+    assert provider.last_response_usage.input_tokens is None
+    assert provider.last_response_usage.cached_input_tokens is None
+    assert provider.last_response_usage.output_tokens is None
+    assert provider.last_response_usage.total_tokens is None
+
+
+def test_malformed_usage_marks_the_received_response_as_unreported() -> None:
+    provider = OpenAIProvider(config("http://localhost:8123/v1"))
+    provider._record_usage(
+        {
+            "usage": {
+                "input_tokens": 2,
+                "output_tokens": 3,
+                "total_tokens": 5,
+            }
+        },
+        "responses",
+    )
+    with pytest.raises(OpenAIProtocolError, match="usage is malformed"):
+        provider._record_usage(
+            {
+                "usage": {
+                    "input_tokens": 7,
+                    "output_tokens": "invalid",
+                    "total_tokens": 7,
+                }
+            },
+            "responses",
+        )
+
+    assert provider.usage.response_count == 2
+    assert provider.usage.reported_response_count == 1
+    assert provider.usage.input_tokens == 2
+    assert provider.usage.output_tokens == 3
+    assert provider.usage.total_tokens == 5
+    assert provider.usage.complete is False
+    assert provider.last_response_usage == provider_module.ProviderUsage(
+        1, 0, None, None, None, None
+    )
+
+
+@pytest.mark.parametrize(
+    ("api_kind", "input_name", "output_name"),
+    (
+        ("responses", "input_tokens", "output_tokens"),
+        ("chat_completions", "prompt_tokens", "completion_tokens"),
+    ),
+)
+@pytest.mark.parametrize(
+    ("input_tokens", "output_tokens", "total_tokens"),
+    (
+        (1_000_000, 2_000_000, 0),
+        (7, 11, 19),
+        (7, 11, 17),
+    ),
+)
+def test_usage_total_must_equal_input_plus_output_without_partial_update(
+    api_kind: APIKind,
+    input_name: str,
+    output_name: str,
+    input_tokens: int,
+    output_tokens: int,
+    total_tokens: int,
+) -> None:
+    provider = OpenAIProvider(config("http://localhost:8123/v1"))
+    provider._record_usage(
+        {
+            "usage": {
+                input_name: 2,
+                output_name: 3,
+                "total_tokens": 5,
+            }
+        },
+        api_kind,
+    )
+    with pytest.raises(OpenAIProtocolError, match="usage is malformed"):
+        provider._record_usage(
+            {
+                "usage": {
+                    input_name: input_tokens,
+                    output_name: output_tokens,
+                    "total_tokens": total_tokens,
+                }
+            },
+            api_kind,
+        )
+
+    assert provider.usage.response_count == 2
+    assert provider.usage.reported_response_count == 1
+    assert provider.usage.input_tokens == 2
+    assert provider.usage.output_tokens == 3
+    assert provider.usage.total_tokens == 5
+    assert provider.usage.complete is False
+    assert provider.last_response_usage == provider_module.ProviderUsage(
+        1, 0, None, None, None, None
+    )
+
+
+@pytest.mark.parametrize(
+    ("api_kind", "input_name", "output_name", "details_name"),
+    (
+        (
+            "responses",
+            "input_tokens",
+            "output_tokens",
+            "input_tokens_details",
+        ),
+        (
+            "chat_completions",
+            "prompt_tokens",
+            "completion_tokens",
+            "prompt_tokens_details",
+        ),
+    ),
+)
+def test_cached_tokens_are_an_input_subset_and_are_not_added_to_total(
+    api_kind: APIKind,
+    input_name: str,
+    output_name: str,
+    details_name: str,
+) -> None:
+    provider = OpenAIProvider(config("http://localhost:8123/v1"))
+    provider._record_usage(
+        {
+            "usage": {
+                input_name: 10,
+                details_name: {"cached_tokens": 4},
+                output_name: 3,
+                "total_tokens": 13,
+            }
+        },
+        api_kind,
+    )
+
+    assert provider.usage.input_tokens == 10
+    assert provider.usage.cached_input_tokens == 4
+    assert provider.usage.output_tokens == 3
+    assert provider.usage.total_tokens == 13
+
+
+@pytest.mark.parametrize(
+    ("api_kind", "input_name", "output_name", "details_name"),
+    (
+        (
+            "responses",
+            "input_tokens",
+            "output_tokens",
+            "input_tokens_details",
+        ),
+        (
+            "chat_completions",
+            "prompt_tokens",
+            "completion_tokens",
+            "prompt_tokens_details",
+        ),
+    ),
+)
+def test_cached_tokens_cannot_exceed_input_tokens(
+    api_kind: APIKind,
+    input_name: str,
+    output_name: str,
+    details_name: str,
+) -> None:
+    provider = OpenAIProvider(config("http://localhost:8123/v1"))
+
+    with pytest.raises(OpenAIProtocolError, match="usage is malformed"):
+        provider._record_usage(
+            {
+                "usage": {
+                    input_name: 3,
+                    details_name: {"cached_tokens": 4},
+                    output_name: 2,
+                    "total_tokens": 5,
+                }
+            },
+            api_kind,
+        )
+
+    assert provider.usage.response_count == 1
+    assert provider.usage.reported_response_count == 0
+    assert provider.usage.total_tokens is None
+    assert provider.usage.complete is False
+    assert provider.last_response_usage == provider_module.ProviderUsage(
+        1, 0, None, None, None, None
+    )
 
 
 def test_missing_environment_names_are_reported_without_values() -> None:
@@ -212,6 +458,19 @@ def test_missing_environment_names_are_reported_without_values() -> None:
     assert "REPO_AGENT_BASE_URL" in message
     assert "REPO_AGENT_MODEL" in message
     assert "fake-only-key" not in message
+
+
+def test_config_rejects_api_keys_too_short_for_secret_scanning() -> None:
+    with pytest.raises(OpenAIConfigurationError, match="too short"):
+        config("http://localhost:8123/v1", api_key="short")
+
+
+def test_config_canonicalizes_api_key_surrounding_whitespace() -> None:
+    loaded = config(
+        "http://localhost:8123/v1", api_key="  fake-provider-key  "
+    )
+
+    assert loaded.api_key == "fake-provider-key"
 
 
 @pytest.mark.parametrize(
@@ -235,6 +494,26 @@ def test_remote_endpoints_still_require_https_after_opt_in() -> None:
         allow_remote_model=True,
     )
     assert allowed.base_url == "https://api.example.invalid/v1"
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    (
+        ("https://api.deepseek.com", True),
+        ("https://API.DEEPSEEK.COM:443/", True),
+        ("https://api.deepseek.com/v1/", True),
+        ("https://api.deepseek.com/v2", False),
+        ("https://deepseek.com", False),
+        ("http://api.deepseek.com/v1", False),
+    ),
+)
+def test_official_deepseek_base_url_detection(url: str, expected: bool) -> None:
+    assert provider_module.is_official_deepseek_base_url(url) is expected
+
+
+def test_config_rejects_an_integer_too_large_for_a_platform_timeout() -> None:
+    with pytest.raises(OpenAIConfigurationError, match="timeout_seconds"):
+        config("http://localhost:8000/v1", timeout_seconds=10**1000)
 
 
 @pytest.mark.parametrize(
@@ -286,6 +565,7 @@ def test_responses_provider_returns_native_tool_call_and_drops_optional_nulls() 
         assert headers["idempotency-key"] == "run-1:inspect:0:responses:0"
         request = json.loads(raw)
         assert request["model"] == "fake-model"
+        assert "max_output_tokens" not in request
         assert request["parallel_tool_calls"] is False
         assert request["store"] is False
         assert all(tool["strict"] is True for tool in request["tools"])
@@ -322,6 +602,523 @@ def test_responses_provider_returns_native_tool_call_and_drops_optional_nulls() 
     )
     assert provider.api_kind == "responses"
     assert len(requests) == 1
+
+
+def test_responses_provider_sends_explicit_reasoning_effort() -> None:
+    def responder(
+        _path: str,
+        _headers: Mapping[str, str],
+        raw: bytes,
+        _index: int,
+    ) -> ResponseSpec:
+        request = json.loads(raw)
+        assert request["reasoning"] == {"effort": "none"}
+        return json_response(
+            {
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "done"}],
+                    }
+                ]
+            }
+        )
+
+    with fake_openai_server(responder) as (base_url, _):
+        provider = OpenAIProvider(config(base_url), reasoning_effort="none")
+        assert provider.next_step("inspect", ()) == FinalAnswer("done")
+
+
+def test_forced_tool_choice_is_consumed_by_one_responses_request() -> None:
+    def responder(
+        _path: str,
+        _headers: Mapping[str, str],
+        raw: bytes,
+        index: int,
+    ) -> ResponseSpec:
+        request = json.loads(raw)
+        if index == 0:
+            assert request["tool_choice"] == {
+                "type": "function",
+                "name": "git_status",
+            }
+            return json_response(
+                {
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "call_id": "forced-call",
+                            "name": "git_status",
+                            "arguments": "{}",
+                        }
+                    ]
+                }
+            )
+        assert "tool_choice" not in request
+        return json_response(
+            {
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "done"}],
+                    }
+                ]
+            }
+        )
+
+    with fake_openai_server(responder) as (base_url, _):
+        provider = OpenAIProvider(config(base_url))
+        provider.set_forced_tool_choice("git_status")
+        call = provider.next_step("inspect", ())
+        assert isinstance(call, ToolCall)
+        assert provider.next_step(
+            "inspect", (ToolResult(call.id, call.name, True, "clean"),)
+        ) == FinalAnswer("done")
+
+
+def test_official_deepseek_sequentializes_parallel_responses_calls() -> None:
+    provider = OpenAIProvider(
+        OpenAIConfig(
+            api_key="fake-deepseek-key",
+            base_url="https://api.deepseek.com",
+            model="deepseek-v4-pro",
+            allow_remote_model=True,
+        )
+    )
+    payloads: list[Mapping[str, object]] = []
+
+    def responder(_path, payload, **_kwargs):
+        payloads.append(payload)
+        if len(payloads) == 1:
+            return {
+                "output": [
+                    {"type": "reasoning", "id": "reasoning-1", "content": []},
+                    {
+                        "type": "function_call",
+                        "call_id": "first-call",
+                        "name": "git_status",
+                        "arguments": "{}",
+                    },
+                    {
+                        "type": "function_call",
+                        "call_id": "deferred-call",
+                        "name": "git_status",
+                        "arguments": "{}",
+                    },
+                ]
+            }
+        return {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "done"}],
+                }
+            ]
+        }
+
+    provider._client.post_json = responder  # type: ignore[method-assign]
+
+    decision = provider.next_step("inspect", ())
+    pending_replay_bytes = provider.pending_internal_tool_result_bytes
+    assert pending_replay_bytes > 0
+    assert provider.parallel_tool_call_violations == 1
+    final = provider.next_step(
+        "inspect",
+        (ToolResult(decision.id, decision.name, True, "clean"),),
+    )
+
+    assert decision == ToolCall("first-call", "git_status", {})
+    assert final == FinalAnswer("done")
+    continued_input = payloads[1]["input"]
+    assert isinstance(continued_input, list)
+    replayed_calls = [
+        item
+        for item in continued_input
+        if isinstance(item, Mapping) and item.get("type") == "function_call"
+    ]
+    assert [item["call_id"] for item in replayed_calls] == [
+        "first-call",
+        "deferred-call",
+    ]
+    replayed_outputs = [
+        item
+        for item in continued_input
+        if isinstance(item, Mapping) and item.get("type") == "function_call_output"
+    ]
+    assert [item["call_id"] for item in replayed_outputs] == [
+        "first-call",
+        "deferred-call",
+    ]
+    deferred = json.loads(replayed_outputs[1]["output"])
+    assert deferred["ok"] is False
+    assert "not executed" in deferred["error"]
+    assert provider.pending_internal_tool_result_bytes == 0
+    assert provider.parallel_tool_call_violations == 1
+
+
+def test_official_deepseek_rejects_too_many_parallel_responses_calls() -> None:
+    provider = OpenAIProvider(
+        OpenAIConfig(
+            api_key="fake-deepseek-key",
+            base_url="https://api.deepseek.com/v1",
+            model="deepseek-v4-pro",
+            allow_remote_model=True,
+        )
+    )
+    call_count = provider_module.MAX_DEFERRED_RESPONSE_CALLS + 2
+    provider._client.post_json = lambda *_args, **_kwargs: {  # type: ignore[method-assign]
+        "output": [
+            {
+                "type": "function_call",
+                "call_id": f"call-{index}",
+                "name": "git_status",
+                "arguments": "{}",
+            }
+            for index in range(call_count)
+        ]
+    }
+
+    with pytest.raises(OpenAIProtocolError, match="too many parallel tool calls"):
+        provider.next_step("inspect", ())
+
+    assert provider.parallel_tool_call_violations == call_count - 1
+    assert provider.pending_internal_tool_result_bytes == 0
+
+
+def test_responses_provider_reports_incomplete_output_reason() -> None:
+    def responder(*_: object) -> ResponseSpec:
+        return json_response(
+            {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": [{"type": "reasoning", "content": []}],
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 20,
+                    "total_tokens": 30,
+                },
+            }
+        )
+
+    with fake_openai_server(responder) as (base_url, _):
+        provider = OpenAIProvider(config(base_url))
+        with pytest.raises(OpenAIProtocolError, match="max_output_tokens"):
+            provider.next_step("inspect", ())
+
+    assert provider.usage.total_tokens == 30
+
+
+def test_responses_token_budget_is_recomputed_and_consumed_each_round() -> None:
+    budgets = (4_000, 3_000)
+    output_limits: list[int] = []
+
+    def responder(
+        path: str,
+        headers: Mapping[str, str],
+        raw: bytes,
+        index: int,
+    ) -> ResponseSpec:
+        del headers
+        assert path == "/responses"
+        request = json.loads(raw)
+        if index < 2:
+            output_limit = request["max_output_tokens"]
+            assert type(output_limit) is int and output_limit > 0
+            assert output_limit + _estimate_request_input_tokens(request) <= budgets[index]
+            output_limits.append(output_limit)
+        else:
+            assert "max_output_tokens" not in request
+
+        if index == 0:
+            return json_response(
+                {
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "call_id": "budget-call",
+                            "name": "git_status",
+                            "arguments": "{}",
+                        }
+                    ]
+                }
+            )
+        return json_response(
+            {
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "done"}],
+                    }
+                ]
+            }
+        )
+
+    with fake_openai_server(responder) as (base_url, requests):
+        provider = OpenAIProvider(config(base_url))
+        provider.set_response_token_budget(budgets[0])
+        call = provider.next_step("inspect", ())
+        assert isinstance(call, ToolCall)
+        provider.set_response_token_budget(budgets[1])
+        final = provider.next_step(
+            "inspect",
+            (ToolResult(call.id, call.name, True, "clean"),),
+        )
+        uncapped = provider.next_step("another task", ())
+
+    assert final == FinalAnswer("done")
+    assert uncapped == FinalAnswer("done")
+    assert output_limits[1] < output_limits[0]
+    assert len(requests) == 3
+
+
+def test_response_token_budget_can_be_exhausted_before_http() -> None:
+    def responder(*_: object) -> ResponseSpec:
+        return json_response({"output": []})
+
+    with fake_openai_server(responder) as (base_url, requests):
+        provider = OpenAIProvider(config(base_url))
+        provider.set_response_token_budget(1_000)
+        with pytest.raises(OpenAIRequestCapacityError, match="estimated request input"):
+            provider.next_step("inspect", ())
+
+    assert requests == []
+    assert provider.usage.response_count == 0
+    assert provider.usage.total_tokens is None
+    assert provider.last_response_usage is None
+
+
+def test_responses_budget_requires_sixteen_output_tokens_before_http(
+    monkeypatch,
+) -> None:
+    estimated_payloads: list[dict[str, object]] = []
+
+    def fixed_estimate(payload: Mapping[str, object]) -> int:
+        estimated_payloads.append(dict(payload))
+        return 100
+
+    monkeypatch.setattr(
+        provider_module, "_estimate_request_input_tokens", fixed_estimate
+    )
+
+    def responder(*_: object) -> ResponseSpec:
+        return json_response(
+            {
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "done"}],
+                    }
+                ]
+            }
+        )
+
+    with fake_openai_server(responder) as (base_url, requests):
+        blocked = OpenAIProvider(config(base_url))
+        blocked.set_response_token_budget(115)
+        with pytest.raises(OpenAIRequestCapacityError, match="minimum output"):
+            blocked.next_step("inspect", ())
+        assert requests == []
+        assert blocked.usage.response_count == 0
+        assert blocked.usage.total_tokens is None
+
+        allowed = OpenAIProvider(config(base_url))
+        allowed.set_response_token_budget(116)
+        assert allowed.next_step("inspect", ()) == FinalAnswer("done")
+
+    assert len(requests) == 1
+    request = json.loads(requests[0]["body"])
+    assert request["max_output_tokens"] == 16
+    assert all(
+        {
+            "model",
+            "instructions",
+            "input",
+            "tools",
+            "parallel_tool_calls",
+            "store",
+            "max_output_tokens",
+        }.issubset(payload)
+        for payload in estimated_payloads
+    )
+
+
+def test_chat_budget_can_retain_one_output_token(monkeypatch) -> None:
+    monkeypatch.setattr(
+        provider_module, "_estimate_request_input_tokens", lambda _payload: 100
+    )
+    payload: dict[str, object] = {"messages": []}
+
+    provider_module._apply_response_token_budget(
+        payload,
+        field_name="max_completion_tokens",
+        total_tokens=101,
+    )
+
+    assert payload["max_completion_tokens"] == 1
+    with pytest.raises(OpenAIRequestCapacityError, match="minimum output"):
+        provider_module._apply_response_token_budget(
+            {"messages": []},
+            field_name="max_completion_tokens",
+            total_tokens=100,
+        )
+
+
+def test_complete_responses_payload_has_a_real_capacity_boundary_before_http() -> None:
+    def responder(*_: object) -> ResponseSpec:
+        return json_response(
+            {
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "done"}],
+                    }
+                ]
+            }
+        )
+
+    with fake_openai_server(responder) as (base_url, requests):
+        def attempt(task_size: int) -> tuple[bool, dict[str, object] | None]:
+            before = len(requests)
+            provider = OpenAIProvider(
+                config(base_url),
+                tool_definitions=(TOOL_DEFINITIONS[0],),
+                system_prompt="Review the complete candidate.",
+            )
+            provider.set_response_token_budget(2_500)
+            try:
+                decision = provider.next_step("x" * task_size, ())
+            except OpenAIRequestCapacityError:
+                assert len(requests) == before
+                assert provider.usage.response_count == 0
+                return False, None
+            assert decision == FinalAnswer("done")
+            assert len(requests) == before + 1
+            return True, json.loads(requests[-1]["body"])
+
+        lower = 1
+        upper = 40_000
+        assert attempt(lower)[0] is True
+        assert attempt(upper)[0] is False
+        while lower + 1 < upper:
+            midpoint = (lower + upper) // 2
+            if attempt(midpoint)[0]:
+                lower = midpoint
+            else:
+                upper = midpoint
+
+        fits, request = attempt(lower)
+        over_capacity, _ = attempt(upper)
+
+    assert fits is True
+    assert request is not None
+    assert request["max_output_tokens"] >= 16
+    assert upper == lower + 1
+    assert over_capacity is False
+
+
+def test_extended_task_limit_reaches_transport_with_complete_payload() -> None:
+    def responder(*_: object) -> ResponseSpec:
+        return json_response(
+            {
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "done"}],
+                    }
+                ]
+            }
+        )
+
+    with fake_openai_server(responder) as (base_url, requests):
+        provider_config = config(base_url)
+        provider = OpenAIProvider(
+            provider_config,
+            tool_definitions=(TOOL_DEFINITIONS[0],),
+            system_prompt="Review the complete bounded workflow context.",
+        )
+        decision = provider.next_step("x" * MAX_TASK_CHARACTERS, ())
+
+    assert decision == FinalAnswer("done")
+    assert len(requests) == 1
+    assert len(requests[0]["body"]) < provider_config.max_request_bytes
+
+
+def test_response_token_budget_survives_a_protocol_error_retry() -> None:
+    output_limits: list[int] = []
+
+    def responder(
+        path: str,
+        headers: Mapping[str, str],
+        raw: bytes,
+        index: int,
+    ) -> ResponseSpec:
+        del path, headers
+        request = json.loads(raw)
+        output_limits.append(request["max_output_tokens"])
+        if index == 0:
+            return (200, {"Content-Type": "application/json"}, b"not-json")
+        return json_response(
+            {
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "done"}],
+                    }
+                ]
+            }
+        )
+
+    with fake_openai_server(responder) as (base_url, requests):
+        provider = OpenAIProvider(config(base_url))
+        provider.set_response_token_budget(4_000)
+        with pytest.raises(OpenAIProtocolError):
+            provider.next_step("inspect", ())
+        final = provider.next_step("inspect", ())
+
+    assert final == FinalAnswer("done")
+    assert output_limits[0] == output_limits[1]
+    assert len(requests) == 2
+
+
+def test_forced_tool_choice_survives_a_protocol_error_retry() -> None:
+    tool_choices: list[object] = []
+
+    def responder(
+        _path: str,
+        _headers: Mapping[str, str],
+        raw: bytes,
+        index: int,
+    ) -> ResponseSpec:
+        request = json.loads(raw)
+        tool_choices.append(request["tool_choice"])
+        if index == 0:
+            return (200, {"Content-Type": "application/json"}, b"not-json")
+        return json_response(
+            {
+                "output": [
+                    {
+                        "type": "function_call",
+                        "call_id": "forced-retry",
+                        "name": "git_status",
+                        "arguments": "{}",
+                    }
+                ]
+            }
+        )
+
+    with fake_openai_server(responder) as (base_url, requests):
+        provider = OpenAIProvider(config(base_url))
+        provider.set_forced_tool_choice("git_status")
+        with pytest.raises(OpenAIProtocolError):
+            provider.next_step("inspect", ())
+        decision = provider.next_step("inspect", ())
+
+    assert decision == ToolCall("forced-retry", "git_status", {})
+    assert tool_choices == [
+        {"type": "function", "name": "git_status"},
+        {"type": "function", "name": "git_status"},
+    ]
+    assert len(requests) == 2
 
 
 def test_idempotency_key_rejects_header_injection_without_echoing_value() -> None:
@@ -562,6 +1359,8 @@ def test_responses_provider_extracts_final_message_text() -> None:
 
 
 def test_provider_falls_back_to_chat_only_for_unsupported_responses_endpoint() -> None:
+    total_budgets = (4_000, 4_000, 3_000)
+
     def responder(
         path: str,
         headers: Mapping[str, str],
@@ -574,11 +1373,23 @@ def test_provider_falls_back_to_chat_only_for_unsupported_responses_endpoint() -
             "run-chat:implement:0:chat:1",
         ]
         assert headers["idempotency-key"] == expected_keys[index]
+        request = json.loads(raw)
         if index == 0:
             assert path == "/responses"
+            assert "max_completion_tokens" not in request
+            output_limit = request["max_output_tokens"]
+            assert (
+                output_limit + _estimate_request_input_tokens(request)
+                <= total_budgets[index]
+            )
             return json_response({"error": {"code": "unknown_endpoint"}}, 404)
         assert path == "/chat/completions"
-        request = json.loads(raw)
+        assert "max_output_tokens" not in request
+        output_limit = request["max_completion_tokens"]
+        assert (
+            output_limit + _estimate_request_input_tokens(request)
+            <= total_budgets[index]
+        )
         assert request["parallel_tool_calls"] is False
         search = next(
             tool for tool in request["tools"] if tool["function"]["name"] == "search"
@@ -649,6 +1460,7 @@ def test_provider_falls_back_to_chat_only_for_unsupported_responses_endpoint() -
             config(base_url),
             idempotency_key="run-chat:implement:0",
         )
+        provider.set_response_token_budget(total_budgets[0])
         decision = provider.next_step("find FIXME markers", ())
         assert isinstance(decision, ToolCall)
         result = ToolResult(
@@ -658,6 +1470,7 @@ def test_provider_falls_back_to_chat_only_for_unsupported_responses_endpoint() -
             "1 match",
             exit_code=0,
         )
+        provider.set_response_token_budget(total_budgets[2])
         final = provider.next_step("find FIXME markers", (result,))
 
     assert decision == ToolCall(
@@ -720,6 +1533,129 @@ def test_response_size_limit_is_enforced_before_json_parsing() -> None:
         client = OpenAIHTTPClient(config(base_url, max_response_bytes=128))
         with pytest.raises(OpenAIResponseTooLargeError, match="size limit"):
             client.post_json("/responses", {"model": "fake"})
+
+
+class _ResponseHeaders:
+    def __init__(self, content_lengths: list[object]) -> None:
+        self._content_lengths = content_lengths
+
+    def get_all(self, name: str) -> list[object] | None:
+        assert name == "Content-Length"
+        return list(self._content_lengths) or None
+
+
+class _BoundedResponse:
+    def __init__(self, headers: object, body: bytes) -> None:
+        self.headers = headers
+        self._body = body
+
+    def read(self, size: int) -> bytes:
+        return self._body[:size]
+
+
+class _ErrorOpener:
+    def __init__(self, error: HTTPError) -> None:
+        self._error = error
+
+    def open(self, *_args: object, **_kwargs: object) -> object:
+        raise self._error
+
+
+def _http_error(
+    status: int,
+    content_lengths: tuple[str, ...],
+    body: bytes,
+) -> HTTPError:
+    headers = Message()
+    for value in content_lengths:
+        headers.add_header("Content-Length", value)
+    return HTTPError(
+        "http://localhost:8123/v1/responses",
+        status,
+        "model error",
+        headers,
+        BytesIO(body),
+    )
+
+
+def test_response_content_length_accepts_single_exact_value_and_mapping_fallback() -> None:
+    client = OpenAIHTTPClient(
+        config("http://localhost:8123/v1", max_response_bytes=8)
+    )
+    response = _BoundedResponse({"Content-Length": "2"}, b"{}")
+
+    assert client._read_bounded(response) == b"{}"
+
+
+def test_response_content_length_rejects_duplicate_values() -> None:
+    client = OpenAIHTTPClient(
+        config("http://localhost:8123/v1", max_response_bytes=8)
+    )
+    response = _BoundedResponse(_ResponseHeaders(["2", "2"]), b"{}")
+
+    with pytest.raises(OpenAIProtocolError, match="Content-Length"):
+        client._read_bounded(response)
+
+
+@pytest.mark.parametrize(
+    "value",
+    ("", "+2", "-2", "2.0", " 2", "2 ", "\u0662", "0" * 129, b"2", None),
+)
+def test_response_content_length_rejects_invalid_values(value: object) -> None:
+    client = OpenAIHTTPClient(
+        config("http://localhost:8123/v1", max_response_bytes=8)
+    )
+    response = _BoundedResponse(_ResponseHeaders([value]), b"{}")
+
+    with pytest.raises(OpenAIProtocolError, match="Content-Length"):
+        client._read_bounded(response)
+
+
+def test_response_content_length_rejects_declared_overflow() -> None:
+    client = OpenAIHTTPClient(
+        config("http://localhost:8123/v1", max_response_bytes=8)
+    )
+    response = _BoundedResponse(_ResponseHeaders(["9"]), b"{}")
+
+    with pytest.raises(OpenAIResponseTooLargeError, match="size limit"):
+        client._read_bounded(response)
+
+
+def test_response_content_length_rejects_short_read() -> None:
+    client = OpenAIHTTPClient(
+        config("http://localhost:8123/v1", max_response_bytes=8)
+    )
+    response = _BoundedResponse(_ResponseHeaders(["3"]), b"{}")
+
+    with pytest.raises(OpenAIProtocolError, match="Content-Length"):
+        client._read_bounded(response)
+
+
+@pytest.mark.parametrize("status", [400, 500])
+@pytest.mark.parametrize(
+    ("content_lengths", "body", "expected_error"),
+    [
+        (("2", "2"), b"{}", OpenAIProtocolError),
+        (("invalid",), b"{}", OpenAIProtocolError),
+        (("9",), b"{}", OpenAIResponseTooLargeError),
+        (("3",), b"{}", OpenAIProtocolError),
+    ],
+)
+def test_http_error_responses_enforce_content_length_contract(
+    status: int,
+    content_lengths: tuple[str, ...],
+    body: bytes,
+    expected_error: type[Exception],
+) -> None:
+    client = OpenAIHTTPClient(
+        config("http://localhost:8123/v1", max_response_bytes=8)
+    )
+    client._opener = _ErrorOpener(  # type: ignore[assignment]
+        _http_error(status, content_lengths, body)
+    )
+
+    with pytest.raises(expected_error, match="Content-Length|size limit"):
+        client.post_json("/responses", {"model": "fake"})
 
 
 def test_timeout_is_sanitized_and_does_not_include_credentials() -> None:

@@ -91,11 +91,11 @@ repo-agent serve `
 
 ## 4. 配置并验证真实模型
 
-当前 Windows 中转站辅助脚本会以星号遮罩输入 Key，发现模型，执行原生 function
-calling doctor，并将配置用 DPAPI CurrentUser 加密保存：
+当前 Windows 辅助脚本连接 DeepSeek 官方 API，以星号遮罩输入 Key，发现模型，
+执行原生 function calling doctor，并将配置用 DPAPI CurrentUser 加密保存：
 
 ```powershell
-./scripts/start-relay.ps1 -Reconfigure -ConfigureOnly
+./scripts/start-relay.ps1 -Reconfigure -ConfigureOnly -Model deepseek-v4-pro
 ```
 
 若配置已经保存，无需再次输入；需要主动复验时运行：
@@ -117,7 +117,7 @@ calling doctor，并将配置用 DPAPI CurrentUser 加密保存：
 
 1. 选择 **Maintenance** 模式。
 2. 输入任务：`Fix the end-offset boundary bug and add a focused regression test.`
-3. 对远程中转站任务显式启用 **Remote model** 授权，再创建 run。
+3. 对 DeepSeek 远程模型任务显式启用 **Remote model** 授权，再创建 run。
 4. 等待状态进入 `awaiting_approval`，阅读计划中的目标文件、测试与风险。
 5. 计划范围合理时批准；范围错误时拒绝，不要为了演示强行通过。
 6. 观察 `implement -> verify -> review -> finalize`。若检查失败，工作流可进入有界

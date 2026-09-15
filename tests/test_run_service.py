@@ -257,6 +257,57 @@ def test_run_service_enforces_waiting_queue_limit(tmp_path: Path) -> None:
         service.close()
 
 
+def test_run_service_rejects_extreme_timeout_and_wait_flag_values(
+    tmp_path: Path,
+) -> None:
+    service = RunService(
+        tmp_path / "data",
+        allowed_repo_roots=(tmp_path,),
+        runner=ApprovalWorkflow(),
+        start_worker=False,
+    )
+    invalid_timeouts: tuple[object, ...] = (
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        1e300,
+        10**1000,
+        -0.001,
+        True,
+        "1",
+        None,
+    )
+    try:
+        for value in invalid_timeouts[:-1]:
+            with pytest.raises(ValueError, match="finite non-negative"):
+                service.wait("a" * 32, timeout=value)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="stop_at_approval"):
+            service.wait("a" * 32, timeout=0, stop_at_approval=1)  # type: ignore[arg-type]
+
+        for value in invalid_timeouts:
+            with pytest.raises(ValueError, match="finite non-negative"):
+                service.close(timeout=value)  # type: ignore[arg-type]
+            assert service._lease is not None and service._lease.held
+    finally:
+        service.close()
+
+
+def test_run_service_rejects_nul_in_task_and_approval_reason(tmp_path: Path) -> None:
+    service = RunService(
+        tmp_path / "data",
+        allowed_repo_roots=(tmp_path,),
+        runner=ApprovalWorkflow(),
+        start_worker=False,
+    )
+    try:
+        with pytest.raises(ValueError, match="task"):
+            service.create_run(repo_path=tmp_path, task="bad\x00task")
+        with pytest.raises(ValueError, match="reason"):
+            service.decide("a" * 32, approve=False, reason="bad\x00reason")
+    finally:
+        service.close()
+
+
 def test_run_service_rejects_repository_outside_allowed_roots(tmp_path: Path) -> None:
     allowed = tmp_path / "allowed"
     outside = tmp_path / "outside"

@@ -443,6 +443,7 @@ def test_single_variant_execute_forwards_options_and_emits_task_text(
             "pass_at_1": None,
             "solved_task_count": 1,
             "tool_error_rate": 0.125,
+            "actionable_tool_error_rate": 0.025,
             "result_dir": "single-results",
             "tasks": task_results,
         }
@@ -493,6 +494,7 @@ def test_single_variant_execute_forwards_options_and_emits_task_text(
     assert "tasks: 3/3 completed, 1 reused" in output
     assert "pass_at_1: -" in output
     assert "tool_error_rate: 0.125" in output
+    assert "actionable_tool_error_rate: 0.025" in output
     assert "task: py-bugfix-001 (pass, 100ms, 20 patch bytes)" in output
     assert "task: py-bugfix-002 (hidden_tests_failed, 200ms, 30 patch bytes)" in output
     assert "task: py-bugfix-003 (fail, 300ms, 0 patch bytes)" in output

@@ -1098,7 +1098,7 @@ def test_new_run_service_defers_bootstrap_runner_creation_until_after_lease(
         received["options"] = kwargs
         return sentinel
 
-    monkeypatch.setenv("REPO_AGENT_API_KEY", "private-key")
+    monkeypatch.setenv("REPO_AGENT_API_KEY", "  private-key  ")
     monkeypatch.setattr(cli, "RunService", fake_run_service)
 
     result = cli._new_run_service(

@@ -7,6 +7,7 @@ import pytest
 
 import repo_agent.git_config as git_config_module
 from repo_agent.git_config import effective_core_autocrlf
+from repo_agent.processes import CapturedProcess
 
 
 def _git(repo: Path, *arguments: str) -> None:
@@ -70,18 +71,15 @@ def test_effective_core_autocrlf_forwards_the_host_deadline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     observed: list[float] = []
-    completed_process = subprocess.CompletedProcess(
-        args=("git",),
-        returncode=0,
-        stdout=b"input\n",
-        stderr=b"",
+    completed_process = CapturedProcess(
+        0, b"input\n", b"", False, False, False
     )
 
     def record_timeout(*_args, **kwargs):
-        observed.append(kwargs["timeout"])
+        observed.append(kwargs["timeout_seconds"])
         return completed_process
 
-    monkeypatch.setattr(git_config_module.subprocess, "run", record_timeout)
+    monkeypatch.setattr(git_config_module, "run_isolated_capture", record_timeout)
 
     assert effective_core_autocrlf(tmp_path, timeout_seconds=0.75) == "input"
     assert observed == [0.75]
