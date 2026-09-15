@@ -41,6 +41,7 @@ CONTROL_TIMEOUT_SECONDS = 30.0
 PROBE_TIMEOUT_SECONDS = 15.0
 TOOL_TIMEOUT_SECONDS = 0.75
 MAX_OUTPUT_BYTES = 64 * 1024
+EXEC_ENTRYPOINT = 'umask 000\nexec "$@"\n'
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
@@ -1132,7 +1133,16 @@ def _exec(
     allowed: Iterable[int] = (0,),
 ) -> CommandOutcome:
     return docker.invoke(
-        ("container", "exec", _parse_container_id(container_id), *tuple(args)),
+        (
+            "container",
+            "exec",
+            _parse_container_id(container_id),
+            "sh",
+            "-c",
+            EXEC_ENTRYPOINT,
+            "repo-agent-day6",
+            *tuple(args),
+        ),
         timeout_seconds=PROBE_TIMEOUT_SECONDS,
         allowed_exit_codes=allowed,
     )

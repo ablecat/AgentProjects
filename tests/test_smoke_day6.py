@@ -203,8 +203,42 @@ def test_init_process_reaping_requires_the_exact_success_marker() -> None:
             "container",
             "exec",
             container_id,
+            "sh",
+            "-c",
+            smoke_day6.EXEC_ENTRYPOINT,
+            "repo-agent-day6",
             "python",
             "/workspace/process_lifecycle_probe.py",
+        )
+    ]
+
+
+def test_exec_uses_open_umask_for_disposable_workspace_outputs() -> None:
+    class RecordingDocker:
+        def __init__(self) -> None:
+            self.commands: list[tuple[str, ...]] = []
+
+        def invoke(self, args, **_kwargs):
+            self.commands.append(tuple(args))
+            return CommandOutcome(0, "")
+
+    docker = RecordingDocker()
+    container_id = "a" * 64
+
+    smoke_day6._exec(docker, container_id, ("mkdir", "-p", "target/classes"))
+
+    assert docker.commands == [
+        (
+            "container",
+            "exec",
+            container_id,
+            "sh",
+            "-c",
+            'umask 000\nexec "$@"\n',
+            "repo-agent-day6",
+            "mkdir",
+            "-p",
+            "target/classes",
         )
     ]
 
