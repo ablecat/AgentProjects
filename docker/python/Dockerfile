@@ -13,6 +13,9 @@ RUN apt-get update \
     && mkdir --parents /workspace /cache \
     && chown --recursive 10001:10001 /workspace /cache /home/repo-agent
 
+RUN mkdir --parents /cache/python \
+    && chown 10001:10001 /cache/python
+
 RUN python -m pip install --no-cache-dir --disable-pip-version-check pytest==9.1.1
 
 ENV HOME=/home/repo-agent \

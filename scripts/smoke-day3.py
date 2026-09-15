@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import subprocess
@@ -27,7 +29,17 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from repo_agent import cli as cli_module  # noqa: E402
-from repo_agent.checks import CheckRunner  # noqa: E402
+from repo_agent.checks import (  # noqa: E402
+    _CACHE_ANCHOR_ENTRYPOINT,
+    _CACHE_RESOURCE,
+    _CACHE_VOLUME_OPTIONS,
+    _RESOURCE_LABEL,
+    _RUN_LABEL,
+    _SEQUENCE_LABEL,
+    _WORKSPACE_ENTRYPOINT,
+    _WORKSPACE_TMPFS,
+    CheckRunner,
+)
 from repo_agent.sandbox import (  # noqa: E402
     CommandOutcome,
     SubprocessCommandRunner,
@@ -39,6 +51,7 @@ class RecordingRunner:
 
     def __init__(self) -> None:
         self.commands: list[tuple[str, ...]] = []
+        self.volume_names: set[str] = set()
         self._delegate = SubprocessCommandRunner()
 
     def __call__(
@@ -50,6 +63,8 @@ class RecordingRunner:
     ) -> CommandOutcome:
         command = tuple(argv)
         self.commands.append(command)
+        if command[:3] == ("docker", "volume", "create") and len(command) >= 4:
+            self.volume_names.add(command[-1])
         return self._delegate(
             command,
             timeout_seconds=timeout_seconds,
@@ -66,6 +81,7 @@ def main() -> int:
         "cleanup": {
             "temporary_fixtures_removed": False,
             "containers_removed": False,
+            "volumes_removed": False,
         },
         "error": None,
     }
@@ -75,6 +91,7 @@ def main() -> int:
     temp_root: Path | None = None
     runtime_failed = False
     cleanup_failed = False
+    runners: list[RecordingRunner] = []
 
     try:
         TEMP_PARENT.mkdir(parents=True, exist_ok=True)
@@ -89,6 +106,7 @@ def main() -> int:
         _create_maven_repo(maven_repo)
 
         python_blocked_runner = RecordingRunner()
+        runners.append(python_blocked_runner)
         python_blocked_run = _invoke_check_cli(
             python_repo,
             allow_bootstrap=False,
@@ -103,6 +121,7 @@ def main() -> int:
         )
 
         python_runner = RecordingRunner()
+        runners.append(python_runner)
         python_run = _invoke_check_cli(
             python_repo,
             allow_bootstrap=True,
@@ -113,6 +132,7 @@ def main() -> int:
         report_runs["python_with_bootstrap"] = _run_summary(python_run)
 
         blocked_runner = RecordingRunner()
+        runners.append(blocked_runner)
         blocked_run = _invoke_check_cli(
             maven_repo,
             allow_bootstrap=False,
@@ -123,6 +143,7 @@ def main() -> int:
         report_runs["maven_without_bootstrap"] = _run_summary(blocked_run)
 
         maven_runner = RecordingRunner()
+        runners.append(maven_runner)
         maven_run = _invoke_check_cli(
             maven_repo,
             allow_bootstrap=True,
@@ -140,6 +161,18 @@ def main() -> int:
         python_blocked_creates = _create_commands(python_blocked_runner.commands)
         blocked_creates = _create_commands(blocked_runner.commands)
         maven_creates = _create_commands(maven_runner.commands)
+        python_anchor_creates = _anchor_create_commands(python_runner.commands)
+        python_blocked_anchor_creates = _anchor_create_commands(
+            python_blocked_runner.commands
+        )
+        blocked_anchor_creates = _anchor_create_commands(blocked_runner.commands)
+        maven_anchor_creates = _anchor_create_commands(maven_runner.commands)
+        python_volume_creates = _volume_create_commands(python_runner.commands)
+        python_blocked_volume_creates = _volume_create_commands(
+            python_blocked_runner.commands
+        )
+        blocked_volume_creates = _volume_create_commands(blocked_runner.commands)
+        maven_volume_creates = _volume_create_commands(maven_runner.commands)
 
         _check(
             checks,
@@ -149,7 +182,9 @@ def main() -> int:
             and _nested(python_blocked_payload, "profile", "id")
             == "python-pytest"
             and python_blocked_payload.get("phases") == []
-            and not python_blocked_creates,
+            and not python_blocked_creates
+            and not python_blocked_anchor_creates
+            and not python_blocked_volume_creates,
             _failure_detail(python_blocked_run),
         )
         _check(
@@ -174,16 +209,18 @@ def main() -> int:
             == [["bridge"], ["none"]]
             and _verify_argv(python_payload)[:1] == ["python"]
             and "--target" in _phase_argvs(python_payload, "bootstrap")[0]
-            and "/dependencies/python"
+            and "/cache/python"
             in _phase_argvs(python_payload, "bootstrap")[0]
             and all(
                 _option_values(command, "--env").count(
-                    "PYTHONPATH=/dependencies/python"
+                    "PYTHONPATH=/cache/python"
                 )
                 == 1
                 for command in python_creates
             )
-            and len({_dependency_mount(command) for command in python_creates}) == 1,
+            and len({_dependency_mount(command) for command in python_creates}) == 1
+            and bool(_dependency_mount(python_creates[0]))
+            and _create_argvs_match_phases(python_creates, python_payload),
             "Python pip --target bootstrap uses bridge; the shared target is reused offline",
         )
         _check(
@@ -193,7 +230,9 @@ def main() -> int:
             and blocked_payload.get("status") == "bootstrap_required"
             and _nested(blocked_payload, "profile", "id") == "maven-test"
             and blocked_payload.get("phases") == []
-            and not blocked_creates,
+            and not blocked_creates
+            and not blocked_anchor_creates
+            and not blocked_volume_creates,
             _failure_detail(blocked_run),
         )
         _check(
@@ -217,7 +256,8 @@ def main() -> int:
                 ("bootstrap", "bridge"),
                 ("verify", "none"),
             ]
-            and _maven_create_networks_are_separated(maven_creates),
+            and _maven_create_networks_are_separated(maven_creates)
+            and _maven_create_argvs_match_phases(maven_creates, maven_payload),
             "all Maven bootstrap attempts use bridge; the sole verify uses network=none",
         )
         _check(
@@ -228,11 +268,52 @@ def main() -> int:
             "Maven verification command includes --offline",
         )
         all_creates = python_creates + maven_creates
+        all_anchor_creates = python_anchor_creates + maven_anchor_creates
+        python_volume_names = {
+            _dependency_volume_name(command) for command in python_creates
+        }
+        maven_volume_names = {
+            _dependency_volume_name(command) for command in maven_creates
+        }
+        python_created_volumes = {
+            _created_volume_name(command) for command in python_volume_creates
+        }
+        maven_created_volumes = {
+            _created_volume_name(command) for command in maven_volume_creates
+        }
+        _check(
+            checks,
+            "dependency_volumes_are_run_scoped",
+            len(python_volume_names) == 1
+            and len(maven_volume_names) == 1
+            and "" not in python_volume_names
+            and "" not in maven_volume_names
+            and python_volume_names == python_created_volumes
+            and maven_volume_names == maven_created_volumes
+            and python_volume_names.isdisjoint(maven_volume_names)
+            and len(python_volume_creates) == 1
+            and len(maven_volume_creates) == 1
+            and _runner_dependency_volume_contract(python_runner.commands)
+            and _runner_dependency_volume_contract(maven_runner.commands)
+            and all(
+                _is_hardened_volume_create(command)
+                for command in python_volume_creates + maven_volume_creates
+            ),
+            "each run creates, labels, bounds, mounts, and removes one private volume",
+        )
         _check(
             checks,
             "docker_hardening_applied",
-            bool(all_creates) and all(_is_hardened(command) for command in all_creates),
-            f"validated hardening on {len(all_creates)} real Docker create commands",
+            bool(all_creates)
+            and len(all_anchor_creates) == 2
+            and all(_is_hardened(command) for command in all_creates)
+            and all(
+                _is_hardened_anchor(command) for command in all_anchor_creates
+            ),
+            (
+                f"validated hardening on {len(all_creates)} phase containers and "
+                f"{len(all_anchor_creates)} cache anchors"
+            ),
         )
         _check(
             checks,
@@ -248,6 +329,14 @@ def main() -> int:
         }
     finally:
         containers_removed, container_error = _containers_removed(common_prefix)
+        volume_names = set().union(*(runner.volume_names for runner in runners))
+        volume_names.update(
+            _dependency_volume_name(command)
+            for runner in runners
+            for command in _all_container_create_commands(runner.commands)
+            if _dependency_volume_name(command)
+        )
+        volumes_removed, volume_error = _volumes_removed(volume_names)
         cleanup = report["cleanup"]
         assert isinstance(cleanup, dict)
         cleanup["containers_removed"] = containers_removed
@@ -258,6 +347,15 @@ def main() -> int:
             "containers_removed",
             containers_removed,
             "no smoke-owned Docker containers remain",
+        )
+        cleanup["volumes_removed"] = volumes_removed
+        if volume_error is not None:
+            cleanup["volume_check_error"] = volume_error
+        _check(
+            checks,
+            "volumes_removed",
+            volumes_removed,
+            "no smoke-owned Docker dependency volumes remain",
         )
 
         fixtures_removed = True
@@ -279,7 +377,9 @@ def main() -> int:
             fixtures_removed,
             "temporary Python and Maven repositories were removed",
         )
-        cleanup_failed = not containers_removed or not fixtures_removed
+        cleanup_failed = (
+            not containers_removed or not volumes_removed or not fixtures_removed
+        )
 
     checks_passed = all(bool(item["ok"]) for item in checks)
     if cleanup_failed:
@@ -338,14 +438,21 @@ def _invoke_check_cli(
 
 def _create_python_repo(repo: Path) -> None:
     files = {
-        "requirements.txt": "pytest==9.1.1\n",
+        "requirements.txt": "pytest==9.1.1\ntomli==2.2.1\n",
         "pyproject.toml": """\
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 """,
         "tests/test_math.py": """\
+import tomli
+
+
 def test_addition():
     assert 20 + 22 == 42
+
+
+def test_bootstrap_cache_survives_into_offline_verify():
+    assert tomli.loads("answer = 42")["answer"] == 42
 """,
     }
     _create_repository(repo, files)
@@ -525,6 +632,44 @@ def _create_commands(commands: list[tuple[str, ...]]) -> list[tuple[str, ...]]:
         command
         for command in commands
         if len(command) >= 3 and command[:3] == ("docker", "container", "create")
+        and not _is_anchor_create_command(command)
+    ]
+
+
+def _anchor_create_commands(
+    commands: list[tuple[str, ...]],
+) -> list[tuple[str, ...]]:
+    return [
+        command
+        for command in commands
+        if len(command) >= 3
+        and command[:3] == ("docker", "container", "create")
+        and _is_anchor_create_command(command)
+    ]
+
+
+def _all_container_create_commands(
+    commands: list[tuple[str, ...]],
+) -> list[tuple[str, ...]]:
+    return [
+        command
+        for command in commands
+        if len(command) >= 3 and command[:3] == ("docker", "container", "create")
+    ]
+
+
+def _is_anchor_create_command(command: tuple[str, ...]) -> bool:
+    names = _option_values(command, "--name")
+    return len(names) == 1 and names[0].endswith("-cache-anchor")
+
+
+def _volume_create_commands(
+    commands: list[tuple[str, ...]],
+) -> list[tuple[str, ...]]:
+    return [
+        command
+        for command in commands
+        if len(command) >= 4 and command[:3] == ("docker", "volume", "create")
     ]
 
 
@@ -537,9 +682,273 @@ def _option_values(command: tuple[str, ...], option: str) -> list[str]:
 
 
 def _dependency_mount(command: tuple[str, ...]) -> str:
+    parsed = _parse_container_create(command)
+    if parsed is None:
+        return ""
+    _, options, _, _ = parsed
     return next(
-        (value for value in _option_values(command, "--mount") if "target=/dependencies" in value),
+        (
+            value
+            for value in options.get("--mount", [])
+            if _mount_fields(value).get("target") == "/cache"
+        ),
         "",
+    )
+
+
+def _dependency_volume_name(command: tuple[str, ...]) -> str:
+    mount = _dependency_mount(command)
+    fields = _mount_fields(mount)
+    if fields.get("type") != "volume":
+        return ""
+    return fields.get("source", "")
+
+
+def _mount_fields(value: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for item in value.split(","):
+        key, separator, field_value = item.partition("=")
+        if not key or key in fields:
+            return {}
+        fields[key] = field_value if separator else ""
+    return fields
+
+
+_CREATE_FLAGS = frozenset({"--init", "--read-only", "--rm"})
+_CREATE_OPTIONS = frozenset(
+    {
+        "--name",
+        "--label",
+        "--pull",
+        "--restart",
+        "--network",
+        "--user",
+        "--cpus",
+        "--memory",
+        "--memory-swap",
+        "--pids-limit",
+        "--cap-drop",
+        "--security-opt",
+        "--log-driver",
+        "--tmpfs",
+        "--mount",
+        "--workdir",
+        "--env",
+        "--entrypoint",
+    }
+)
+_CONTAINER_NAME_PATTERN = re.compile(
+    r"^(?P<prefix>repo-agent-day3-smoke-[0-9a-f]{8}-(?:py|mvn))-"
+    r"(?P<run>[0-9a-f]{32})-(?P<sequence>[1-9][0-9]*)$"
+)
+_ANCHOR_NAME_PATTERN = re.compile(
+    r"^(?P<prefix>repo-agent-day3-smoke-[0-9a-f]{8}-(?:py|mvn))-"
+    r"(?P<run>[0-9a-f]{32})-cache-anchor$"
+)
+_VOLUME_NAME_PATTERN = re.compile(
+    r"^(?P<prefix>repo-agent-day3-smoke-[0-9a-f]{8}-(?:py|mvn))-"
+    r"(?P<run>[0-9a-f]{32})-cache$"
+)
+
+
+def _parse_container_create(
+    command: tuple[str, ...],
+) -> tuple[Counter[str], dict[str, list[str]], str, tuple[str, ...]] | None:
+    if command[:3] != ("docker", "container", "create"):
+        return None
+    flags: Counter[str] = Counter()
+    options: dict[str, list[str]] = {}
+    index = 3
+    while index < len(command) and command[index].startswith("-"):
+        token = command[index]
+        if token in _CREATE_FLAGS:
+            flags[token] += 1
+            index += 1
+            continue
+        if token not in _CREATE_OPTIONS or index + 1 >= len(command):
+            return None
+        options.setdefault(token, []).append(command[index + 1])
+        index += 2
+    if index >= len(command):
+        return None
+    return flags, options, command[index], command[index + 1 :]
+
+
+def _container_payload_argv(command: tuple[str, ...]) -> tuple[str, ...] | None:
+    parsed = _parse_container_create(command)
+    if parsed is None:
+        return None
+    _, _, _, tail = parsed
+    expected_prefix = ("-c", _WORKSPACE_ENTRYPOINT, "repo-agent-check")
+    if tail[:3] != expected_prefix or len(tail) < 4:
+        return None
+    return tail[3:]
+
+
+def _all_phase_argvs(payload: dict[str, object]) -> list[tuple[str, ...]]:
+    phases = payload.get("phases")
+    if not isinstance(phases, list):
+        return []
+    result: list[tuple[str, ...]] = []
+    for phase in phases:
+        if not isinstance(phase, dict):
+            return []
+        argv = phase.get("argv")
+        if not isinstance(argv, list) or not all(isinstance(item, str) for item in argv):
+            return []
+        result.append(tuple(argv))
+    return result
+
+
+def _create_argvs_match_phases(
+    commands: list[tuple[str, ...]], payload: dict[str, object]
+) -> bool:
+    actual = [_container_payload_argv(command) for command in commands]
+    return None not in actual and actual == _all_phase_argvs(payload)
+
+
+def _maven_create_argvs_match_phases(
+    commands: list[tuple[str, ...]], payload: dict[str, object]
+) -> bool:
+    actual = [_container_payload_argv(command) for command in commands]
+    expected = _all_phase_argvs(payload)
+    if None in actual or len(expected) != 5:
+        return False
+    cursor = 0
+    for phase_argv in expected[:-1]:
+        attempts = 0
+        while cursor < len(actual) and actual[cursor] == phase_argv:
+            attempts += 1
+            cursor += 1
+        if not 1 <= attempts <= 2:
+            return False
+    return actual[cursor:] == [expected[-1]]
+
+
+def _created_volume_name(command: tuple[str, ...]) -> str:
+    return command[-1] if len(command) >= 4 else ""
+
+
+def _parse_volume_create(
+    command: tuple[str, ...],
+) -> tuple[dict[str, list[str]], str] | None:
+    if command[:3] != ("docker", "volume", "create"):
+        return None
+    allowed = {"--driver", "--opt", "--label"}
+    options: dict[str, list[str]] = {}
+    index = 3
+    while index < len(command) - 1:
+        token = command[index]
+        if token not in allowed or index + 1 >= len(command) - 1:
+            return None
+        options.setdefault(token, []).append(command[index + 1])
+        index += 2
+    if index != len(command) - 1 or command[index].startswith("-"):
+        return None
+    return options, command[index]
+
+
+def _is_hardened_volume_create(command: tuple[str, ...]) -> bool:
+    parsed = _parse_volume_create(command)
+    if parsed is None:
+        return False
+    options, name = parsed
+    match = _VOLUME_NAME_PATTERN.fullmatch(name)
+    if match is None:
+        return False
+    expected_labels = Counter(
+        {
+            f"{_RUN_LABEL}={match.group('run')}": 1,
+            f"{_RESOURCE_LABEL}={_CACHE_RESOURCE}": 1,
+        }
+    )
+    return (
+        set(options) == {"--driver", "--opt", "--label"}
+        and options["--driver"] == ["local"]
+        and Counter(options["--opt"]) == Counter(_CACHE_VOLUME_OPTIONS)
+        and Counter(options["--label"]) == expected_labels
+    )
+
+
+def _is_hardened_anchor(command: tuple[str, ...]) -> bool:
+    parsed = _parse_container_create(command)
+    if parsed is None:
+        return False
+    flags, options, image, tail = parsed
+    names = options.get("--name", [])
+    match = _ANCHOR_NAME_PATTERN.fullmatch(names[0]) if len(names) == 1 else None
+    if match is None:
+        return False
+    expected_values = {
+        "--pull": ["never"],
+        "--restart": ["no"],
+        "--network": ["none"],
+        "--user": ["10001:10001"],
+        "--cpus": ["2"],
+        "--memory": ["4g"],
+        "--memory-swap": ["4g"],
+        "--pids-limit": ["256"],
+        "--cap-drop": ["ALL"],
+        "--security-opt": ["no-new-privileges"],
+        "--log-driver": ["none"],
+        "--entrypoint": ["/bin/sh"],
+    }
+    expected_keys = set(expected_values) | {"--name", "--label", "--mount"}
+    expected_labels = Counter(
+        {
+            f"{_RUN_LABEL}={match.group('run')}": 1,
+            f"{_SEQUENCE_LABEL}=0": 1,
+        }
+    )
+    mounts = options.get("--mount", [])
+    mount = _mount_fields(mounts[0]) if len(mounts) == 1 else {}
+    expected_volume = f"{match.group('prefix')}-{match.group('run')}-cache"
+    expected_image = (
+        "repo-agent-python:0.1"
+        if match.group("prefix").endswith("-py")
+        else "repo-agent-maven:0.1"
+    )
+    return (
+        flags == Counter({"--init": 1, "--read-only": 1, "--rm": 1})
+        and set(options) == expected_keys
+        and all(options.get(key) == value for key, value in expected_values.items())
+        and Counter(options.get("--label", [])) == expected_labels
+        and set(mount) == {"type", "source", "target"}
+        and mount.get("type") == "volume"
+        and mount.get("source") == expected_volume
+        and mount.get("target") == "/cache"
+        and image == expected_image
+        and tail == ("-c", _CACHE_ANCHOR_ENTRYPOINT)
+        and not any("docker.sock" in value.casefold() for value in command)
+    )
+
+
+def _anchor_start_is_recorded(commands: list[tuple[str, ...]]) -> bool:
+    starts = [
+        command
+        for command in commands
+        if command[:3] == ("docker", "container", "start")
+        and len(command) == 4
+    ]
+    return len(starts) == 1 and bool(re.fullmatch(r"[0-9a-f]{64}", starts[0][-1]))
+
+
+def _runner_dependency_volume_contract(commands: list[tuple[str, ...]]) -> bool:
+    creates = _all_container_create_commands(commands)
+    phase_creates = _create_commands(commands)
+    anchor_creates = _anchor_create_commands(commands)
+    volume_creates = _volume_create_commands(commands)
+    if not phase_creates or len(anchor_creates) != 1 or len(volume_creates) != 1:
+        return False
+    created = {_created_volume_name(command) for command in volume_creates}
+    mounted = {_dependency_volume_name(command) for command in creates}
+    return (
+        "" not in mounted
+        and created == mounted
+        and _is_hardened_volume_create(volume_creates[0])
+        and _is_hardened_anchor(anchor_creates[0])
+        and _anchor_start_is_recorded(commands)
+        and all(_is_hardened(command) for command in phase_creates)
     )
 
 
@@ -550,11 +959,9 @@ def _maven_create_networks_are_separated(
     if not 5 <= len(commands) <= 9:
         return False
     networks = [_option_values(command, "--network") for command in commands]
-    entrypoints = [_option_values(command, "--entrypoint") for command in commands]
     return (
         all(value == ["bridge"] for value in networks[:-1])
         and networks[-1] == ["none"]
-        and all(value == ["mvn"] for value in entrypoints)
         and all("--offline" not in command for command in commands[:-1])
         and "--offline" in commands[-1]
         and len({_dependency_mount(command) for command in commands}) == 1
@@ -563,7 +970,10 @@ def _maven_create_networks_are_separated(
 
 
 def _is_hardened(command: tuple[str, ...]) -> bool:
-    required_flags = {"--init", "--read-only"}
+    parsed = _parse_container_create(command)
+    if parsed is None:
+        return False
+    flags, options, image, tail = parsed
     required_options = {
         "--pull": "never",
         "--restart": "no",
@@ -575,6 +985,8 @@ def _is_hardened(command: tuple[str, ...]) -> bool:
         "--cap-drop": "ALL",
         "--security-opt": "no-new-privileges",
         "--log-driver": "none",
+        "--workdir": "/workspace",
+        "--entrypoint": "/bin/sh",
     }
     required_environment = {
         "HOME=/tmp/home",
@@ -583,21 +995,90 @@ def _is_hardened(command: tuple[str, ...]) -> bool:
         "PYTHONDONTWRITEBYTECODE=1",
     }
     values_ok = all(
-        _option_values(command, option) == [expected]
+        options.get(option) == [expected]
         for option, expected in required_options.items()
     )
-    tmpfs = _option_values(command, "--tmpfs")
-    mounts = _option_values(command, "--mount")
-    environments = set(_option_values(command, "--env"))
+    tmpfs = options.get("--tmpfs", [])
+    mounts = options.get("--mount", [])
+    source_mounts = [
+        _mount_fields(value)
+        for value in mounts
+        if _mount_fields(value).get("target") == "/source"
+    ]
+    cache_mounts = [
+        _mount_fields(value)
+        for value in mounts
+        if _mount_fields(value).get("target") == "/cache"
+    ]
+    source_ok = (
+        len(source_mounts) == 1
+        and set(source_mounts[0]) == {"type", "source", "target", "readonly"}
+        and source_mounts[0].get("type") == "bind"
+        and bool(source_mounts[0].get("source"))
+        and source_mounts[0].get("readonly") == ""
+    )
+    cache_ok = (
+        len(cache_mounts) == 1
+        and set(cache_mounts[0]) == {"type", "source", "target"}
+        and cache_mounts[0].get("type") == "volume"
+        and bool(cache_mounts[0].get("source"))
+    )
+    name_values = options.get("--name", [])
+    name_match = (
+        _CONTAINER_NAME_PATTERN.fullmatch(name_values[0])
+        if len(name_values) == 1
+        else None
+    )
+    if name_match is None or not cache_ok:
+        return False
+    expected_volume = (
+        f"{name_match.group('prefix')}-{name_match.group('run')}-cache"
+    )
+    expected_labels = Counter(
+        {
+            f"{_RUN_LABEL}={name_match.group('run')}": 1,
+            f"{_SEQUENCE_LABEL}={name_match.group('sequence')}": 1,
+        }
+    )
+    payload = _container_payload_argv(command)
+    if payload is None:
+        return False
+    expected_image = {
+        "python": "repo-agent-python:0.1",
+        "mvn": "repo-agent-maven:0.1",
+    }.get(payload[0])
+    expected_environment = set(required_environment)
+    if payload[0] == "python":
+        expected_environment.add("PYTHONPATH=/cache/python")
+    exact_option_keys = set(required_options) | {
+        "--name",
+        "--label",
+        "--network",
+        "--tmpfs",
+        "--mount",
+        "--env",
+    }
     return (
-        required_flags.issubset(command)
+        flags == Counter({"--init": 1, "--read-only": 1})
+        and set(options) == exact_option_keys
         and values_ok
-        and len(tmpfs) == 1
-        and tmpfs[0].startswith("/tmp:rw,nosuid,nodev,")
+        and options.get("--network") in (["bridge"], ["none"])
+        and Counter(options.get("--label", [])) == expected_labels
+        and Counter(tmpfs)
+        == Counter(
+            {
+                "/tmp:rw,nosuid,nodev,size=256m,mode=1777": 1,
+                _WORKSPACE_TMPFS: 1,
+            }
+        )
         and len(mounts) == 2
-        and any("target=/workspace" in mount for mount in mounts)
-        and any("target=/dependencies" in mount for mount in mounts)
-        and required_environment.issubset(environments)
+        and source_ok
+        and cache_ok
+        and cache_mounts[0].get("source") == expected_volume
+        and Counter(options.get("--env", []))
+        == Counter({value: 1 for value in expected_environment})
+        and image == expected_image
+        and tail[:3] == ("-c", _WORKSPACE_ENTRYPOINT, "repo-agent-check")
         and not any("docker.sock" in value.casefold() for value in command)
     )
 
@@ -630,6 +1111,40 @@ def _containers_removed(prefix: str) -> tuple[bool, str | None]:
     except BaseException as exc:
         return False, f"{type(exc).__name__}: {exc}"
     return not bool(completed.stdout.strip()), None
+
+
+def _volumes_removed(names: set[str]) -> tuple[bool, str | None]:
+    errors: list[str] = []
+    remaining: list[str] = []
+    for name in sorted(names):
+        try:
+            completed = subprocess.run(
+                ("docker", "volume", "inspect", name),
+                check=False,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                shell=False,
+                timeout=15,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except BaseException as exc:
+            errors.append(f"{name}: {type(exc).__name__}: {exc}")
+            continue
+        if completed.returncode == 0:
+            remaining.append(name)
+        elif "no such volume" not in completed.stderr.casefold():
+            errors.append(
+                f"{name}: docker volume inspect exited {completed.returncode}: "
+                f"{completed.stderr.strip()}"
+            )
+    details: list[str] = []
+    if remaining:
+        details.append("remaining volumes: " + ", ".join(remaining))
+    details.extend(errors)
+    return not details, "; ".join(details) or None
 
 
 def _remove_temp_root(temp_root: Path) -> None:

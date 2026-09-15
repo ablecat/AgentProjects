@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 import subprocess
+import threading
+import time
 from typing import Callable
 
 import pytest
@@ -91,7 +93,8 @@ MAVEN_PLUGIN_POM = """\
 </project>
 """
 
-CONTAINER_IDS = tuple(f"{number:064x}" for number in range(1, 10))
+CONTAINER_IDS = tuple(f"{number:064x}" for number in range(1, 20))
+ANCHOR_ID = "f" * 64
 
 
 class FakeDockerRunner:
@@ -104,8 +107,16 @@ class FakeDockerRunner:
         inspect_owned: bool = False,
         on_start: Callable[[tuple[str, ...]], None] | None = None,
         start_exception: BaseException | None = None,
+        volume_creates: list[CommandOutcome] | None = None,
+        volume_inspects: list[CommandOutcome] | None = None,
+        volume_removes: list[CommandOutcome] | None = None,
+        volume_remove_default: CommandOutcome | None = None,
+        anchor_creates: list[CommandOutcome] | None = None,
+        anchor_starts: list[CommandOutcome] | None = None,
+        anchor_start_exception: BaseException | None = None,
     ) -> None:
         self.commands: list[tuple[str, ...]] = []
+        self.anchor_commands: list[tuple[str, ...]] = []
         self.timeouts: list[float] = []
         self.output_limits: list[int] = []
         self.starts = list(starts or [])
@@ -114,9 +125,23 @@ class FakeDockerRunner:
         self.inspect_owned = inspect_owned
         self.on_start = on_start
         self.start_exception = start_exception
+        self.volume_creates = list(volume_creates or [])
+        self.volume_inspects = list(volume_inspects or [])
+        self.volume_removes = list(volume_removes or [])
+        self.volume_remove_default = volume_remove_default
+        self.anchor_creates = list(anchor_creates or [])
+        self.anchor_starts = list(anchor_starts or [])
+        self.anchor_start_exception = anchor_start_exception
+        self.volume_commands: list[tuple[str, ...]] = []
+        self.volume_timeouts: list[float] = []
+        self._volume_name: str | None = None
+        self._volume_run_id: str | None = None
+        self._volume_resource: str | None = None
         self._create_count = 0
         self._create_by_id: dict[str, tuple[str, ...]] = {}
         self._create_by_name: dict[str, tuple[str, ...]] = {}
+        self._id_by_name: dict[str, str] = {}
+        self._anchor_ids: set[str] = set()
 
     def __call__(
         self,
@@ -126,21 +151,80 @@ class FakeDockerRunner:
         max_output_bytes: int,
     ) -> CommandOutcome:
         command = tuple(argv)
-        self.commands.append(command)
-        self.timeouts.append(timeout_seconds)
-        self.output_limits.append(max_output_bytes)
+        if command[:2] == ("docker", "volume"):
+            self.volume_commands.append(command)
+            self.volume_timeouts.append(timeout_seconds)
+            operation = command[2]
+            if operation == "create":
+                labels = [
+                    command[index + 1]
+                    for index, value in enumerate(command)
+                    if value == "--label"
+                ]
+                self._volume_name = command[-1]
+                self._volume_run_id = labels[0].split("=", 1)[1]
+                self._volume_resource = labels[1].split("=", 1)[1]
+                if self.volume_creates:
+                    return self.volume_creates.pop(0)
+                return CommandOutcome(0, f"{self._volume_name}\n")
+            if operation == "inspect":
+                if self.volume_inspects:
+                    return self.volume_inspects.pop(0)
+                if self._volume_name is None:
+                    return CommandOutcome(1, "Error: No such volume\n")
+                return CommandOutcome(
+                    0,
+                    "repo-agent-check-volume-owned "
+                    f"{self._volume_name} {self._volume_run_id} "
+                    f"{self._volume_resource}\n",
+                )
+            if operation == "rm":
+                removed_name = command[-1]
+                if self.volume_removes:
+                    outcome = self.volume_removes.pop(0)
+                    if outcome.exit_code != 0 or outcome.timed_out:
+                        return outcome
+                elif self.volume_remove_default is not None:
+                    return self.volume_remove_default
+                self._volume_name = None
+                return CommandOutcome(0, f"{removed_name}\n")
+            raise AssertionError(f"unexpected Docker volume command: {command}")
         operation = command[2]
         if operation == "create":
-            self._create_count += 1
-            container_id = CONTAINER_IDS[self._create_count - 1]
             name = command[command.index("--name") + 1]
+            is_anchor = name.endswith("-cache-anchor")
+            if is_anchor:
+                container_id = ANCHOR_ID
+            else:
+                self._create_count += 1
+                container_id = CONTAINER_IDS[self._create_count - 1]
             self._create_by_id[container_id] = command
             self._create_by_name[name] = command
+            self._id_by_name[name] = container_id
+            if is_anchor:
+                self._anchor_ids.add(container_id)
+                self.anchor_commands.append(command)
+                if self.anchor_creates:
+                    return self.anchor_creates.pop(0)
+                return CommandOutcome(0, f"{container_id}\n")
+            self.commands.append(command)
+            self.timeouts.append(timeout_seconds)
+            self.output_limits.append(max_output_bytes)
             if self.creates:
                 return self.creates.pop(0)
             return CommandOutcome(0, f"{container_id}\n")
         if operation == "start":
             container_id = command[-1]
+            if container_id in self._anchor_ids:
+                self.anchor_commands.append(command)
+                if self.anchor_start_exception is not None:
+                    raise self.anchor_start_exception
+                if self.anchor_starts:
+                    return self.anchor_starts.pop(0)
+                return CommandOutcome(0, f"{container_id}\n")
+            self.commands.append(command)
+            self.timeouts.append(timeout_seconds)
+            self.output_limits.append(max_output_bytes)
             if self.on_start is not None:
                 self.on_start(self._create_by_id[container_id])
             if self.start_exception is not None:
@@ -150,6 +234,13 @@ class FakeDockerRunner:
             return CommandOutcome(0, "phase output\n")
         if operation == "inspect":
             name = command[-1]
+            container_id = self._id_by_name.get(name)
+            if container_id in self._anchor_ids:
+                self.anchor_commands.append(command)
+            else:
+                self.commands.append(command)
+                self.timeouts.append(timeout_seconds)
+                self.output_limits.append(max_output_bytes)
             if self.inspects:
                 return self.inspects.pop(0)
             if not self.inspect_owned:
@@ -162,12 +253,20 @@ class FakeDockerRunner:
             ]
             run_id = labels[0].split("=", 1)[1]
             sequence = labels[1].split("=", 1)[1]
-            container_id = CONTAINER_IDS[self._create_count - 1]
+            container_id = self._id_by_name[name]
             return CommandOutcome(
                 0,
                 f"repo-agent-check-owned {container_id} {run_id} {sequence}\n",
             )
         if operation == "rm":
+            container_id = command[-1]
+            if container_id in self._anchor_ids:
+                self.anchor_commands.append(command)
+                self._anchor_ids.discard(container_id)
+            else:
+                self.commands.append(command)
+                self.timeouts.append(timeout_seconds)
+                self.output_limits.append(max_output_bytes)
             return CommandOutcome(0, f"{command[-1]}\n")
         raise AssertionError(f"unexpected Docker command: {command}")
 
@@ -333,7 +432,7 @@ def test_python_requirements_enable_only_preregistered_bootstrap_argv(
             "--no-input",
             "--no-compile",
             "--target",
-            "/dependencies/python",
+            "/cache/python",
             "--requirement",
             "requirements.txt",
         ),
@@ -356,7 +455,7 @@ def test_detects_single_module_maven_profile_with_offline_verify(
             "--batch-mode",
             "--no-transfer-progress",
             "-Dstyle.color=never",
-            "-Dmaven.repo.local=/dependencies/m2",
+            "-Dmaven.repo.local=/cache/m2",
             "-DskipTests",
             "org.apache.maven.plugins:maven-dependency-plugin:3.8.1:go-offline",
         ),
@@ -365,7 +464,7 @@ def test_detects_single_module_maven_profile_with_offline_verify(
             "--batch-mode",
             "--no-transfer-progress",
             "-Dstyle.color=never",
-            "-Dmaven.repo.local=/dependencies/m2",
+            "-Dmaven.repo.local=/cache/m2",
             "org.apache.maven.plugins:maven-dependency-plugin:3.8.1:get",
             "-Dartifact=org.apache.maven.surefire:surefire-junit-platform:3.5.2",
             "-Dtransitive=true",
@@ -375,7 +474,7 @@ def test_detects_single_module_maven_profile_with_offline_verify(
             "--batch-mode",
             "--no-transfer-progress",
             "-Dstyle.color=never",
-            "-Dmaven.repo.local=/dependencies/m2",
+            "-Dmaven.repo.local=/cache/m2",
             "org.apache.maven.plugins:maven-dependency-plugin:3.8.1:get",
             "-Dartifact=org.junit.platform:junit-platform-launcher:1.9.3",
             "-Dtransitive=true",
@@ -385,7 +484,7 @@ def test_detects_single_module_maven_profile_with_offline_verify(
             "--batch-mode",
             "--no-transfer-progress",
             "-Dstyle.color=never",
-            "-Dmaven.repo.local=/dependencies/m2",
+            "-Dmaven.repo.local=/cache/m2",
             "org.apache.maven.plugins:maven-dependency-plugin:3.8.1:get",
             "-Dartifact=org.junit.platform:junit-platform-launcher:1.11.4",
             "-Dtransitive=true",
@@ -893,7 +992,8 @@ def test_python_verify_uses_hardened_offline_container_and_exact_cleanup(
     assert _option_values(create, "--security-opt") == ["no-new-privileges"]
     assert _option_values(create, "--log-driver") == ["none"]
     assert _option_values(create, "--tmpfs") == [
-        "/tmp:rw,nosuid,nodev,size=256m,mode=1777"
+        "/tmp:rw,nosuid,nodev,size=256m,mode=1777",
+        "/workspace:rw,nosuid,nodev,size=2g,mode=0700,uid=10001,gid=10001",
     ]
     assert set(_option_values(create, "--env")) == {
         "HOME=/tmp/home",
@@ -902,18 +1002,26 @@ def test_python_verify_uses_hardened_offline_container_and_exact_cleanup(
         "PYTHONDONTWRITEBYTECODE=1",
     }
     mounts = _mount_sources(create)
-    assert set(mounts) == {"/workspace", "/dependencies"}
-    assert Path(mounts["/workspace"]) != repo
-    assert Path(mounts["/dependencies"]) != Path.home()
-    assert not Path(mounts["/workspace"]).exists()
+    assert set(mounts) == {"/source", "/cache"}
+    assert Path(mounts["/source"]) != repo
+    assert mounts["/cache"].startswith("repo-agent-check-")
+    assert not Path(mounts["/source"]).exists()
+    source_mount = next(
+        mount for mount in _option_values(create, "--mount") if "target=/source" in mount
+    )
+    assert source_mount.endswith(",readonly")
     assert "/var/run/docker.sock" not in " ".join(create)
     entrypoint = create.index("--entrypoint")
     assert create[entrypoint : entrypoint + 3] == (
         "--entrypoint",
-        "python",
+        "/bin/sh",
         "repo-agent-python:0.1",
     )
-    assert create[entrypoint + 3 :] == (
+    assert create[entrypoint + 3] == "-c"
+    assert "cp -R /source/. /workspace" in create[entrypoint + 4]
+    assert create[entrypoint + 5 :] == (
+        "repo-agent-check",
+        "python",
         "-m",
         "pytest",
         "-q",
@@ -928,6 +1036,544 @@ def test_python_verify_uses_hardened_offline_container_and_exact_cleanup(
         CONTAINER_IDS[0],
     )
     assert runner.timeouts[1] <= 15
+    assert [command[2] for command in runner.volume_commands] == [
+        "create",
+        "inspect",
+        "inspect",
+        "inspect",
+        "inspect",
+        "rm",
+    ]
+    volume_create = runner.volume_commands[0]
+    volume_name = volume_create[-1]
+    assert _mount_sources(create)["/cache"] == volume_name
+    assert _option_values(volume_create, "--label") == [
+        f"io.github.ablecat.repo-agent.check.run={runner._volume_run_id}",
+        "io.github.ablecat.repo-agent.check.resource=dependencies",
+    ]
+    assert _option_values(volume_create, "--driver") == ["local"]
+    assert _option_values(volume_create, "--opt") == [
+        "type=tmpfs",
+        "device=tmpfs",
+        "o=rw,nosuid,nodev,size=1g,mode=0700,uid=10001,gid=10001",
+    ]
+    assert runner.volume_commands[-1] == ("docker", "volume", "rm", volume_name)
+    assert [command[2] for command in runner.anchor_commands] == [
+        "create",
+        "start",
+        "rm",
+    ]
+    anchor_create = runner.anchor_commands[0]
+    assert "--rm" in anchor_create
+    assert _option_values(anchor_create, "--network") == ["none"]
+    assert "--read-only" in anchor_create
+    assert anchor_create[-2:] == ("-c", "exec sleep 1260\n")
+
+
+def test_dependency_volume_ownership_mismatch_is_never_mounted_or_removed(
+    tmp_path: Path,
+) -> None:
+    run_id = "a" * 32
+    volume_name = f"repo-agent-check-{run_id}-cache"
+    docker = FakeDockerRunner(
+        volume_inspects=[
+            CommandOutcome(
+                0,
+                "repo-agent-check-volume-owned "
+                f"{volume_name} {'b' * 32} dependencies\n",
+            )
+        ]
+    )
+    check_runner = CheckRunner(
+        _python_repository(tmp_path), command_runner=docker, temp_parent=tmp_path
+    )
+    check_runner._run_id = run_id
+
+    result = check_runner.run()
+
+    assert result.status == "setup_error"
+    assert result.cleanup_ok
+    assert "mismatched ownership" in (result.error or "")
+    assert docker.commands == []
+    assert [command[2] for command in docker.volume_commands] == [
+        "create",
+        "inspect",
+    ]
+
+
+def test_timed_out_dependency_volume_create_recovers_exact_owned_volume(
+    tmp_path: Path,
+) -> None:
+    docker = FakeDockerRunner(
+        volume_creates=[CommandOutcome(None, "", timed_out=True)]
+    )
+
+    result = CheckRunner(
+        _python_repository(tmp_path), command_runner=docker, temp_parent=tmp_path
+    ).run()
+
+    assert result.status == "setup_error"
+    assert result.cleanup_ok
+    assert "volume create timed out" in (result.error or "")
+    assert docker.commands == []
+    assert [command[2] for command in docker.volume_commands] == [
+        "create",
+        "inspect",
+        "rm",
+    ]
+    assert docker.volume_commands[-1][-1] == docker.volume_commands[0][-1]
+
+
+def test_dependency_volume_cleanup_failure_is_reported_and_can_be_retried(
+    tmp_path: Path,
+) -> None:
+    docker = FakeDockerRunner(
+        volume_remove_default=CommandOutcome(1, "volume is in use\n")
+    )
+    check_runner = CheckRunner(
+        _python_repository(tmp_path),
+        command_runner=docker,
+        control_timeout_seconds=1,
+        temp_parent=tmp_path,
+    )
+
+    result = check_runner.run()
+
+    assert result.status == "cleanup_error"
+    assert not result.cleanup_ok
+    assert "volume" in (result.error or "")
+    assert check_runner._dependency_volume_name is not None
+    docker.volume_remove_default = None
+    check_runner.close()
+    assert check_runner._dependency_volume_name is None
+    assert [command[2] for command in docker.volume_commands].count("rm") >= 2
+
+
+def _owned_volume_inspect(volume_name: str, run_id: str) -> CommandOutcome:
+    return CommandOutcome(
+        0,
+        "repo-agent-check-volume-owned "
+        f"{volume_name} {run_id} dependencies\n",
+    )
+
+
+def test_dependency_volume_is_revalidated_after_container_create(
+    tmp_path: Path,
+) -> None:
+    run_id = "a" * 32
+    volume_name = f"repo-agent-check-{run_id}-cache"
+    docker = FakeDockerRunner(
+        volume_inspects=[
+            _owned_volume_inspect(volume_name, run_id),
+            _owned_volume_inspect(volume_name, run_id),
+            _owned_volume_inspect(volume_name, "b" * 32),
+        ]
+    )
+    check_runner = CheckRunner(
+        _python_repository(tmp_path), command_runner=docker, temp_parent=tmp_path
+    )
+    check_runner._run_id = run_id
+
+    result = check_runner.run()
+
+    assert result.status == "setup_error"
+    assert result.cleanup_ok
+    assert "mismatched ownership" in (result.error or "")
+    assert [command[2] for command in docker.commands] == ["create", "rm"]
+    assert all(command[2] != "rm" for command in docker.volume_commands)
+
+
+def test_transient_volume_inspect_error_is_retried_during_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_id = "a" * 32
+    volume_name = f"repo-agent-check-{run_id}-cache"
+    docker = FakeDockerRunner(
+        volume_inspects=[
+            _owned_volume_inspect(volume_name, run_id),
+            _owned_volume_inspect(volume_name, run_id),
+            _owned_volume_inspect(volume_name, run_id),
+            CommandOutcome(2, "daemon unavailable\n"),
+            _owned_volume_inspect(volume_name, run_id),
+        ]
+    )
+    check_runner = CheckRunner(
+        _python_repository(tmp_path), command_runner=docker, temp_parent=tmp_path
+    )
+    check_runner._run_id = run_id
+    monkeypatch.setattr(checks_module, "sleep", lambda _seconds: None)
+
+    result = check_runner.run()
+
+    assert result.status == "passed"
+    assert result.cleanup_ok
+    assert [command[2] for command in docker.volume_commands].count("inspect") == 5
+    assert [command[2] for command in docker.volume_commands].count("rm") == 1
+
+
+@pytest.mark.parametrize(
+    ("anchor_creates", "anchor_starts", "start_exception", "message"),
+    [
+        ([CommandOutcome(None, "", timed_out=True)], [], None, "create timed out"),
+        ([CommandOutcome(0, "invalid id\n")], [], None, "did not return"),
+        ([], [CommandOutcome(None, "", timed_out=True)], None, "start timed out"),
+        ([], [], OSError("anchor start failed"), "anchor start failed"),
+    ],
+)
+def test_cache_anchor_failures_clean_container_volume_and_root(
+    tmp_path: Path,
+    anchor_creates: list[CommandOutcome],
+    anchor_starts: list[CommandOutcome],
+    start_exception: BaseException | None,
+    message: str,
+) -> None:
+    docker = FakeDockerRunner(
+        anchor_creates=anchor_creates,
+        anchor_starts=anchor_starts,
+        anchor_start_exception=start_exception,
+        inspect_owned=True,
+    )
+    check_runner = CheckRunner(
+        _python_repository(tmp_path),
+        command_runner=docker,
+        control_timeout_seconds=1,
+        temp_parent=tmp_path,
+    )
+
+    result = check_runner.run()
+
+    assert result.status == "setup_error"
+    assert result.cleanup_ok
+    assert message in (result.error or "")
+    assert docker.commands == []
+    assert [command[2] for command in docker.anchor_commands].count("rm") == 1
+    assert [command[2] for command in docker.volume_commands].count("rm") == 1
+    with check_runner._state_lock:
+        assert check_runner._container_ids == {}
+        assert check_runner._container_names == {}
+        assert check_runner._dependency_volume_name is None
+        assert check_runner._root is None
+
+
+def _wait_for_close_request(check_runner: CheckRunner) -> None:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        with check_runner._state_lock:
+            if check_runner._close_requested:
+                return
+        threading.Event().wait(0.01)
+    raise AssertionError("close() did not publish its cancellation request")
+
+
+def _run_and_close_at_command(
+    tmp_path: Path,
+    *,
+    blocked_operation: tuple[str, ...],
+) -> tuple[CheckRunner, FakeDockerRunner, object]:
+    entered = threading.Event()
+    release = threading.Event()
+    docker = FakeDockerRunner()
+
+    def blocking_runner(
+        argv,
+        *,
+        timeout_seconds: float,
+        max_output_bytes: int,
+    ) -> CommandOutcome:
+        command = tuple(argv)
+        outcome = docker(
+            command,
+            timeout_seconds=timeout_seconds,
+            max_output_bytes=max_output_bytes,
+        )
+        is_anchor = (
+            (
+                command[2] == "create"
+                and any(value.endswith("-cache-anchor") for value in command)
+            )
+            or (command[2] in {"start", "rm"} and command[-1] == ANCHOR_ID)
+        )
+        if command[: len(blocked_operation)] == blocked_operation and not is_anchor:
+            entered.set()
+            assert release.wait(timeout=5)
+        return outcome
+
+    check_runner = CheckRunner(
+        _python_repository(tmp_path),
+        command_runner=blocking_runner,
+        control_timeout_seconds=5,
+        temp_parent=tmp_path,
+    )
+    results: list[object] = []
+    errors: list[BaseException] = []
+    close_errors: list[BaseException] = []
+    close_done = threading.Event()
+
+    def invoke_run() -> None:
+        try:
+            results.append(check_runner.run())
+        except BaseException as exc:
+            errors.append(exc)
+
+    def invoke_close() -> None:
+        try:
+            check_runner.close()
+        except BaseException as exc:
+            close_errors.append(exc)
+        finally:
+            close_done.set()
+
+    run_thread = threading.Thread(target=invoke_run)
+    close_thread = threading.Thread(target=invoke_close)
+    run_thread.start()
+    assert entered.wait(timeout=5)
+    close_thread.start()
+    _wait_for_close_request(check_runner)
+    assert not close_done.wait(timeout=0.05)
+    if blocked_operation == ("docker", "container", "start"):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if any(command[2] == "rm" for command in docker.commands):
+                break
+            threading.Event().wait(0.01)
+        assert any(command[2] == "rm" for command in docker.commands)
+        assert not close_done.is_set()
+    release.set()
+    run_thread.join(timeout=5)
+    close_thread.join(timeout=5)
+
+    assert not run_thread.is_alive()
+    assert not close_thread.is_alive()
+    assert errors == []
+    assert close_errors == []
+    assert len(results) == 1
+    with check_runner._state_lock:
+        assert check_runner._container_ids == {}
+        assert check_runner._container_names == {}
+        assert check_runner._dependency_volume_name is None
+        assert check_runner._root is None
+        assert check_runner._closed
+    return check_runner, docker, results[0]
+
+
+def test_concurrent_close_during_volume_create_cannot_leak_resources(
+    tmp_path: Path,
+) -> None:
+    _, docker, result = _run_and_close_at_command(
+        tmp_path, blocked_operation=("docker", "volume", "create")
+    )
+
+    assert getattr(result, "status") == "setup_error"
+    assert docker.commands == []
+    assert [command[2] for command in docker.volume_commands].count("rm") == 1
+
+
+def test_concurrent_close_during_container_create_prevents_start(
+    tmp_path: Path,
+) -> None:
+    _, docker, result = _run_and_close_at_command(
+        tmp_path, blocked_operation=("docker", "container", "create")
+    )
+
+    assert getattr(result, "status") == "setup_error"
+    assert [command[2] for command in docker.commands].count("start") == 0
+    assert [command[2] for command in docker.commands].count("rm") == 1
+    assert [command[2] for command in docker.volume_commands].count("rm") == 1
+
+
+def test_concurrent_close_during_attached_start_removes_container_once(
+    tmp_path: Path,
+) -> None:
+    _, docker, result = _run_and_close_at_command(
+        tmp_path, blocked_operation=("docker", "container", "start")
+    )
+
+    assert getattr(result, "status") == "setup_error"
+    assert [command[2] for command in docker.commands].count("start") == 1
+    assert [command[2] for command in docker.commands].count("rm") == 1
+    assert [command[2] for command in docker.volume_commands].count("rm") == 1
+
+
+def test_concurrent_close_during_run_side_remove_is_serialized(
+    tmp_path: Path,
+) -> None:
+    _, docker, result = _run_and_close_at_command(
+        tmp_path, blocked_operation=("docker", "container", "rm")
+    )
+
+    assert getattr(result, "status") == "setup_error"
+    assert [command[2] for command in docker.commands].count("start") == 1
+    assert [command[2] for command in docker.commands].count("rm") == 1
+    assert [command[2] for command in docker.volume_commands].count("rm") == 1
+
+
+def test_concurrent_close_waits_for_temporary_root_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _python_repository(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+    original_mkdtemp = checks_module.tempfile.mkdtemp
+    created_paths: list[Path] = []
+
+    def blocked_mkdtemp(*args, **kwargs) -> str:
+        created = original_mkdtemp(*args, **kwargs)
+        created_paths.append(Path(created))
+        entered.set()
+        assert release.wait(timeout=5)
+        return created
+
+    monkeypatch.setattr(checks_module.tempfile, "mkdtemp", blocked_mkdtemp)
+    check_runner = CheckRunner(
+        repo,
+        command_runner=FakeDockerRunner(),
+        control_timeout_seconds=5,
+        temp_parent=tmp_path,
+    )
+    results: list[object] = []
+    errors: list[BaseException] = []
+
+    def invoke_run() -> None:
+        try:
+            results.append(check_runner.run())
+        except BaseException as exc:
+            errors.append(exc)
+
+    def invoke_close() -> None:
+        try:
+            check_runner.close()
+        except BaseException as exc:
+            errors.append(exc)
+
+    run_thread = threading.Thread(target=invoke_run)
+    close_thread = threading.Thread(target=invoke_close)
+    run_thread.start()
+    assert entered.wait(timeout=5)
+    close_thread.start()
+    _wait_for_close_request(check_runner)
+    release.set()
+    run_thread.join(timeout=5)
+    close_thread.join(timeout=5)
+
+    assert not run_thread.is_alive()
+    assert not close_thread.is_alive()
+    assert errors == []
+    assert len(results) == 1
+    assert getattr(results[0], "status") == "setup_error"
+    assert created_paths and all(not path.exists() for path in created_paths)
+    with check_runner._state_lock:
+        assert check_runner._root is None
+        assert check_runner._closed
+
+
+def test_temporary_root_validation_failure_still_removes_registered_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = [0]
+
+    def reject_first_validation(_path: Path) -> bool:
+        calls[0] += 1
+        return calls[0] == 1
+
+    monkeypatch.setattr(checks_module, "_is_link_or_reparse", reject_first_validation)
+    check_runner = CheckRunner(
+        _python_repository(tmp_path),
+        command_runner=FakeDockerRunner(),
+        temp_parent=tmp_path,
+    )
+
+    result = check_runner.run()
+
+    assert result.status == "setup_error"
+    assert result.cleanup_ok
+    assert "must not be a link" in (result.error or "")
+    with check_runner._state_lock:
+        assert check_runner._root is None
+        assert check_runner._closed
+
+
+def test_two_concurrent_close_calls_are_idempotent(tmp_path: Path) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    docker = FakeDockerRunner()
+
+    def blocking_start(
+        argv,
+        *,
+        timeout_seconds: float,
+        max_output_bytes: int,
+    ) -> CommandOutcome:
+        command = tuple(argv)
+        outcome = docker(
+            command,
+            timeout_seconds=timeout_seconds,
+            max_output_bytes=max_output_bytes,
+        )
+        if (
+            command[:3] == ("docker", "container", "start")
+            and command[-1] != ANCHOR_ID
+        ):
+            entered.set()
+            assert release.wait(timeout=5)
+        return outcome
+
+    check_runner = CheckRunner(
+        _python_repository(tmp_path),
+        command_runner=blocking_start,
+        control_timeout_seconds=5,
+        temp_parent=tmp_path,
+    )
+    run_results: list[object] = []
+    errors: list[BaseException] = []
+    close_started = [threading.Event(), threading.Event()]
+    close_done = [threading.Event(), threading.Event()]
+
+    def invoke_run() -> None:
+        try:
+            run_results.append(check_runner.run())
+        except BaseException as exc:
+            errors.append(exc)
+
+    def invoke_close(index: int) -> None:
+        close_started[index].set()
+        try:
+            check_runner.close()
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            close_done[index].set()
+
+    run_thread = threading.Thread(target=invoke_run)
+    threads = [
+        threading.Thread(target=invoke_close, args=(index,)) for index in range(2)
+    ]
+    run_thread.start()
+    assert entered.wait(timeout=5)
+    for thread in threads:
+        thread.start()
+    assert all(event.wait(timeout=5) for event in close_started)
+    _wait_for_close_request(check_runner)
+    assert all(not event.wait(timeout=0.05) for event in close_done)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if any(command[2] == "rm" for command in docker.commands):
+            break
+        threading.Event().wait(0.01)
+    assert any(command[2] == "rm" for command in docker.commands)
+    release.set()
+    run_thread.join(timeout=5)
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert not run_thread.is_alive()
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    assert len(run_results) == 1
+    assert getattr(run_results[0], "status") == "setup_error"
+    assert [command[2] for command in docker.commands].count("rm") == 1
+    assert [command[2] for command in docker.volume_commands].count("rm") == 1
+    with check_runner._state_lock:
+        assert check_runner._closed
 
 
 def test_bootstrap_requires_authorization_before_any_container_is_created(
@@ -968,16 +1614,15 @@ def test_authorized_bootstrap_is_networked_and_verify_is_fresh_and_offline(
         ["none"],
     ]
     assert all(
-        "PYTHONPATH=/dependencies/python" in _option_values(command, "--env")
+        "PYTHONPATH=/cache/python" in _option_values(command, "--env")
         for command in creates
     )
     mount_sets = [_mount_sources(command) for command in creates]
-    bootstrap_workspace = mount_sets[0]["/workspace"]
-    verify_workspace = mount_sets[1]["/workspace"]
+    bootstrap_workspace = mount_sets[0]["/source"]
+    verify_workspace = mount_sets[1]["/source"]
     assert verify_workspace != bootstrap_workspace
-    assert len({mounts["/dependencies"] for mounts in mount_sets}) == 1
-    assert all(not Path(mounts["/workspace"]).exists() for mounts in mount_sets)
-    assert all(not Path(mounts["/dependencies"]).exists() for mounts in mount_sets)
+    assert len({mounts["/cache"] for mounts in mount_sets}) == 1
+    assert all(not Path(mounts["/source"]).exists() for mounts in mount_sets)
     assert [command[2] for command in runner.commands] == [
         "create",
         "start",
@@ -998,7 +1643,7 @@ def test_candidate_patch_is_applied_only_to_fresh_verification_copy(
     observed: list[tuple[Path, str]] = []
 
     def inspect_workspace(create: tuple[str, ...]) -> None:
-        workspace = Path(_mount_sources(create)["/workspace"])
+        workspace = Path(_mount_sources(create)["/source"])
         observed.append(
             (workspace, (workspace / "app.py").read_text(encoding="utf-8"))
         )
@@ -1089,12 +1734,13 @@ def test_maven_bootstrap_and_verify_use_only_fixed_commands(tmp_path: Path) -> N
     )
     creates = [command for command in allowed_runner.commands if command[2] == "create"]
     assert [command[command.index("--entrypoint") + 1] for command in creates] == [
-        "mvn",
-        "mvn",
-        "mvn",
-        "mvn",
-        "mvn",
+        "/bin/sh",
+        "/bin/sh",
+        "/bin/sh",
+        "/bin/sh",
+        "/bin/sh",
     ]
+    assert all(command[-len(phase.argv) :] == phase.argv for command, phase in zip(creates, result.phases, strict=True))
     assert all("repo-agent-maven:0.1" in command for command in creates)
 
 
@@ -1444,7 +2090,7 @@ def test_timed_out_create_with_repeated_absence_keeps_cleanup_ownership(
     clock = [100.0]
     monkeypatch.setattr(checks_module.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(
-        checks_module.time,
+        checks_module,
         "sleep",
         lambda seconds: clock.__setitem__(0, clock[0] + seconds),
     )
@@ -1509,7 +2155,7 @@ def test_keyboard_interrupt_is_preserved_when_cleanup_fails(
     clock = [100.0]
     monkeypatch.setattr(checks_module.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(
-        checks_module.time,
+        checks_module,
         "sleep",
         lambda seconds: clock.__setitem__(0, clock[0] + seconds),
     )
@@ -1808,7 +2454,7 @@ def test_timed_out_create_recovers_container_appearing_within_control_deadline(
 
     monkeypatch.setattr(checks_module.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(
-        checks_module.time,
+        checks_module,
         "sleep",
         lambda seconds: clock.__setitem__(0, clock[0] + seconds),
     )

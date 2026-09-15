@@ -542,7 +542,7 @@ def test_create_timeout_requires_multiple_delayed_absence_checks(
     runner = FakeDockerRunner()
     runner.create = CommandOutcome(None, "", timed_out=True)
     delays: list[float] = []
-    monkeypatch.setattr(sandbox_module.time, "sleep", delays.append)
+    monkeypatch.setattr(sandbox_module, "sleep", delays.append)
 
     sandbox = DockerSandbox(committed_repo, command_runner=runner)
     sandbox.__enter__()
@@ -575,7 +575,7 @@ def test_failed_timeout_recovery_retains_state_for_a_later_retry(
     runner = FakeDockerRunner()
     runner.create = CommandOutcome(None, "", timed_out=True)
     runner.inspect = CommandOutcome(2, "daemon unavailable\n")
-    monkeypatch.setattr(sandbox_module.time, "sleep", lambda _: None)
+    monkeypatch.setattr(sandbox_module, "sleep", lambda _: None)
     sandbox = DockerSandbox(committed_repo, command_runner=runner)
     sandbox.__enter__()
     run_root = sandbox.snapshot_path.parent

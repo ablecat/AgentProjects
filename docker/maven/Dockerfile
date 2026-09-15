@@ -11,6 +11,9 @@ RUN apt-get -o Acquire::Retries=3 update \
     && mkdir --parents /workspace /cache /home/repo-agent/.m2 \
     && chown --recursive 10001:10001 /workspace /cache /home/repo-agent
 
+RUN mkdir --parents /cache/m2 \
+    && chown 10001:10001 /cache/m2
+
 ENV HOME=/home/repo-agent \
     MAVEN_CONFIG=/home/repo-agent/.m2
 

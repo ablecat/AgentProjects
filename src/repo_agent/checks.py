@@ -11,7 +11,9 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import threading
 import time
+from time import sleep
 import tomllib
 from typing import Callable, Literal, Protocol, Sequence, TypeAlias
 import uuid
@@ -40,9 +42,28 @@ _MAX_GIT_OUTPUT_BYTES = 16 * 1024 * 1024
 _CHECK_ROOT_RE = re.compile(r"^repo-agent-check-[0-9a-z_]+$")
 _CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _CONTAINER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_VOLUME_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _RUN_LABEL = "io.github.ablecat.repo-agent.check.run"
 _SEQUENCE_LABEL = "io.github.ablecat.repo-agent.check.sequence"
+_RESOURCE_LABEL = "io.github.ablecat.repo-agent.check.resource"
 _INSPECT_PREFIX = "repo-agent-check-owned"
+_VOLUME_INSPECT_PREFIX = "repo-agent-check-volume-owned"
+_CACHE_RESOURCE = "dependencies"
+_WORKSPACE_TMPFS = (
+    "/workspace:rw,nosuid,nodev,size=2g,mode=0700,uid=10001,gid=10001"
+)
+_CACHE_VOLUME_OPTIONS = (
+    "type=tmpfs",
+    "device=tmpfs",
+    "o=rw,nosuid,nodev,size=1g,mode=0700,uid=10001,gid=10001",
+)
+_CACHE_ANCHOR_ENTRYPOINT = "exec sleep 1260\n"
+_WORKSPACE_ENTRYPOINT = """\
+set -eu
+mkdir -p /cache/python /cache/m2
+cp -R /source/. /workspace
+exec "$@"
+"""
 _RECOVERY_INITIAL_DELAY_SECONDS = 0.05
 _RECOVERY_MAX_DELAY_SECONDS = 1.0
 _GRADLE_MARKERS = frozenset(
@@ -153,7 +174,7 @@ class CheckProfile:
     manifest: str
     bootstrap_argv: tuple[tuple[str, ...], ...]
     check_argv: tuple[str, ...]
-    cache_target: str = "/dependencies"
+    cache_target: str = "/cache"
     java_release: int | None = None
 
     @property
@@ -282,7 +303,7 @@ def _python_profile(root: Path) -> CheckProfile:
             "--no-input",
             "--no-compile",
             "--target",
-            "/dependencies/python",
+            "/cache/python",
         ]
         if has_requirements:
             install.extend(("--requirement", "requirements.txt"))
@@ -359,7 +380,7 @@ def _maven_profile(pom: Path) -> CheckProfile:
         "--batch-mode",
         "--no-transfer-progress",
         "-Dstyle.color=never",
-        "-Dmaven.repo.local=/dependencies/m2",
+        "-Dmaven.repo.local=/cache/m2",
     )
     return CheckProfile(
         id="maven-test",
@@ -906,54 +927,44 @@ class CheckRunner:
         self._container_ids: dict[str, str] = {}
         self._container_names: dict[str, int] = {}
         self._indeterminate_container_names: set[str] = set()
+        self._dependency_volume_name: str | None = None
+        self._dependency_volume_indeterminate = False
         self._cleanup_deadline: float | None = None
         self._root: Path | None = None
         self._closed = False
+        self._close_requested = False
+        self._run_active = False
+        self._run_finished = threading.Event()
+        self._run_finished.set()
+        self._state_lock = threading.RLock()
+        self._resource_transition_lock = threading.RLock()
+        self._cleanup_lock = threading.RLock()
 
     def run(self, check_id: str | None = None) -> CheckRunResult:
         """Run the detected profile once and always clean every run-owned resource."""
 
+        with self._state_lock:
+            if self._run_active or self._closed or self._close_requested:
+                raise CheckError("a CheckRunner instance can only run once")
+            self._run_active = True
+            self._run_finished.clear()
         started = time.monotonic()
         result: CheckRunResult
         try:
-            result = self._run_inner(check_id, started)
-        except CheckPolicyError as exc:
-            result = CheckRunResult(
-                status="policy_denied",
-                profile=None,
-                base_commit=None,
-                candidate_applied=self._candidate is not None,
-                phases=(),
-                duration_ms=_elapsed_ms(started),
-                error=str(exc),
-            )
-        except CheckTimeoutError as exc:
-            result = CheckRunResult(
-                status="timed_out",
-                profile=None,
-                base_commit=None,
-                candidate_applied=self._candidate is not None,
-                phases=(),
-                duration_ms=_elapsed_ms(started),
-                error=str(exc),
-            )
-        except (OSError, CheckError, subprocess.SubprocessError) as exc:
-            result = CheckRunResult(
-                status="setup_error",
-                profile=None,
-                base_commit=None,
-                candidate_applied=self._candidate is not None,
-                phases=(),
-                duration_ms=_elapsed_ms(started),
-                error=f"{type(exc).__name__}: {exc}",
-            )
+            result = self._run_result(check_id, started)
         except BaseException as exc:
+            with self._state_lock:
+                self._run_active = False
+                self._run_finished.set()
             try:
                 self.close()
             except CheckCleanupError as cleanup_exc:
                 exc.add_note(f"check cleanup also failed: {cleanup_exc}")
             raise
 
+        with self._state_lock:
+            self._run_active = False
+            self._run_finished.set()
         try:
             self.close()
         except CheckCleanupError as exc:
@@ -965,6 +976,40 @@ class CheckRunner:
                 cleanup_ok=False,
             )
         return replace(result, duration_ms=_elapsed_ms(started))
+
+    def _run_result(self, check_id: str | None, started: float) -> CheckRunResult:
+        try:
+            return self._run_inner(check_id, started)
+        except CheckPolicyError as exc:
+            return CheckRunResult(
+                status="policy_denied",
+                profile=None,
+                base_commit=None,
+                candidate_applied=self._candidate is not None,
+                phases=(),
+                duration_ms=_elapsed_ms(started),
+                error=str(exc),
+            )
+        except CheckTimeoutError as exc:
+            return CheckRunResult(
+                status="timed_out",
+                profile=None,
+                base_commit=None,
+                candidate_applied=self._candidate is not None,
+                phases=(),
+                duration_ms=_elapsed_ms(started),
+                error=str(exc),
+            )
+        except (OSError, CheckError, subprocess.SubprocessError) as exc:
+            return CheckRunResult(
+                status="setup_error",
+                profile=None,
+                base_commit=None,
+                candidate_applied=self._candidate is not None,
+                phases=(),
+                duration_ms=_elapsed_ms(started),
+                error=f"{type(exc).__name__}: {exc}",
+            )
 
     def _run_inner(self, check_id: str | None, started: float) -> CheckRunResult:
         self._prepare_root()
@@ -996,12 +1041,7 @@ class CheckRunner:
                 error="dependency bootstrap requires explicit allow_bootstrap=True",
             )
 
-        dependency_cache = self._root / "dependencies"
-        dependency_cache.mkdir(mode=0o700)
-        _make_container_writable(
-            dependency_cache,
-            check_deadline=lambda: self._require_remaining_time(started),
-        )
+        dependency_cache = self._create_dependency_volume(profile, started)
         self._require_remaining_time(started)
         phases: list[CheckPhaseResult] = []
         if profile.bootstrap_required:
@@ -1035,6 +1075,7 @@ class CheckRunner:
                         dependencies=dependency_cache,
                         timeout_seconds=timeout,
                     )
+                    self._require_not_closing()
                     attempt_phases.append(attempt_phase)
                     if attempt_phase.status == "passed":
                         break
@@ -1066,6 +1107,7 @@ class CheckRunner:
             dependencies=dependency_cache,
             timeout_seconds=timeout,
         )
+        self._require_not_closing()
         phases.append(verify)
         if self._remaining_total_timeout(started) <= 0:
             return self._timeout_result(profile, base_commit, phases, started)
@@ -1134,10 +1176,16 @@ class CheckRunner:
         return min(self.control_timeout_seconds, remaining)
 
     def _require_remaining_time(self, started: float) -> None:
+        self._require_not_closing()
         if self._remaining_timeout(started) <= 0:
             raise CheckTimeoutError(
                 f"check run exceeded {self.total_timeout_seconds:g} seconds"
             )
+
+    def _require_not_closing(self) -> None:
+        with self._state_lock:
+            if self._close_requested:
+                raise CheckError("check run was cancelled during cleanup")
 
     @staticmethod
     def _assert_profile(workspace: Path, expected: CheckProfile) -> None:
@@ -1148,17 +1196,25 @@ class CheckRunner:
             )
 
     def _prepare_root(self) -> None:
-        if self._root is not None or self._closed:
-            raise CheckError("a CheckRunner instance can only run once")
-        created = Path(
-            tempfile.mkdtemp(prefix="repo-agent-check-", dir=self._temp_parent)
-        ).absolute()
-        resolved = created.resolve(strict=True)
-        if resolved.parent != self._temp_parent or not _CHECK_ROOT_RE.fullmatch(resolved.name):
-            raise CheckError(f"refusing unexpected check root: {resolved}")
-        if _is_link_or_reparse(resolved):
-            raise CheckError("check root must not be a link or reparse point")
-        self._root = resolved
+        with self._resource_transition_lock:
+            with self._state_lock:
+                if self._root is not None or self._closed or self._close_requested:
+                    raise CheckError("a CheckRunner instance can only run once")
+            created = Path(
+                tempfile.mkdtemp(prefix="repo-agent-check-", dir=self._temp_parent)
+            ).absolute()
+            with self._state_lock:
+                self._root = created
+            resolved = created.resolve(strict=True)
+            if (
+                resolved.parent != self._temp_parent
+                or not _CHECK_ROOT_RE.fullmatch(resolved.name)
+            ):
+                raise CheckError(f"refusing unexpected check root: {resolved}")
+            if _is_link_or_reparse(resolved):
+                raise CheckError("check root must not be a link or reparse point")
+            with self._state_lock:
+                self._root = resolved
 
     def _create_base_snapshot(self, destination: Path, started: float) -> str:
         try:
@@ -1391,6 +1447,202 @@ class CheckRunner:
         self._require_remaining_time(started)
         return destination
 
+    def _create_dependency_volume(self, profile: CheckProfile, started: float) -> str:
+        with self._resource_transition_lock:
+            return self._create_dependency_volume_locked(profile, started)
+
+    def _create_dependency_volume_locked(
+        self, profile: CheckProfile, started: float
+    ) -> str:
+        self._require_not_closing()
+        volume_name = f"{self.container_name_prefix}-{self._run_id}-cache"
+        if not _VOLUME_NAME_RE.fullmatch(volume_name):
+            raise CheckError("generated Docker volume name is invalid")
+        with self._state_lock:
+            if self._dependency_volume_name is not None:
+                raise CheckError("dependency cache volume was already prepared")
+            if self._close_requested:
+                raise CheckError("check run was cancelled during cleanup")
+            self._dependency_volume_name = volume_name
+            self._dependency_volume_indeterminate = True
+        timeout = min(self.control_timeout_seconds, self._remaining_total_timeout(started))
+        if timeout <= 0:
+            self._require_remaining_time(started)
+        created = self._run_command(
+            (
+                "docker",
+                "volume",
+                "create",
+                "--driver",
+                "local",
+                "--opt",
+                _CACHE_VOLUME_OPTIONS[0],
+                "--opt",
+                _CACHE_VOLUME_OPTIONS[1],
+                "--opt",
+                _CACHE_VOLUME_OPTIONS[2],
+                "--label",
+                f"{_RUN_LABEL}={self._run_id}",
+                "--label",
+                f"{_RESOURCE_LABEL}={_CACHE_RESOURCE}",
+                volume_name,
+            ),
+            timeout_seconds=timeout,
+        )
+        recovery_deadline = time.monotonic() + self.control_timeout_seconds
+        ownership_deadline = min(
+            recovery_deadline,
+            started + self.total_timeout_seconds,
+        )
+        if created.timed_out:
+            self._cleanup_deadline = recovery_deadline
+            cleanup_error = self._recover_dependency_volume(
+                retry=True, deadline=recovery_deadline
+            )
+            raise CheckError(
+                _join_error("Docker dependency volume create timed out", cleanup_error)
+            )
+        if created.exit_code != 0 or created.output.strip() != volume_name:
+            cleanup_error = self._recover_dependency_volume(
+                retry=False, deadline=recovery_deadline
+            )
+            detail = (
+                f"Docker dependency volume create exited with code {created.exit_code}"
+                if created.exit_code != 0
+                else "Docker dependency volume create returned an unexpected name"
+            )
+            raise CheckError(_join_error(detail, cleanup_error))
+
+        state, inspect_error = self._inspect_dependency_volume(
+            volume_name, ownership_deadline
+        )
+        if state == "owned":
+            with self._state_lock:
+                if self._dependency_volume_name == volume_name:
+                    self._dependency_volume_indeterminate = False
+            self._create_dependency_anchor_locked(profile, volume_name, started)
+            return volume_name
+        if state == "unowned":
+            with self._state_lock:
+                self._dependency_volume_name = None
+                self._dependency_volume_indeterminate = False
+            raise CheckError(inspect_error or "dependency cache volume is not run-owned")
+
+        with self._state_lock:
+            self._dependency_volume_indeterminate = True
+        cleanup_error = self._recover_dependency_volume(
+            retry=state == "absent", deadline=recovery_deadline
+        )
+        raise CheckError(
+            _join_error(
+                inspect_error or "Docker dependency volume disappeared after creation",
+                cleanup_error,
+            )
+        )
+
+    def _create_dependency_anchor_locked(
+        self,
+        profile: CheckProfile,
+        dependency_volume: str,
+        started: float,
+    ) -> None:
+        container_name = (
+            f"{self.container_name_prefix}-{self._run_id}-cache-anchor"
+        )
+        if not _CONTAINER_NAME_RE.fullmatch(container_name):
+            raise CheckError("generated Docker cache anchor name is invalid")
+        create_argv = self._cache_anchor_create_argv(
+            profile, container_name, dependency_volume
+        )
+        with self._state_lock:
+            if self._close_requested:
+                raise CheckError("check run was cancelled during cleanup")
+            self._container_names[container_name] = 0
+            self._indeterminate_container_names.add(container_name)
+
+        create_timeout = min(
+            self.control_timeout_seconds,
+            self._remaining_total_timeout(started),
+        )
+        if create_timeout <= 0:
+            self._require_remaining_time(started)
+        created = self._run_command(
+            create_argv,
+            timeout_seconds=create_timeout,
+        )
+        if created.timed_out:
+            recovery_deadline = time.monotonic() + self.control_timeout_seconds
+            cleanup_error = self._recover_container_name(
+                container_name,
+                retry=True,
+                deadline=recovery_deadline,
+            )
+            raise CheckError(
+                _join_error("Docker cache anchor create timed out", cleanup_error)
+            )
+
+        with self._state_lock:
+            self._indeterminate_container_names.discard(container_name)
+        container_id = _container_id(created.output)
+        if created.exit_code != 0 or container_id is None:
+            cleanup_error = self._recover_container_name(container_name)
+            detail = (
+                f"Docker cache anchor create exited with code {created.exit_code}"
+                if created.exit_code != 0
+                else "Docker cache anchor create did not return one container ID"
+            )
+            raise CheckError(_join_error(detail, cleanup_error))
+
+        with self._state_lock:
+            self._container_ids[container_id] = container_name
+        start_timeout = min(
+            self.control_timeout_seconds,
+            self._remaining_total_timeout(started),
+        )
+        if start_timeout <= 0:
+            cleanup_error = self._remove_container(container_id)
+            raise CheckTimeoutError(
+                _join_error("Docker cache anchor start timed out", cleanup_error)
+            )
+        anchor_start = self._run_command(
+            ("docker", "container", "start", container_id),
+            timeout_seconds=start_timeout,
+        )
+        if anchor_start.timed_out or anchor_start.exit_code != 0:
+            cleanup_error = self._remove_container(container_id)
+            detail = (
+                "Docker cache anchor start timed out"
+                if anchor_start.timed_out
+                else (
+                    "Docker cache anchor start exited with code "
+                    f"{anchor_start.exit_code}"
+                )
+            )
+            raise CheckError(_join_error(detail, cleanup_error))
+
+        ownership_deadline = min(
+            time.monotonic() + self.control_timeout_seconds,
+            started + self.total_timeout_seconds,
+        )
+        state, ownership_error = self._inspect_dependency_volume(
+            dependency_volume, ownership_deadline
+        )
+        if state != "owned":
+            if state == "unowned":
+                with self._state_lock:
+                    if self._dependency_volume_name == dependency_volume:
+                        self._dependency_volume_name = None
+                        self._dependency_volume_indeterminate = False
+            elif state == "absent":
+                with self._state_lock:
+                    self._dependency_volume_indeterminate = True
+            cleanup_error = self._remove_container(container_id)
+            detail = ownership_error or (
+                "dependency cache volume disappeared while starting its anchor"
+            )
+            raise CheckError(_join_error(detail, cleanup_error))
+        self._require_not_closing()
+
     def _run_phase(
         self,
         profile: CheckProfile,
@@ -1400,7 +1652,7 @@ class CheckRunner:
         network: str,
         argv: tuple[str, ...],
         workspace: Path,
-        dependencies: Path,
+        dependencies: str,
         timeout_seconds: float,
     ) -> CheckPhaseResult:
         phase_started = time.monotonic()
@@ -1409,7 +1661,6 @@ class CheckRunner:
         container_name = f"{self.container_name_prefix}-{self._run_id}-{self._sequence}"
         if not _CONTAINER_NAME_RE.fullmatch(container_name):
             raise CheckError("generated Docker container name is invalid")
-        self._container_names[container_name] = self._sequence
         create_argv = self._container_create_argv(
             profile,
             container_name,
@@ -1420,23 +1671,13 @@ class CheckRunner:
         )
         container_id: str | None = None
         try:
-            create = self._run_command(
+            create, container_id, create_error = self._create_phase_container(
                 create_argv,
-                timeout_seconds=min(
-                    _CONTROL_TIMEOUT_SECONDS,
-                    self._deadline_remaining(phase_deadline),
-                ),
+                container_name=container_name,
+                dependency_volume=dependencies,
+                phase_deadline=phase_deadline,
             )
-            if create.timed_out:
-                self._indeterminate_container_names.add(container_name)
-                self._cleanup_deadline = (
-                    time.monotonic() + self.control_timeout_seconds
-                )
-                cleanup_error = self._recover_container_name(
-                    container_name,
-                    retry=True,
-                    deadline=self._cleanup_deadline,
-                )
+            if create_error is not None or container_id is None:
                 return _phase_result(
                     name,
                     kind,
@@ -1445,27 +1686,9 @@ class CheckRunner:
                     argv,
                     create,
                     phase_started,
-                    _join_error("Docker create timed out", cleanup_error),
+                    create_error or "Docker create did not return one container ID",
                 )
-            container_id = _container_id(create.output)
-            if create.exit_code != 0 or container_id is None:
-                cleanup_error = self._recover_container_name(container_name)
-                detail: str | None = (
-                    f"Docker create exited with code {create.exit_code}"
-                    if create.exit_code != 0
-                    else "Docker create did not return one container ID"
-                )
-                return _phase_result(
-                    name,
-                    kind,
-                    "setup_error",
-                    network,
-                    argv,
-                    create,
-                    phase_started,
-                    _join_error(detail, cleanup_error),
-                )
-            self._container_ids[container_id] = container_name
+            self._require_not_closing()
             start_timeout = self._deadline_remaining(phase_deadline)
             if start_timeout <= 0:
                 cleanup_error = self._remove_container(container_id)
@@ -1488,6 +1711,7 @@ class CheckRunner:
                 timeout_seconds=start_timeout,
             )
             cleanup_error = self._remove_container(container_id)
+            self._require_not_closing()
             if execution.timed_out:
                 return _phase_result(
                     name,
@@ -1546,9 +1770,134 @@ class CheckRunner:
                 _join_error(f"{type(exc).__name__}: {exc}", cleanup_error),
             )
 
+    def _create_phase_container(
+        self,
+        create_argv: tuple[str, ...],
+        *,
+        container_name: str,
+        dependency_volume: str,
+        phase_deadline: float,
+    ) -> tuple[CommandOutcome, str | None, str | None]:
+        with self._resource_transition_lock:
+            with self._state_lock:
+                if self._close_requested:
+                    raise CheckError("check run was cancelled during cleanup")
+                self._container_names[container_name] = self._sequence
+                self._indeterminate_container_names.add(container_name)
+            create = self._run_command(
+                create_argv,
+                timeout_seconds=min(
+                    self.control_timeout_seconds,
+                    self._deadline_remaining(phase_deadline),
+                ),
+            )
+            if create.timed_out:
+                self._cleanup_deadline = (
+                    time.monotonic() + self.control_timeout_seconds
+                )
+                cleanup_error = self._recover_container_name(
+                    container_name,
+                    retry=True,
+                    deadline=self._cleanup_deadline,
+                )
+                return create, None, _join_error(
+                    "Docker create timed out", cleanup_error
+                )
+
+            with self._state_lock:
+                self._indeterminate_container_names.discard(container_name)
+            container_id = _container_id(create.output)
+            if create.exit_code != 0 or container_id is None:
+                cleanup_error = self._recover_container_name(container_name)
+                detail = (
+                    f"Docker create exited with code {create.exit_code}"
+                    if create.exit_code != 0
+                    else "Docker create did not return one container ID"
+                )
+                return create, None, _join_error(detail, cleanup_error)
+
+            with self._state_lock:
+                self._container_ids[container_id] = container_name
+            ownership_deadline = min(
+                phase_deadline,
+                time.monotonic() + self.control_timeout_seconds,
+            )
+            state, ownership_error = self._inspect_dependency_volume(
+                dependency_volume, ownership_deadline
+            )
+            if state == "owned":
+                return create, container_id, None
+
+            if state == "unowned":
+                with self._state_lock:
+                    if self._dependency_volume_name == dependency_volume:
+                        self._dependency_volume_name = None
+                        self._dependency_volume_indeterminate = False
+            elif state == "absent":
+                with self._state_lock:
+                    self._dependency_volume_indeterminate = True
+            cleanup_error = self._remove_container(container_id)
+            detail = ownership_error or (
+                "dependency cache volume disappeared before container start"
+            )
+            return create, None, _join_error(detail, cleanup_error)
+
     @staticmethod
     def _deadline_remaining(deadline: float) -> float:
         return max(0.0, deadline - time.monotonic())
+
+    def _cache_anchor_create_argv(
+        self,
+        profile: CheckProfile,
+        name: str,
+        dependency_volume: str,
+    ) -> tuple[str, ...]:
+        if not _VOLUME_NAME_RE.fullmatch(dependency_volume):
+            raise CheckError("invalid dependency cache volume name")
+        policy = DEFAULT_POLICY
+        return (
+            "docker",
+            "container",
+            "create",
+            "--name",
+            name,
+            "--label",
+            f"{_RUN_LABEL}={self._run_id}",
+            "--label",
+            f"{_SEQUENCE_LABEL}=0",
+            "--init",
+            "--rm",
+            "--pull",
+            policy.pull,
+            "--restart",
+            policy.restart,
+            "--network",
+            "none",
+            "--read-only",
+            "--user",
+            policy.user,
+            "--cpus",
+            policy.cpus,
+            "--memory",
+            policy.memory,
+            "--memory-swap",
+            policy.memory_swap,
+            "--pids-limit",
+            str(policy.pids_limit),
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--log-driver",
+            policy.log_driver,
+            "--mount",
+            f"type=volume,source={dependency_volume},target=/cache",
+            "--entrypoint",
+            "/bin/sh",
+            profile.image,
+            "-c",
+            _CACHE_ANCHOR_ENTRYPOINT,
+        )
 
     def _container_create_argv(
         self,
@@ -1557,12 +1906,13 @@ class CheckRunner:
         network: str,
         argv: tuple[str, ...],
         workspace: Path,
-        dependencies: Path,
+        dependencies: str,
     ) -> tuple[str, ...]:
         workspace_source = str(workspace.resolve(strict=True))
-        dependency_source = str(dependencies.resolve(strict=True))
-        if "," in workspace_source or "," in dependency_source:
+        if "," in workspace_source:
             raise CheckPolicyError("Docker bind source paths containing commas are unsupported")
+        if not _VOLUME_NAME_RE.fullmatch(dependencies):
+            raise CheckError("invalid dependency cache volume name")
         policy = DEFAULT_POLICY
         args: list[str] = [
             "docker",
@@ -1603,10 +1953,12 @@ class CheckRunner:
                 policy.log_driver,
                 "--tmpfs",
                 policy.tmpfs,
+                "--tmpfs",
+                _WORKSPACE_TMPFS,
                 "--mount",
-                f"type=bind,source={workspace_source},target=/workspace",
+                f"type=bind,source={workspace_source},target=/source,readonly",
                 "--mount",
-                f"type=bind,source={dependency_source},target={profile.cache_target}",
+                f"type=volume,source={dependencies},target={profile.cache_target}",
                 "--workdir",
                 "/workspace",
                 "--env",
@@ -1620,8 +1972,18 @@ class CheckRunner:
             )
         )
         if profile.language == "python" and profile.bootstrap_required:
-            args.extend(("--env", "PYTHONPATH=/dependencies/python"))
-        args.extend(("--entrypoint", argv[0], profile.image, *argv[1:]))
+            args.extend(("--env", "PYTHONPATH=/cache/python"))
+        args.extend(
+            (
+                "--entrypoint",
+                "/bin/sh",
+                profile.image,
+                "-c",
+                _WORKSPACE_ENTRYPOINT,
+                "repo-agent-check",
+                *argv,
+            )
+        )
         return tuple(args)
 
     def _run_command(
@@ -1642,7 +2004,159 @@ class CheckRunner:
             timed_out=outcome.timed_out,
         )
 
+    def _inspect_dependency_volume(
+        self, name: str, deadline: float
+    ) -> tuple[Literal["owned", "absent", "unowned", "error"], str | None]:
+        with self._state_lock:
+            tracked_name = self._dependency_volume_name
+        if name != tracked_name or not _VOLUME_NAME_RE.fullmatch(name):
+            return "unowned", f"dependency cache volume is not owned by this run: {name!r}"
+        remaining = self._deadline_remaining(deadline)
+        if remaining <= 0:
+            return "error", "dependency cache volume inspection deadline expired"
+        format_value = (
+            f'{_VOLUME_INSPECT_PREFIX} {{{{.Name}}}} '
+            f'{{{{index .Labels "{_RUN_LABEL}"}}}} '
+            f'{{{{index .Labels "{_RESOURCE_LABEL}"}}}}'
+        )
+        try:
+            inspected = self._run_command(
+                (
+                    "docker",
+                    "volume",
+                    "inspect",
+                    "--format",
+                    format_value,
+                    name,
+                ),
+                timeout_seconds=remaining,
+            )
+        except (OSError, CheckError) as exc:
+            return "error", (
+                "dependency cache volume inspection failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        if inspected.timed_out:
+            return "error", "dependency cache volume inspection timed out"
+        if inspected.exit_code != 0:
+            normalized = inspected.output.casefold()
+            if "no such volume" in normalized or "no such object" in normalized:
+                return "absent", None
+            return "error", "dependency cache volume inspection failed"
+        pattern = re.compile(
+            rf"(?m)^[ \t]*{re.escape(_VOLUME_INSPECT_PREFIX)}[ \t]+"
+            r"([A-Za-z0-9][A-Za-z0-9_.-]{0,127})[ \t]+"
+            r"([0-9a-f]{32})[ \t]+([A-Za-z0-9_.-]+)[ \t]*$"
+        )
+        records = pattern.findall(inspected.output)
+        if len(records) != 1:
+            return "error", "dependency cache volume inspection returned invalid metadata"
+        found_name, run_id, resource = records[0]
+        if (
+            found_name != name
+            or run_id != self._run_id
+            or resource != _CACHE_RESOURCE
+        ):
+            return "unowned", (
+                f"refusing dependency cache volume with mismatched ownership: {name!r}"
+            )
+        return "owned", None
+
+    def _remove_owned_dependency_volume(
+        self, name: str, *, deadline: float
+    ) -> str | None:
+        remaining = self._deadline_remaining(deadline)
+        if remaining <= 0:
+            return f"dependency cache volume {name!r} cleanup deadline expired"
+        try:
+            removed = self._run_command(
+                ("docker", "volume", "rm", name),
+                timeout_seconds=remaining,
+            )
+        except (OSError, CheckError) as exc:
+            return f"dependency cache volume cleanup failed: {type(exc).__name__}: {exc}"
+        if removed.timed_out:
+            return f"dependency cache volume {name!r} cleanup timed out"
+        if removed.exit_code != 0:
+            normalized = removed.output.casefold()
+            if "no such volume" not in normalized and "no such object" not in normalized:
+                return (
+                    f"dependency cache volume {name!r} cleanup exited with code "
+                    f"{removed.exit_code}"
+                )
+        with self._state_lock:
+            self._dependency_volume_name = None
+            self._dependency_volume_indeterminate = False
+        return None
+
+    def _recover_dependency_volume(
+        self, *, retry: bool, deadline: float
+    ) -> str | None:
+        with self._cleanup_lock:
+            return self._recover_dependency_volume_locked(
+                retry=retry, deadline=deadline
+            )
+
+    def _recover_dependency_volume_locked(
+        self, *, retry: bool, deadline: float
+    ) -> str | None:
+        with self._state_lock:
+            name = self._dependency_volume_name
+        if name is None:
+            return None
+        delay = 0.0
+        last_error: str | None = None
+        while True:
+            remaining = self._deadline_remaining(deadline)
+            if remaining <= 0:
+                break
+            if delay:
+                sleep(min(delay, remaining))
+                if self._deadline_remaining(deadline) <= 0:
+                    break
+            state, error = self._inspect_dependency_volume(name, deadline)
+            if state == "owned":
+                removal_error = self._remove_owned_dependency_volume(
+                    name, deadline=deadline
+                )
+                if removal_error is None:
+                    return None
+                last_error = removal_error
+            if state == "unowned":
+                with self._state_lock:
+                    self._dependency_volume_name = None
+                    self._dependency_volume_indeterminate = False
+                return error
+            if state == "error":
+                last_error = error
+            if not retry:
+                if state == "absent":
+                    with self._state_lock:
+                        self._dependency_volume_name = None
+                        self._dependency_volume_indeterminate = False
+                    return None
+            delay = (
+                _RECOVERY_INITIAL_DELAY_SECONDS
+                if delay == 0
+                else min(_RECOVERY_MAX_DELAY_SECONDS, delay * 2)
+            )
+        return last_error or (
+            f"Docker dependency volume create remains indeterminate for {name!r}"
+        )
+
     def _recover_container_name(
+        self,
+        name: str,
+        retry: bool = False,
+        *,
+        deadline: float | None = None,
+    ) -> str | None:
+        with self._cleanup_lock:
+            return self._recover_container_name_locked(
+                name, retry=retry, deadline=deadline
+            )
+
+    def _recover_container_name_locked(
         self,
         name: str,
         retry: bool = False,
@@ -1658,7 +2172,7 @@ class CheckRunner:
             if remaining <= 0:
                 break
             if delay:
-                time.sleep(min(delay, remaining))
+                sleep(min(delay, remaining))
                 if self._deadline_remaining(recovery_deadline) <= 0:
                     break
             try:
@@ -1677,15 +2191,19 @@ class CheckRunner:
                         else min(_RECOVERY_MAX_DELAY_SECONDS, delay * 2)
                     )
                     continue
-                if name in self._indeterminate_container_names:
+                with self._state_lock:
+                    indeterminate = name in self._indeterminate_container_names
+                if indeterminate:
                     return (
                         "timed-out Docker create remains indeterminate for "
                         f"container {name!r}"
                     )
-                self._container_names.pop(name, None)
+                with self._state_lock:
+                    self._container_names.pop(name, None)
                 return None
             if container_id is not None:
-                self._container_ids[container_id] = name
+                with self._state_lock:
+                    self._container_ids[container_id] = name
                 return self._remove_container(
                     container_id, deadline=recovery_deadline
                 )
@@ -1694,7 +2212,8 @@ class CheckRunner:
     def _inspect_owned_container(
         self, name: str, deadline: float
     ) -> tuple[str | None, bool, str | None]:
-        sequence = self._container_names.get(name)
+        with self._state_lock:
+            sequence = self._container_names.get(name)
         if sequence is None:
             return None, False, f"container name is not owned by this run: {name!r}"
         format_value = (
@@ -1734,6 +2253,12 @@ class CheckRunner:
     def _remove_container(
         self, container_id: str | None, *, deadline: float | None = None
     ) -> str | None:
+        with self._cleanup_lock:
+            return self._remove_container_locked(container_id, deadline=deadline)
+
+    def _remove_container_locked(
+        self, container_id: str | None, *, deadline: float | None = None
+    ) -> str | None:
         if container_id is None or not _CONTAINER_ID_RE.fullmatch(container_id):
             return f"refusing invalid container ID: {container_id!r}"
         cleanup_deadline = deadline or (
@@ -1742,7 +2267,10 @@ class CheckRunner:
         remaining = self._deadline_remaining(cleanup_deadline)
         if remaining <= 0:
             return f"container {container_id} cleanup deadline expired"
-        name = self._container_ids.get(container_id)
+        with self._state_lock:
+            name = self._container_ids.get(container_id)
+        if name is None:
+            return None
         try:
             removed = self._run_command(
                 ("docker", "container", "rm", "--force", container_id),
@@ -1754,8 +2282,8 @@ class CheckRunner:
             return f"container {container_id} cleanup timed out"
         if removed.exit_code != 0 and "no such container" not in removed.output.casefold():
             return f"container {container_id} cleanup exited with code {removed.exit_code}"
-        self._container_ids.pop(container_id, None)
-        if name is not None:
+        with self._state_lock:
+            self._container_ids.pop(container_id, None)
             self._container_names.pop(name, None)
             self._indeterminate_container_names.discard(name)
         return None
@@ -1763,17 +2291,48 @@ class CheckRunner:
     def close(self) -> None:
         """Remove only containers and the temporary root owned by this runner."""
 
-        if self._closed:
-            return
+        with self._state_lock:
+            if self._closed:
+                return
+            self._close_requested = True
+            run_active = self._run_active
+        cleanup_deadline = time.monotonic() + self.control_timeout_seconds
+        first_error: CheckCleanupError | None = None
+        try:
+            with self._resource_transition_lock:
+                with self._cleanup_lock:
+                    self._close_inner(cleanup_deadline)
+        except CheckCleanupError as exc:
+            first_error = exc
+        if run_active:
+            remaining = self._deadline_remaining(cleanup_deadline)
+            if remaining <= 0 or not self._run_finished.wait(timeout=remaining):
+                detail = "check run remains active during cleanup"
+                if first_error is not None:
+                    detail = f"{first_error}; {detail}"
+                raise CheckCleanupError(detail)
+        try:
+            with self._resource_transition_lock:
+                with self._cleanup_lock:
+                    self._close_inner(cleanup_deadline)
+        except CheckCleanupError:
+            raise
+
+    def _close_inner(self, cleanup_deadline: float) -> None:
+        with self._state_lock:
+            if self._closed:
+                return
+            run_active = self._run_active
         errors: list[str] = []
-        cleanup_deadline = self._cleanup_deadline or (
-            time.monotonic() + self.control_timeout_seconds
-        )
-        for container_id in tuple(self._container_ids):
+        with self._state_lock:
+            container_ids = tuple(self._container_ids)
+        for container_id in container_ids:
             error = self._remove_container(container_id, deadline=cleanup_deadline)
             if error:
                 errors.append(error)
-        for name in tuple(self._container_names):
+        with self._state_lock:
+            container_names = tuple(self._container_names)
+        for name in container_names:
             try:
                 error = self._recover_container_name(
                     name, retry=True, deadline=cleanup_deadline
@@ -1782,8 +2341,26 @@ class CheckRunner:
                 error = f"exact container recovery failed: {type(exc).__name__}: {exc}"
             if error:
                 errors.append(error)
-        if not self._container_ids and not self._container_names and self._root is not None:
+        with self._state_lock:
+            containers_remain = bool(self._container_ids or self._container_names)
+            volume_indeterminate = self._dependency_volume_indeterminate
+        if not containers_remain:
+            try:
+                volume_error = self._recover_dependency_volume(
+                    retry=volume_indeterminate,
+                    deadline=cleanup_deadline,
+                )
+            except (OSError, CheckError) as exc:
+                volume_error = (
+                    "dependency cache volume cleanup failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            if volume_error:
+                errors.append(volume_error)
+        with self._state_lock:
+            containers_remain = bool(self._container_ids or self._container_names)
             root = self._root
+        if not run_active and not containers_remain and root is not None:
             if (
                 root.parent != self._temp_parent
                 or not _CHECK_ROOT_RE.fullmatch(root.name)
@@ -1793,14 +2370,21 @@ class CheckRunner:
             else:
                 try:
                     shutil.rmtree(root, onerror=_remove_readonly)
-                    self._root = None
+                    with self._state_lock:
+                        if self._root == root:
+                            self._root = None
                 except OSError as exc:
                     errors.append(f"check root cleanup failed: {exc}")
-        if self._container_ids or self._container_names:
-            errors.append("run-owned check containers remain")
+        with self._state_lock:
+            if self._container_ids or self._container_names:
+                errors.append("run-owned check containers remain")
+            if self._dependency_volume_name is not None:
+                errors.append("run-owned dependency cache volume remains")
         if errors:
             raise CheckCleanupError("; ".join(errors))
-        self._closed = True
+        if not run_active:
+            with self._state_lock:
+                self._closed = True
 
 
 def _visible_files(

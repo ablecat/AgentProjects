@@ -12,7 +12,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
-import time
+from time import sleep
 from dataclasses import dataclass
 from typing import Callable, Literal, Protocol, Sequence, TypeAlias, cast
 import uuid
@@ -841,7 +841,7 @@ class DockerSandbox:
 
         for delay in _RECOVERY_DELAYS:
             if delay:
-                time.sleep(delay)
+                sleep(delay)
             container_id, absent, error = self._inspect_owned_container(name)
             if error is not None:
                 return error
