@@ -157,7 +157,7 @@ class _DataDirectoryLease:
 
 def _lock_lease_file(stream: Any) -> None:
     if os.name == "nt":
-        import msvcrt
+        msvcrt: Any = importlib.import_module("msvcrt")
 
         msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
         return
@@ -170,7 +170,7 @@ def _lock_lease_file(stream: Any) -> None:
 def _unlock_lease_file(stream: Any) -> None:
     stream.seek(0)
     if os.name == "nt":
-        import msvcrt
+        msvcrt: Any = importlib.import_module("msvcrt")
 
         msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
         return

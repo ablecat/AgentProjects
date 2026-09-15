@@ -479,6 +479,8 @@ def _create_windows_job(process: subprocess.Popen[bytes]) -> int | None:
     import ctypes
     from ctypes import wintypes
 
+    ctypes_api: Any = ctypes
+
     class IO_COUNTERS(ctypes.Structure):
         _fields_ = [
             ("ReadOperationCount", ctypes.c_ulonglong),
@@ -512,7 +514,7 @@ def _create_windows_job(process: subprocess.Popen[bytes]) -> int | None:
             ("PeakJobMemoryUsed", ctypes.c_size_t),
         ]
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32 = ctypes_api.WinDLL("kernel32", use_last_error=True)
     create_job = kernel32.CreateJobObjectW
     create_job.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
     create_job.restype = wintypes.HANDLE
@@ -530,7 +532,7 @@ def _create_windows_job(process: subprocess.Popen[bytes]) -> int | None:
 
     job = create_job(None, None)
     if not job:
-        raise ctypes.WinError(ctypes.get_last_error())
+        raise ctypes_api.WinError(ctypes_api.get_last_error())
     job_value = int(job)
     information = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
     information.BasicLimitInformation.LimitFlags = 0x00002000
@@ -541,13 +543,13 @@ def _create_windows_job(process: subprocess.Popen[bytes]) -> int | None:
         ctypes.sizeof(information),
     )
     if not configured:
-        error = ctypes.get_last_error()
+        error = ctypes_api.get_last_error()
         _close_windows_handle(job_value)
-        raise ctypes.WinError(error)
+        raise ctypes_api.WinError(error)
     if not assign(job, wintypes.HANDLE(int(process_handle))):
-        error = ctypes.get_last_error()
+        error = ctypes_api.get_last_error()
         _close_windows_handle(job_value)
-        raise ctypes.WinError(error)
+        raise ctypes_api.WinError(error)
     return job_value
 
 
@@ -556,6 +558,8 @@ def _resume_windows_process(process_id: int) -> None:
         return
     import ctypes
     from ctypes import wintypes
+
+    ctypes_api: Any = ctypes
 
     class THREADENTRY32(ctypes.Structure):
         _fields_ = [
@@ -568,7 +572,7 @@ def _resume_windows_process(process_id: int) -> None:
             ("dwFlags", wintypes.DWORD),
         ]
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32 = ctypes_api.WinDLL("kernel32", use_last_error=True)
     create_snapshot = kernel32.CreateToolhelp32Snapshot
     create_snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
     create_snapshot.restype = wintypes.HANDLE
@@ -588,7 +592,7 @@ def _resume_windows_process(process_id: int) -> None:
     snapshot = create_snapshot(0x00000004, 0)
     invalid_handle = ctypes.c_void_p(-1).value
     if not snapshot or int(snapshot) == invalid_handle:
-        raise ctypes.WinError(ctypes.get_last_error())
+        raise ctypes_api.WinError(ctypes_api.get_last_error())
 
     resumed = 0
     try:
@@ -599,12 +603,12 @@ def _resume_windows_process(process_id: int) -> None:
             if entry.th32OwnerProcessID == process_id:
                 thread = open_thread(0x0002, False, entry.th32ThreadID)
                 if not thread:
-                    raise ctypes.WinError(ctypes.get_last_error())
+                    raise ctypes_api.WinError(ctypes_api.get_last_error())
                 thread_value = int(thread)
                 try:
                     previous_count = int(resume_thread(thread))
                     if previous_count == 0xFFFFFFFF:
-                        raise ctypes.WinError(ctypes.get_last_error())
+                        raise ctypes_api.WinError(ctypes_api.get_last_error())
                     resumed += 1
                 finally:
                     _close_windows_handle(thread_value)
@@ -622,12 +626,14 @@ def _terminate_windows_job(handle: int) -> None:
     import ctypes
     from ctypes import wintypes
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    ctypes_api: Any = ctypes
+
+    kernel32 = ctypes_api.WinDLL("kernel32", use_last_error=True)
     terminate = kernel32.TerminateJobObject
     terminate.argtypes = (wintypes.HANDLE, wintypes.UINT)
     terminate.restype = wintypes.BOOL
     if not terminate(wintypes.HANDLE(handle), 1):
-        raise ctypes.WinError(ctypes.get_last_error())
+        raise ctypes_api.WinError(ctypes_api.get_last_error())
 
 
 def _close_windows_handle(handle: int) -> None:
@@ -636,12 +642,14 @@ def _close_windows_handle(handle: int) -> None:
     import ctypes
     from ctypes import wintypes
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    ctypes_api: Any = ctypes
+
+    kernel32 = ctypes_api.WinDLL("kernel32", use_last_error=True)
     close_handle = kernel32.CloseHandle
     close_handle.argtypes = (wintypes.HANDLE,)
     close_handle.restype = wintypes.BOOL
     if not close_handle(wintypes.HANDLE(handle)):
-        raise ctypes.WinError(ctypes.get_last_error())
+        raise ctypes_api.WinError(ctypes_api.get_last_error())
 
 
 def _close_process_streams(process: subprocess.Popen[bytes]) -> None:

@@ -2795,9 +2795,9 @@ def _formal_shard_lock(output_dir: Path) -> Iterator[None]:
         stream.seek(0)
         try:
             if os.name == "nt":
-                import msvcrt
+                lock_msvcrt: Any = __import__("msvcrt")
 
-                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                lock_msvcrt.locking(stream.fileno(), lock_msvcrt.LK_NBLCK, 1)
             else:
                 fcntl_module: Any = __import__("fcntl")
                 fcntl_module.flock(
@@ -2815,9 +2815,11 @@ def _formal_shard_lock(output_dir: Path) -> Iterator[None]:
                 try:
                     stream.seek(0)
                     if os.name == "nt":
-                        import msvcrt
+                        unlock_msvcrt: Any = __import__("msvcrt")
 
-                        msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+                        unlock_msvcrt.locking(
+                            stream.fileno(), unlock_msvcrt.LK_UNLCK, 1
+                        )
                     else:
                         fcntl_module = __import__("fcntl")
                         fcntl_module.flock(stream.fileno(), fcntl_module.LOCK_UN)
