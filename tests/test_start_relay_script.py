@@ -45,7 +45,7 @@ def test_windows_launcher_targets_the_official_deepseek_api() -> None:
 @pytest.fixture
 def short_tmp_path() -> Path:
     path = Path(
-        tempfile.mkdtemp(prefix=".relay-eval-test-", dir=Path(__file__).parents[1])
+        tempfile.mkdtemp(prefix=".relay-eval-test-", dir=Path(__file__).parents[2])
     )
     try:
         yield path
