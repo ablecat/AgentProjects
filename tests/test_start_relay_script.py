@@ -291,13 +291,14 @@ def test_relay_formal_evaluation_command_is_fixed_and_isolated() -> None:
     start = script.index("function Invoke-RelayFormalEvaluation")
     end = script.index("function Assert-FormalEvaluationAcceptance", start)
     definition = script[start:end]
-    assert 'Join-Path $projectRoot "benchmarks"' in definition
-    assert '"evaluation-results\\formal-v1-regression-acceptance"' in definition
+    assert '"benchmarks\\tasks\\python\\bugfix"' in definition
+    assert '"repo-agent-py-formal-v1"' in definition
+    assert '"evaluation-results\\formal-v1-regression-acceptance"' not in definition
     assert '"--variant",\n            "full"' in definition
     assert '"--trial",\n            "1"' in definition
     assert '"--execute"' in definition
     assert '"--allow-remote-model"' in definition
-    assert '"--allow-bootstrap"' in definition
+    assert '"--allow-bootstrap"' not in definition
     assert '"--task-timeout-seconds",\n            "1200"' in definition
     assert 'Assert-FormalEvaluationAcceptance' in definition
     assert '"--task-id"' not in definition
@@ -319,7 +320,9 @@ def test_relay_evaluation_helpers_use_real_runner_summary_layout(
     project_root = short_tmp_path / "project"
     script_directory = project_root / "scripts"
     development_dir = project_root / "benchmarks" / "tasks" / "python" / "development"
+    formal_dir = project_root / "benchmarks" / "tasks" / "python" / "bugfix"
     development_dir.mkdir(parents=True)
+    formal_dir.mkdir(parents=True)
     script_directory.mkdir()
     argument_log = short_tmp_path / "evaluation-arguments.jsonl"
     fake_evaluator = short_tmp_path / "fake-evaluator.py"
@@ -346,7 +349,7 @@ is_development = benchmark_root.name == "development"
 suite_id = (
     "repo-agent-python-development-v1"
     if is_development
-    else "repo-agent-python-java-day3-v1"
+    else "repo-agent-python-bugfix-v1"
 )
 if is_development:
     tasks = [
@@ -357,6 +360,10 @@ if is_development:
             "model": model,
             "language": "python",
             "budget_passed": True,
+            "agent": {
+                "timed_out": False,
+                "usage": {"complete": True},
+            },
         }
         for index in range(1, 5)
     ]
@@ -369,16 +376,17 @@ if is_development:
         "task_count": 4,
         "solved_task_count": 3,
         "actionable_tool_error_rate": 0.0,
+        "tokens": {"complete": True},
         "tasks": tasks,
     }
 else:
     tasks = [
         {
-            "task_id": f"{language}-bugfix-{index:03d}",
+            "task_id": f"py-bugfix-{index:03d}",
             "status": "completed",
             "solved": index <= 4,
             "model": model,
-            "language": "python" if language == "py" else "java",
+            "language": "python",
             "budget_passed": True,
             "failure_category": None,
             "agent": {
@@ -386,7 +394,6 @@ else:
                 "usage": {"complete": True, "total_tokens": 1000},
             },
         }
-        for language in ("py", "java")
         for index in range(1, 7)
     ]
     report = {
@@ -395,12 +402,11 @@ else:
         "variant": "full",
         "trial": 1,
         "model": model,
-        "task_count": 12,
-        "completed_task_count": 12,
-        "solved_task_count": 8,
+        "task_count": 6,
+        "completed_task_count": 6,
+        "solved_task_count": 4,
         "language_success": {
             "python": {"tasks": 6, "solved": 4},
-            "java": {"tasks": 6, "solved": 4},
         },
         "tokens": {"complete": True},
         "latency_ms": {"p95": 480000},
@@ -452,13 +458,8 @@ Invoke-RelayFormalEvaluation -PythonInvocation $invocation
     development_runs = list(
         (project_root / "evaluation-results" / "development-v1").iterdir()
     )
-    formal_runs = list(
-        (
-            project_root
-            / "evaluation-results"
-            / "formal-v1-regression-acceptance"
-        ).iterdir()
-    )
+    formal_root = project_root.parent / "repo-agent-py-formal-v1"
+    formal_runs = list(formal_root.iterdir())
     assert len(development_runs) == 1
     assert len(formal_runs) == 1
     assert (
@@ -470,7 +471,7 @@ Invoke-RelayFormalEvaluation -PythonInvocation $invocation
     ).is_file()
     assert (
         formal_runs[0]
-        / "repo-agent-python-java-day3-v1"
+        / "repo-agent-python-bugfix-v1"
         / "full"
         / "trial-1"
         / "summary.json"
@@ -481,11 +482,23 @@ Invoke-RelayFormalEvaluation -PythonInvocation $invocation
     ]
     assert len(invocations) == 2
     development_arguments, formal_arguments = invocations
+    formal_output = Path(
+        formal_arguments[formal_arguments.index("--output-dir") + 1]
+    )
+    assert formal_output.parent == formal_root
+    assert formal_output.parent != (
+        project_root
+        / "evaluation-results"
+        / "formal-v1-regression-acceptance"
+    )
+    # Keep enough room for the fixed suite/trial/task/scoring hierarchy on
+    # Windows, where legacy MAX_PATH failures surface as WinError 206.
+    assert len(str(formal_output)) <= 128
     assert "--trial" not in development_arguments
     assert "--allow-bootstrap" not in development_arguments
     assert "--trial" in formal_arguments
     assert formal_arguments[formal_arguments.index("--trial") + 1] == "1"
-    assert "--allow-bootstrap" in formal_arguments
+    assert "--allow-bootstrap" not in formal_arguments
     for arguments in invocations:
         assert "--variant" in arguments
         assert arguments[arguments.index("--variant") + 1] == "full"
@@ -521,6 +534,7 @@ def test_relay_evaluation_acceptance_gate(
         "task_count": 4,
         "solved_task_count": 3,
         "actionable_tool_error_rate": 0.05,
+        "tokens": {"complete": True},
         "tasks": [
             {
                 "task_id": f"py-development-{index:03d}",
@@ -529,6 +543,10 @@ def test_relay_evaluation_acceptance_gate(
                 "model": "fake-model",
                 "language": "python",
                 "budget_passed": True,
+                "agent": {
+                    "timed_out": False,
+                    "usage": {"complete": True},
+                },
             }
             for index in range(1, 5)
         ],
@@ -605,6 +623,71 @@ def test_relay_evaluation_acceptance_gate(
     assert rejected.returncode != 0
     assert "task rows do not match its aggregate totals" in rejected.stderr
 
+    incomplete_reports: list[dict[str, object]] = []
+
+    missing_summary_usage = json.loads(json.dumps(passing))
+    del missing_summary_usage["tokens"]
+    incomplete_reports.append(missing_summary_usage)
+
+    false_summary_usage = json.loads(json.dumps(passing))
+    false_summary_usage["tokens"]["complete"] = False
+    incomplete_reports.append(false_summary_usage)
+
+    missing_task_usage = json.loads(json.dumps(passing))
+    del missing_task_usage["tasks"][0]["agent"]["usage"]["complete"]
+    incomplete_reports.append(missing_task_usage)
+
+    false_task_usage = json.loads(json.dumps(passing))
+    false_task_usage["tasks"][0]["agent"]["usage"]["complete"] = False
+    incomplete_reports.append(false_task_usage)
+
+    for incomplete in incomplete_reports:
+        summary_path.write_text(json.dumps(incomplete), encoding="utf-8")
+        rejected = subprocess.run(
+            [
+                powershell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                command,
+            ],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        assert rejected.returncode != 0
+        assert "token usage is incomplete" in rejected.stderr
+
+    missing_timeout = json.loads(json.dumps(passing))
+    del missing_timeout["tasks"][0]["agent"]["timed_out"]
+    timed_out = json.loads(json.dumps(passing))
+    timed_out["tasks"][0]["agent"]["timed_out"] = True
+
+    for invalid_timeout in (missing_timeout, timed_out):
+        summary_path.write_text(json.dumps(invalid_timeout), encoding="utf-8")
+        rejected = subprocess.run(
+            [
+                powershell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                command,
+            ],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        assert rejected.returncode != 0
+        assert "timed out or timeout status is missing" in rejected.stderr
+
 
 @pytest.mark.parametrize("powershell", _powershells() or (None,))
 def test_relay_formal_evaluation_acceptance_gate(
@@ -617,7 +700,7 @@ def test_relay_formal_evaluation_acceptance_gate(
     script_path = Path(__file__).parents[1] / "scripts" / "start-relay.ps1"
     summary_path = (
         tmp_path
-        / "repo-agent-python-java-day3-v1"
+        / "repo-agent-python-bugfix-v1"
         / "full"
         / "trial-1"
         / "summary.json"
@@ -625,11 +708,11 @@ def test_relay_formal_evaluation_acceptance_gate(
     summary_path.parent.mkdir(parents=True)
     tasks = [
         {
-            "task_id": f"{language}-bugfix-{index:03d}",
+            "task_id": f"py-bugfix-{index:03d}",
             "status": "completed",
             "solved": index <= 4,
             "model": "fake-model",
-            "language": "python" if language == "py" else "java",
+            "language": "python",
             "budget_passed": True,
             "failure_category": None,
             "agent": {
@@ -637,21 +720,19 @@ def test_relay_formal_evaluation_acceptance_gate(
                 "usage": {"complete": True, "total_tokens": 30000},
             },
         }
-        for language in ("py", "java")
         for index in range(1, 7)
     ]
     passing = {
         "status": "completed",
-        "suite_id": "repo-agent-python-java-day3-v1",
+        "suite_id": "repo-agent-python-bugfix-v1",
         "variant": "full",
         "trial": 1,
         "model": "fake-model",
-        "task_count": 12,
-        "completed_task_count": 12,
-        "solved_task_count": 8,
+        "task_count": 6,
+        "completed_task_count": 6,
+        "solved_task_count": 4,
         "language_success": {
             "python": {"tasks": 6, "solved": 4},
-            "java": {"tasks": 6, "solved": 4},
         },
         "tokens": {"complete": True},
         "latency_ms": {"p95": 480000},
@@ -688,47 +769,20 @@ def test_relay_formal_evaluation_acceptance_gate(
     assert "Formal acceptance passed" in completed.stdout
 
     too_few_tasks = [dict(task) for task in tasks]
-    too_few_tasks[9]["solved"] = False
+    too_few_tasks[3]["solved"] = False
     too_few = {
         **passing,
-        "solved_task_count": 7,
+        "solved_task_count": 3,
         "language_success": {
-            "python": {"tasks": 6, "solved": 4},
-            "java": {"tasks": 6, "solved": 3},
+            "python": {"tasks": 6, "solved": 3},
         },
         "tasks": too_few_tasks,
     }
     rejected = invoke(too_few)
     assert rejected.returncode != 0
-    assert "fewer than 8 of 12 tasks solved" in rejected.stderr
+    assert "fewer than 4 of 6 tasks solved" in rejected.stderr
 
-    language_miss_tasks = [
-        {
-            **task,
-            "solved": (
-                task["task_id"].startswith("py-")
-                and int(task["task_id"].rsplit("-", 1)[1]) <= 3
-            )
-            or (
-                task["task_id"].startswith("java-")
-                and int(task["task_id"].rsplit("-", 1)[1]) <= 5
-            ),
-        }
-        for task in tasks
-    ]
-    language_miss = {
-        **passing,
-        "language_success": {
-            "python": {"tasks": 6, "solved": 3},
-            "java": {"tasks": 6, "solved": 5},
-        },
-        "tasks": language_miss_tasks,
-    }
-    rejected = invoke(language_miss)
-    assert rejected.returncode != 0
-    assert "fewer than 4 of 6 Python tasks solved" in rejected.stderr
-
-    inconsistent = {**passing, "solved_task_count": 9}
+    inconsistent = {**passing, "solved_task_count": 5}
     rejected = invoke(inconsistent)
     assert rejected.returncode != 0
     assert "task rows do not match its aggregate totals" in rejected.stderr

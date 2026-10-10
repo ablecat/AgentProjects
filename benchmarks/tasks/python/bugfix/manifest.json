@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "suite_id": "repo-agent-python-bugfix-v1",
+  "formal_evaluation": true,
+  "languages": ["python"],
+  "tasks": [
+    {
+      "id": "py-bugfix-001",
+      "path": "trailing-separator",
+      "sha256": "9ec1bd6935ebe59e531b09e143f7e4faa766b08006ce22848ec2d79ac37b4f1c"
+    },
+    {
+      "id": "py-bugfix-002",
+      "path": "end-offset",
+      "sha256": "22775f9cc5500d7ec5f2a25e265292a666456626c15ac4c4985814988a02e898"
+    },
+    {
+      "id": "py-bugfix-003",
+      "path": "shared-defaults",
+      "sha256": "d5a424bd428571464df02e649d87674c448f701b5587ea05975bbc58e96b1727"
+    },
+    {
+      "id": "py-bugfix-004",
+      "path": "json-error-boundary",
+      "sha256": "417243d18cbfaf03cca716445c147b22f4f369bfd1f190eb05d0957d61a42928"
+    },
+    {
+      "id": "py-bugfix-005",
+      "path": "boolean-env",
+      "sha256": "911761278619a7291e184c2998f92f9b6976e2718224ce6c9f8cae7cc180dd58"
+    },
+    {
+      "id": "py-bugfix-006",
+      "path": "casefold-dedupe",
+      "sha256": "4d58404be85738b9ef1e188eaa40fc6ed15b6557b7bdb89add5db9a76eba44bc"
+    }
+  ]
+}

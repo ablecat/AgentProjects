@@ -1,7 +1,8 @@
-"""Exercise the Day 3 check CLI with real hardened Docker containers."""
+"""Exercise the Day 3 Python check CLI with real hardened Docker containers."""
 
 from __future__ import annotations
 
+import argparse
 from collections import Counter
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
@@ -14,6 +15,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from typing import Sequence
 import uuid
 
 
@@ -33,6 +35,7 @@ from repo_agent.checks import (  # noqa: E402
     _CACHE_ANCHOR_ENTRYPOINT,
     _CACHE_RESOURCE,
     _CACHE_VOLUME_OPTIONS,
+    _MAVEN_TMPFS,
     _RESOURCE_LABEL,
     _RUN_LABEL,
     _SEQUENCE_LABEL,
@@ -72,7 +75,9 @@ class RecordingRunner:
         )
 
 
-def main() -> int:
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parse_args(argv)
+    include_legacy_maven = args.include_legacy_maven
     report: dict[str, object] = {
         "status": "failed",
         "exit_code": EXIT_RUNTIME_ERROR,
@@ -84,6 +89,7 @@ def main() -> int:
             "volumes_removed": False,
         },
         "error": None,
+        "include_legacy_maven": include_legacy_maven,
     }
     checks: list[dict[str, object]] = report["checks"]  # type: ignore[assignment]
     token = uuid.uuid4().hex[:8]
@@ -99,11 +105,9 @@ def main() -> int:
             tempfile.mkdtemp(prefix="day3-smoke-", dir=TEMP_PARENT)
         ).resolve(strict=True)
         python_repo = temp_root / "python-repo"
-        maven_repo = temp_root / "maven-repo"
         runner_temp = temp_root / "check-runs"
         runner_temp.mkdir()
         _create_python_repo(python_repo)
-        _create_maven_repo(maven_repo)
 
         python_blocked_runner = RecordingRunner()
         runners.append(python_blocked_runner)
@@ -131,48 +135,22 @@ def main() -> int:
         )
         report_runs["python_with_bootstrap"] = _run_summary(python_run)
 
-        blocked_runner = RecordingRunner()
-        runners.append(blocked_runner)
-        blocked_run = _invoke_check_cli(
-            maven_repo,
-            allow_bootstrap=False,
-            runner=blocked_runner,
-            prefix=f"{common_prefix}-blocked",
-            temp_parent=runner_temp,
-        )
-        report_runs["maven_without_bootstrap"] = _run_summary(blocked_run)
-
-        maven_runner = RecordingRunner()
-        runners.append(maven_runner)
-        maven_run = _invoke_check_cli(
-            maven_repo,
-            allow_bootstrap=True,
-            runner=maven_runner,
-            prefix=f"{common_prefix}-mvn",
-            temp_parent=runner_temp,
-        )
-        report_runs["maven_with_bootstrap"] = _run_summary(maven_run)
-
         python_payload = python_run[1]
         python_blocked_payload = python_blocked_run[1]
-        blocked_payload = blocked_run[1]
-        maven_payload = maven_run[1]
         python_creates = _create_commands(python_runner.commands)
         python_blocked_creates = _create_commands(python_blocked_runner.commands)
-        blocked_creates = _create_commands(blocked_runner.commands)
-        maven_creates = _create_commands(maven_runner.commands)
         python_anchor_creates = _anchor_create_commands(python_runner.commands)
         python_blocked_anchor_creates = _anchor_create_commands(
             python_blocked_runner.commands
         )
-        blocked_anchor_creates = _anchor_create_commands(blocked_runner.commands)
-        maven_anchor_creates = _anchor_create_commands(maven_runner.commands)
         python_volume_creates = _volume_create_commands(python_runner.commands)
         python_blocked_volume_creates = _volume_create_commands(
             python_blocked_runner.commands
         )
-        blocked_volume_creates = _volume_create_commands(blocked_runner.commands)
-        maven_volume_creates = _volume_create_commands(maven_runner.commands)
+        maven_creates: list[tuple[str, ...]] = []
+        maven_anchor_creates: list[tuple[str, ...]] = []
+        maven_volume_creates: list[tuple[str, ...]] = []
+        maven_runner: RecordingRunner | None = None
 
         _check(
             checks,
@@ -223,50 +201,88 @@ def main() -> int:
             and _create_argvs_match_phases(python_creates, python_payload),
             "Python pip --target bootstrap uses bridge; the shared target is reused offline",
         )
-        _check(
-            checks,
-            "maven_requires_explicit_bootstrap",
-            blocked_run[0] == 1
-            and blocked_payload.get("status") == "bootstrap_required"
-            and _nested(blocked_payload, "profile", "id") == "maven-test"
-            and blocked_payload.get("phases") == []
-            and not blocked_creates
-            and not blocked_anchor_creates
-            and not blocked_volume_creates,
-            _failure_detail(blocked_run),
-        )
-        _check(
-            checks,
-            "maven_profile_detected",
-            maven_run[0] == 0
-            and maven_payload.get("status") == "passed"
-            and _nested(maven_payload, "profile", "id") == "maven-test"
-            and _nested(maven_payload, "profile", "language") == "java"
-            and _nested(maven_payload, "profile", "java_release") == 17,
-            _failure_detail(maven_run),
-        )
-        _check(
-            checks,
-            "bootstrap_and_verify_networks_are_separated",
-            _phase_networks(maven_payload)
-            == [
-                ("bootstrap", "bridge"),
-                ("bootstrap", "bridge"),
-                ("bootstrap", "bridge"),
-                ("bootstrap", "bridge"),
-                ("verify", "none"),
-            ]
-            and _maven_create_networks_are_separated(maven_creates)
-            and _maven_create_argvs_match_phases(maven_creates, maven_payload),
-            "all Maven bootstrap attempts use bridge; the sole verify uses network=none",
-        )
-        _check(
-            checks,
-            "maven_verify_is_offline",
-            _verify_argv(maven_payload)[:1] == ["mvn"]
-            and "--offline" in _verify_argv(maven_payload),
-            "Maven verification command includes --offline",
-        )
+        if include_legacy_maven:
+            maven_repo = temp_root / "maven-repo"
+            _create_maven_repo(maven_repo)
+            blocked_runner = RecordingRunner()
+            runners.append(blocked_runner)
+            blocked_run = _invoke_check_cli(
+                maven_repo,
+                allow_bootstrap=False,
+                runner=blocked_runner,
+                prefix=f"{common_prefix}-blocked",
+                temp_parent=runner_temp,
+            )
+            report_runs["maven_without_bootstrap"] = _run_summary(blocked_run)
+
+            maven_runner = RecordingRunner()
+            runners.append(maven_runner)
+            maven_run = _invoke_check_cli(
+                maven_repo,
+                allow_bootstrap=True,
+                runner=maven_runner,
+                prefix=f"{common_prefix}-mvn",
+                temp_parent=runner_temp,
+            )
+            report_runs["maven_with_bootstrap"] = _run_summary(maven_run)
+
+            blocked_payload = blocked_run[1]
+            maven_payload = maven_run[1]
+            blocked_creates = _create_commands(blocked_runner.commands)
+            maven_creates = _create_commands(maven_runner.commands)
+            blocked_anchor_creates = _anchor_create_commands(
+                blocked_runner.commands
+            )
+            maven_anchor_creates = _anchor_create_commands(maven_runner.commands)
+            blocked_volume_creates = _volume_create_commands(
+                blocked_runner.commands
+            )
+            maven_volume_creates = _volume_create_commands(maven_runner.commands)
+
+            _check(
+                checks,
+                "maven_requires_explicit_bootstrap",
+                blocked_run[0] == 1
+                and blocked_payload.get("status") == "bootstrap_required"
+                and _nested(blocked_payload, "profile", "id") == "maven-test"
+                and blocked_payload.get("phases") == []
+                and not blocked_creates
+                and not blocked_anchor_creates
+                and not blocked_volume_creates,
+                _failure_detail(blocked_run),
+            )
+            _check(
+                checks,
+                "maven_profile_detected",
+                maven_run[0] == 0
+                and maven_payload.get("status") == "passed"
+                and _nested(maven_payload, "profile", "id") == "maven-test"
+                and _nested(maven_payload, "profile", "language") == "java"
+                and _nested(maven_payload, "profile", "java_release") == 17,
+                _failure_detail(maven_run),
+            )
+            _check(
+                checks,
+                "bootstrap_and_verify_networks_are_separated",
+                _phase_networks(maven_payload)
+                == [
+                    ("bootstrap", "bridge"),
+                    ("bootstrap", "bridge"),
+                    ("bootstrap", "bridge"),
+                    ("bootstrap", "bridge"),
+                    ("verify", "none"),
+                ]
+                and _maven_create_networks_are_separated(maven_creates)
+                and _maven_create_argvs_match_phases(maven_creates, maven_payload),
+                "all Maven bootstrap attempts use bridge; the sole verify uses network=none",
+            )
+            _check(
+                checks,
+                "maven_verify_is_offline",
+                _verify_argv(maven_payload)[:1] == ["mvn"]
+                and "--offline" in _verify_argv(maven_payload),
+                "Maven verification command includes --offline",
+            )
         all_creates = python_creates + maven_creates
         all_anchor_creates = python_anchor_creates + maven_anchor_creates
         python_volume_names = {
@@ -285,16 +301,22 @@ def main() -> int:
             checks,
             "dependency_volumes_are_run_scoped",
             len(python_volume_names) == 1
-            and len(maven_volume_names) == 1
             and "" not in python_volume_names
-            and "" not in maven_volume_names
             and python_volume_names == python_created_volumes
-            and maven_volume_names == maven_created_volumes
-            and python_volume_names.isdisjoint(maven_volume_names)
             and len(python_volume_creates) == 1
-            and len(maven_volume_creates) == 1
             and _runner_dependency_volume_contract(python_runner.commands)
-            and _runner_dependency_volume_contract(maven_runner.commands)
+            and (
+                not include_legacy_maven
+                or (
+                    len(maven_volume_names) == 1
+                    and "" not in maven_volume_names
+                    and maven_volume_names == maven_created_volumes
+                    and python_volume_names.isdisjoint(maven_volume_names)
+                    and len(maven_volume_creates) == 1
+                    and maven_runner is not None
+                    and _runner_dependency_volume_contract(maven_runner.commands)
+                )
+            )
             and all(
                 _is_hardened_volume_create(command)
                 for command in python_volume_creates + maven_volume_creates
@@ -305,7 +327,7 @@ def main() -> int:
             checks,
             "docker_hardening_applied",
             bool(all_creates)
-            and len(all_anchor_creates) == 2
+            and len(all_anchor_creates) == 1 + int(include_legacy_maven)
             and all(_is_hardened(command) for command in all_creates)
             and all(
                 _is_hardened_anchor(command) for command in all_anchor_creates
@@ -375,7 +397,7 @@ def main() -> int:
             checks,
             "temporary_fixtures_removed",
             fixtures_removed,
-            "temporary Python and Maven repositories were removed",
+            "all temporary smoke repositories were removed",
         )
         cleanup_failed = (
             not containers_removed or not volumes_removed or not fixtures_removed
@@ -394,6 +416,18 @@ def main() -> int:
     report["exit_code"] = exit_code
     print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
     return exit_code
+
+
+def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run the Day 3 smoke checks for active repository runtimes."
+    )
+    parser.add_argument(
+        "--include-legacy-maven",
+        action="store_true",
+        help="also exercise the legacy Maven check profile",
+    )
+    return parser.parse_args(argv)
 
 
 def _invoke_check_cli(
@@ -1050,6 +1084,11 @@ def _is_hardened(command: tuple[str, ...]) -> bool:
     expected_environment = set(required_environment)
     if payload[0] == "python":
         expected_environment.add("PYTHONPATH=/cache/python")
+    expected_tmpfs = (
+        _MAVEN_TMPFS
+        if payload[0] == "mvn"
+        else "/tmp:rw,nosuid,nodev,size=256m,mode=1777"
+    )
     exact_option_keys = set(required_options) | {
         "--name",
         "--label",
@@ -1064,13 +1103,7 @@ def _is_hardened(command: tuple[str, ...]) -> bool:
         and values_ok
         and options.get("--network") in (["bridge"], ["none"])
         and Counter(options.get("--label", [])) == expected_labels
-        and Counter(tmpfs)
-        == Counter(
-            {
-                "/tmp:rw,nosuid,nodev,size=256m,mode=1777": 1,
-                _WORKSPACE_TMPFS: 1,
-            }
-        )
+        and Counter(tmpfs) == Counter({expected_tmpfs: 1, _WORKSPACE_TMPFS: 1})
         and len(mounts) == 2
         and source_ok
         and cache_ok

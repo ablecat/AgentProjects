@@ -31,16 +31,15 @@ def clean_python_repo(tmp_path: Path) -> Path:
     repo = tmp_path / "repository"
     repo.mkdir()
     _git(repo, "init", "--quiet")
+    _git(repo, "config", "core.autocrlf", "false")
     _git(repo, "config", "user.name", "Workflow Test")
     _git(repo, "config", "user.email", "workflow@example.invalid")
-    (repo / "pyproject.toml").write_text(
-        "[project]\nname='fixture'\nversion='0.1.0'\nrequires-python='>=3.11'\n",
-        encoding="utf-8",
+    (repo / "pyproject.toml").write_bytes(
+        b"[project]\nname='fixture'\nversion='0.1.0'\nrequires-python='>=3.11'\n"
     )
-    (repo / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
-    (repo / "test_app.py").write_text(
-        "def test_value():\n    from app import VALUE\n    assert VALUE == 1\n",
-        encoding="utf-8",
+    (repo / "app.py").write_bytes(b"VALUE = 1\n")
+    (repo / "test_app.py").write_bytes(
+        b"def test_value():\n    from app import VALUE\n    assert VALUE == 1\n"
     )
     _git(repo, "add", ".")
     _git(repo, "commit", "--quiet", "-m", "fixture")
@@ -50,6 +49,7 @@ def clean_python_repo(tmp_path: Path) -> Path:
 class FakeSandbox:
     def __init__(self, repo_path, **kwargs) -> None:
         self.repo_path = repo_path
+        self.snapshot_path = Path(repo_path)
         self.kwargs = kwargs
         self.patch = ""
         self.workspace_revision = 0
@@ -151,19 +151,23 @@ class ScriptedProvider:
                 {"approved": True, "summary": "Patch is focused", "risks": []},
             )
         if not results:
-            patch = (
-                "diff --git a/app.py b/app.py\n"
-                "--- a/app.py\n"
-                "+++ b/app.py\n"
-                "@@ -1 +1 @@\n"
-                "-VALUE = 1\n"
-                "+VALUE = 2\n"
-            )
-            return ToolCall("patch", "apply_patch", {"unified_diff": patch})
+            return ToolCall("read", "read_files", {"paths": ["app.py", "test_app.py"]})
         return ToolCall(
-            "finish",
-            "finish",
-            {"summary": "Fixed value handling", "risks": []},
+            "write",
+            "write_files",
+            {
+                "files": [
+                    {"path": "app.py", "content": "VALUE = 2\n"},
+                    {
+                        "path": "tests/test_value_regression.py",
+                        "content": (
+                            "def test_value_regression():\n"
+                            "    from app import VALUE\n"
+                            "    assert VALUE == 2\n"
+                        ),
+                    },
+                ]
+            },
         )
 
 

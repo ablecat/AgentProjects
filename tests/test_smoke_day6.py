@@ -16,6 +16,20 @@ smoke_day6 = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(smoke_day6)
 
 
+def test_runtime_images_default_to_python_and_keep_maven_as_opt_in() -> None:
+    assert smoke_day6._selected_images(False) == (
+        ("python", smoke_day6.PYTHON_IMAGE),
+    )
+    assert smoke_day6._selected_images(True) == (
+        ("python", smoke_day6.PYTHON_IMAGE),
+        ("maven", smoke_day6.MAVEN_IMAGE),
+    )
+    assert not smoke_day6._parse_args([]).include_legacy_maven
+    assert smoke_day6._parse_args(
+        ["--include-legacy-maven"]
+    ).include_legacy_maven
+
+
 def _option_values(command: tuple[str, ...], option: str) -> list[str]:
     return [
         command[index + 1]

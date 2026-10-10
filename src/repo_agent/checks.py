@@ -52,6 +52,10 @@ _CACHE_RESOURCE = "dependencies"
 _WORKSPACE_TMPFS = (
     "/workspace:rw,nosuid,nodev,size=2g,mode=0700,uid=10001,gid=10001"
 )
+# Docker Desktop adds ``noexec`` to implicit tmpfs mounts. Maven 3.9's Jansi
+# extracts a small native library into /tmp during bootstrap, so Java check
+# containers explicitly opt into exec only for this bounded, isolated tmpfs.
+_MAVEN_TMPFS = "/tmp:rw,exec,nosuid,nodev,size=256m,mode=1777"
 _CACHE_VOLUME_OPTIONS = (
     "type=tmpfs",
     "device=tmpfs",
@@ -377,6 +381,8 @@ def _maven_profile(pom: Path) -> CheckProfile:
         )
     common = (
         "mvn",
+        "-T",
+        "4",
         "--batch-mode",
         "--no-transfer-progress",
         "-Dstyle.color=never",
@@ -391,7 +397,8 @@ def _maven_profile(pom: Path) -> CheckProfile:
             common
             + (
                 "-DskipTests",
-                "org.apache.maven.plugins:maven-dependency-plugin:3.8.1:go-offline",
+                "process-test-classes",
+                "org.apache.maven.plugins:maven-surefire-plugin:3.5.2:help",
             ),
             common
             + (
@@ -1914,6 +1921,7 @@ class CheckRunner:
         if not _VOLUME_NAME_RE.fullmatch(dependencies):
             raise CheckError("invalid dependency cache volume name")
         policy = DEFAULT_POLICY
+        tmpfs = _MAVEN_TMPFS if profile.language == "java" else policy.tmpfs
         args: list[str] = [
             "docker",
             "container",
@@ -1952,7 +1960,7 @@ class CheckRunner:
                 "--log-driver",
                 policy.log_driver,
                 "--tmpfs",
-                policy.tmpfs,
+                tmpfs,
                 "--tmpfs",
                 _WORKSPACE_TMPFS,
                 "--mount",
@@ -2589,6 +2597,17 @@ def _bounded_output(output: str, limit: int) -> tuple[str, bool]:
 
 
 def _is_retryable_maven_bootstrap_phase(phase: CheckPhaseResult) -> bool:
+    # A bounded container execution timeout can be transient (for example, a
+    # slow first Maven Central response).  The phase runner has already
+    # removed the container before returning this result; retry only when that
+    # cleanup completed, and let the caller's two-attempt limit enforce the
+    # single retry contract.
+    if phase.status == "timed_out":
+        return bool(
+            phase.error
+            and phase.error.startswith("bootstrap phase timed out after ")
+            and "; " not in phase.error
+        )
     expected_error = f"bootstrap phase exited with code {phase.exit_code}"
     return (
         phase.status == "failed"

@@ -1,7 +1,9 @@
 #requires -Version 5.1
 
 [CmdletBinding()]
-param()
+param(
+    [switch]$IncludeLegacyMaven
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -252,12 +254,16 @@ try {
     Write-Host "User .wslconfig present (left unchanged): $(Test-Path -LiteralPath $wslConfigPath)"
 
     $helloName = "repo-agent-hello-$runId"
-    $hello = Invoke-DockerCapture -CommandArgs @("run", "--rm", "--pull", "always", "--name", $helloName, "--label", $runLabel, "hello-world")
-    Assert-Condition -Condition ($hello.Output -match "Hello from Docker!") -Message "hello-world pull/create/run path succeeds"
+    $hello = Invoke-DockerCapture -CommandArgs @("run", "--rm", "--name", $helloName, "--label", $runLabel, "hello-world")
+    Assert-Condition -Condition ($hello.Output -match "Hello from Docker!") -Message "hello-world create/run path succeeds"
     $helloInspect = Invoke-DockerCapture -CommandArgs @("container", "inspect", $helloName) -AllowedExitCodes @(0, 1)
     Assert-Condition -Condition ($helloInspect.ExitCode -ne 0) -Message "hello-world container was automatically removed"
 
-    foreach ($directory in @($pythonWorkspace, $pythonCache, $mavenWorkspace, $mavenCache, $readOnlyInput)) {
+    $verificationDirectories = @($pythonWorkspace, $pythonCache, $readOnlyInput)
+    if ($IncludeLegacyMaven) {
+        $verificationDirectories += @($mavenWorkspace, $mavenCache)
+    }
+    foreach ($directory in $verificationDirectories) {
         New-Item -ItemType Directory -Path $directory -Force | Out-Null
     }
     $resolvedTempRoot = [IO.Path]::GetFullPath($tempRoot)
@@ -271,19 +277,24 @@ try {
     $proofHashBefore = (Get-FileHash -LiteralPath $proofPath -Algorithm SHA256).Hash
 
     $pythonImage = "repo-agent-python:0.1"
-    $mavenImage = "repo-agent-maven:0.1"
     $pythonImageId = Get-ImageId -Image $pythonImage
-    $mavenImageId = Get-ImageId -Image $mavenImage
     Assert-Condition -Condition ($pythonImageId -match "^sha256:[0-9a-f]{64}$") -Message "Python sandbox image exists"
-    Assert-Condition -Condition ($mavenImageId -match "^sha256:[0-9a-f]{64}$") -Message "Maven sandbox image exists"
 
     $lockPath = Join-Path $projectRoot "docker/image-lock.json"
     Assert-Condition -Condition (Test-Path -LiteralPath $lockPath -PathType Leaf) -Message "docker/image-lock.json exists"
     $imageLock = [IO.File]::ReadAllText($lockPath) | ConvertFrom-Json
     Assert-Condition -Condition ($imageLock.images.python.imageId -eq $pythonImageId) -Message "Python image ID matches image-lock.json"
-    Assert-Condition -Condition ($imageLock.images.maven.imageId -eq $mavenImageId) -Message "Maven image ID matches image-lock.json"
 
-    foreach ($image in @($pythonImage, $mavenImage)) {
+    $imagesToVerify = @($pythonImage)
+    if ($IncludeLegacyMaven) {
+        $mavenImage = "repo-agent-maven:0.1"
+        $mavenImageId = Get-ImageId -Image $mavenImage
+        Assert-Condition -Condition ($mavenImageId -match "^sha256:[0-9a-f]{64}$") -Message "Maven sandbox image exists"
+        Assert-Condition -Condition ($imageLock.images.maven.imageId -eq $mavenImageId) -Message "Maven image ID matches image-lock.json"
+        $imagesToVerify += $mavenImage
+    }
+
+    foreach ($image in $imagesToVerify) {
         $defaultUser = (Invoke-DockerCapture -CommandArgs @("image", "inspect", "--format", "{{.Config.User}}", $image)).Output
         Assert-Condition -Condition ($defaultUser -eq "10001:10001") -Message "$image defaults to UID/GID 10001"
         $declaredVolumes = (Invoke-DockerCapture -CommandArgs @("image", "inspect", "--format", "{{json .Config.Volumes}}", $image)).Output
@@ -295,9 +306,13 @@ try {
     $pythonId = New-SandboxContainer -Name $pythonName -CaseName "python" -Image $pythonImage -WorkspacePath $pythonWorkspace -CachePath $pythonCache -CacheTarget "/cache" -AdditionalMounts @($readOnlyMount)
     Start-SandboxContainer -ContainerId $pythonId
 
-    $mavenName = "repo-agent-maven-$runId"
-    $mavenId = New-SandboxContainer -Name $mavenName -CaseName "maven" -Image $mavenImage -WorkspacePath $mavenWorkspace -CachePath $mavenCache -CacheTarget "/home/repo-agent/.m2"
-    Start-SandboxContainer -ContainerId $mavenId
+    $containerIds = @($pythonId)
+    if ($IncludeLegacyMaven) {
+        $mavenName = "repo-agent-maven-$runId"
+        $mavenId = New-SandboxContainer -Name $mavenName -CaseName "maven" -Image $mavenImage -WorkspacePath $mavenWorkspace -CachePath $mavenCache -CacheTarget "/home/repo-agent/.m2"
+        Start-SandboxContainer -ContainerId $mavenId
+        $containerIds += $mavenId
+    }
 
     $inspectResult = Invoke-DockerCapture -CommandArgs @("container", "inspect", $pythonId)
     $inspect = @($inspectResult.Output | ConvertFrom-Json)[0]
@@ -334,29 +349,32 @@ try {
         Assert-Condition -Condition ([IO.Path]::GetFullPath([string]$mount.Source).StartsWith($resolvedTempRoot, [StringComparison]::OrdinalIgnoreCase)) -Message "bind source stays inside the run-specific temporary directory"
     }
 
-    $mavenInspectResult = Invoke-DockerCapture -CommandArgs @("container", "inspect", $mavenId)
-    $mavenInspect = @($mavenInspectResult.Output | ConvertFrom-Json)[0]
-    Assert-Condition -Condition ($mavenInspect.HostConfig.NetworkMode -eq "none" -and [bool]$mavenInspect.HostConfig.ReadonlyRootfs) -Message "Maven container uses network-none and a read-only root filesystem"
-    Assert-Condition -Condition ([int64]$mavenInspect.HostConfig.NanoCpus -eq 2000000000 -and [int64]$mavenInspect.HostConfig.Memory -eq 4294967296 -and [int64]$mavenInspect.HostConfig.MemorySwap -eq 4294967296 -and [int64]$mavenInspect.HostConfig.PidsLimit -eq 256) -Message "Maven container uses the required CPU, memory, swap, and PID limits"
-    Assert-Condition -Condition (@($mavenInspect.HostConfig.CapDrop) -contains "ALL" -and @($mavenInspect.HostConfig.SecurityOpt) -contains "no-new-privileges") -Message "Maven container drops capabilities and prevents privilege escalation"
-    $mavenWorkspaceMount = @($mavenInspect.Mounts | Where-Object { $_.Destination -eq "/workspace" })
-    $mavenCacheMount = @($mavenInspect.Mounts | Where-Object { $_.Destination -eq "/home/repo-agent/.m2" })
-    Assert-Condition -Condition (@($mavenInspect.Mounts).Count -eq 2) -Message "Maven container has exactly two explicit bind mounts"
-    Assert-Condition -Condition ($mavenWorkspaceMount.Count -eq 1 -and $mavenWorkspaceMount[0].Type -eq "bind" -and [bool]$mavenWorkspaceMount[0].RW) -Message "Maven workspace bind mount is read-write"
-    Assert-Condition -Condition ($mavenCacheMount.Count -eq 1 -and $mavenCacheMount[0].Type -eq "bind" -and [bool]$mavenCacheMount[0].RW) -Message "Maven dependency cache bind mount is read-write"
-    foreach ($mount in @($mavenInspect.Mounts)) {
-        Assert-Condition -Condition ($mount.Type -eq "bind" -and [IO.Path]::GetFullPath([string]$mount.Source).StartsWith($resolvedTempRoot, [StringComparison]::OrdinalIgnoreCase)) -Message "Maven bind source stays inside the run-specific temporary directory"
-    }
-
     $environmentAllowlists = [ordered]@{
         python = @("PATH", "LANG", "GPG_KEY", "PYTHON_VERSION", "PYTHON_SHA256", "HOME", "PYTHONDONTWRITEBYTECODE", "PIP_DISABLE_PIP_VERSION_CHECK")
-        maven = @("PATH", "JAVA_HOME", "LANG", "LANGUAGE", "LC_ALL", "JAVA_VERSION", "MAVEN_HOME", "MAVEN_CONFIG", "HOME")
     }
     $environmentInspects = [ordered]@{
         python = $inspect
-        maven = $mavenInspect
     }
-    foreach ($runtimeName in @("python", "maven")) {
+    $runtimeNames = @("python")
+    if ($IncludeLegacyMaven) {
+        $mavenInspectResult = Invoke-DockerCapture -CommandArgs @("container", "inspect", $mavenId)
+        $mavenInspect = @($mavenInspectResult.Output | ConvertFrom-Json)[0]
+        Assert-Condition -Condition ($mavenInspect.HostConfig.NetworkMode -eq "none" -and [bool]$mavenInspect.HostConfig.ReadonlyRootfs) -Message "Maven container uses network-none and a read-only root filesystem"
+        Assert-Condition -Condition ([int64]$mavenInspect.HostConfig.NanoCpus -eq 2000000000 -and [int64]$mavenInspect.HostConfig.Memory -eq 4294967296 -and [int64]$mavenInspect.HostConfig.MemorySwap -eq 4294967296 -and [int64]$mavenInspect.HostConfig.PidsLimit -eq 256) -Message "Maven container uses the required CPU, memory, swap, and PID limits"
+        Assert-Condition -Condition (@($mavenInspect.HostConfig.CapDrop) -contains "ALL" -and @($mavenInspect.HostConfig.SecurityOpt) -contains "no-new-privileges") -Message "Maven container drops capabilities and prevents privilege escalation"
+        $mavenWorkspaceMount = @($mavenInspect.Mounts | Where-Object { $_.Destination -eq "/workspace" })
+        $mavenCacheMount = @($mavenInspect.Mounts | Where-Object { $_.Destination -eq "/home/repo-agent/.m2" })
+        Assert-Condition -Condition (@($mavenInspect.Mounts).Count -eq 2) -Message "Maven container has exactly two explicit bind mounts"
+        Assert-Condition -Condition ($mavenWorkspaceMount.Count -eq 1 -and $mavenWorkspaceMount[0].Type -eq "bind" -and [bool]$mavenWorkspaceMount[0].RW) -Message "Maven workspace bind mount is read-write"
+        Assert-Condition -Condition ($mavenCacheMount.Count -eq 1 -and $mavenCacheMount[0].Type -eq "bind" -and [bool]$mavenCacheMount[0].RW) -Message "Maven dependency cache bind mount is read-write"
+        foreach ($mount in @($mavenInspect.Mounts)) {
+            Assert-Condition -Condition ($mount.Type -eq "bind" -and [IO.Path]::GetFullPath([string]$mount.Source).StartsWith($resolvedTempRoot, [StringComparison]::OrdinalIgnoreCase)) -Message "Maven bind source stays inside the run-specific temporary directory"
+        }
+        $environmentAllowlists["maven"] = @("PATH", "JAVA_HOME", "LANG", "LANGUAGE", "LC_ALL", "JAVA_VERSION", "MAVEN_HOME", "MAVEN_CONFIG", "HOME")
+        $environmentInspects["maven"] = $mavenInspect
+        $runtimeNames += "maven"
+    }
+    foreach ($runtimeName in $runtimeNames) {
         $environmentNames = @($environmentInspects[$runtimeName].Config.Env | ForEach-Object { @($_ -split "=", 2)[0] })
         $unexpectedNames = @($environmentNames | Where-Object { $environmentAllowlists[$runtimeName] -notcontains $_ })
         Assert-Condition -Condition ($unexpectedNames.Count -eq 0) -Message "$runtimeName container environment matches its reviewed allowlist"
@@ -371,16 +389,18 @@ try {
     Assert-Condition -Condition ($pythonGitVersion -match "^git version ") -Message "Git is available in the Python image"
     Assert-Condition -Condition ($pythonRgVersion -match "^ripgrep ") -Message "ripgrep is available in the Python image"
 
-    $javaVersion = (Invoke-ContainerExec -ContainerId $mavenId -CommandArgs @("java", "-version")).Output
-    $mavenVersion = (Invoke-ContainerExec -ContainerId $mavenId -CommandArgs @("mvn", "--version")).Output
-    $mavenGitVersion = (Invoke-ContainerExec -ContainerId $mavenId -CommandArgs @("git", "--version")).Output
-    $mavenRgVersion = (Invoke-ContainerExec -ContainerId $mavenId -CommandArgs @("rg", "--version")).Output
-    Assert-Condition -Condition ($javaVersion -match 'version "21\.') -Message "Java 21 is available"
-    Assert-Condition -Condition ($mavenVersion -match "Apache Maven 3\.9\.") -Message "Maven 3.9 is available"
-    Assert-Condition -Condition ($mavenGitVersion -match "^git version ") -Message "Git is available in the Maven image"
-    Assert-Condition -Condition ($mavenRgVersion -match "^ripgrep ") -Message "ripgrep is available in the Maven image"
+    if ($IncludeLegacyMaven) {
+        $javaVersion = (Invoke-ContainerExec -ContainerId $mavenId -CommandArgs @("java", "-version")).Output
+        $mavenVersion = (Invoke-ContainerExec -ContainerId $mavenId -CommandArgs @("mvn", "--version")).Output
+        $mavenGitVersion = (Invoke-ContainerExec -ContainerId $mavenId -CommandArgs @("git", "--version")).Output
+        $mavenRgVersion = (Invoke-ContainerExec -ContainerId $mavenId -CommandArgs @("rg", "--version")).Output
+        Assert-Condition -Condition ($javaVersion -match 'version "21\.') -Message "Java 21 is available"
+        Assert-Condition -Condition ($mavenVersion -match "Apache Maven 3\.9\.") -Message "Maven 3.9 is available"
+        Assert-Condition -Condition ($mavenGitVersion -match "^git version ") -Message "Git is available in the Maven image"
+        Assert-Condition -Condition ($mavenRgVersion -match "^ripgrep ") -Message "ripgrep is available in the Maven image"
+    }
 
-    foreach ($containerId in @($pythonId, $mavenId)) {
+    foreach ($containerId in $containerIds) {
         $uid = (Invoke-ContainerExec -ContainerId $containerId -CommandArgs @("id", "-u")).Output
         $gid = (Invoke-ContainerExec -ContainerId $containerId -CommandArgs @("id", "-g")).Output
         Assert-Condition -Condition ($uid -eq "10001") -Message "container $($containerId.Substring(0, 12)) runs as UID 10001"
@@ -448,9 +468,11 @@ Path('/workspace/workspace-write-2.txt').write_text('workspace-ok', encoding='ut
 
     $policyFiles = @(
         (Join-Path $projectRoot "README.md"),
-        (Join-Path $projectRoot "docker/python/Dockerfile"),
-        (Join-Path $projectRoot "docker/maven/Dockerfile")
+        (Join-Path $projectRoot "docker/python/Dockerfile")
     ) + @(Get-ChildItem -LiteralPath $PSScriptRoot -File -Filter "*.ps1" | ForEach-Object { $_.FullName })
+    if ($IncludeLegacyMaven) {
+        $policyFiles += (Join-Path $projectRoot "docker/maven/Dockerfile")
+    }
     $forbiddenText = (($policyFiles | ForEach-Object { [IO.File]::ReadAllText($_) }) -join "`n")
     Assert-Condition -Condition ($forbiddenText -notmatch "docker\s+system\s+prune") -Message "project scripts do not invoke global Docker prune"
 }

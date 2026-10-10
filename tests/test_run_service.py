@@ -8,7 +8,9 @@ import threading
 
 import pytest
 
-from repo_agent.run_models import ChangePlan, RunRecord, TERMINAL_STATUSES
+from repo_agent.checks import CheckProfile
+import repo_agent.service as service_module
+from repo_agent.run_models import ChangePlan, RunRecord, TERMINAL_STATUSES, utc_now
 from repo_agent.service import (
     DataDirectoryInUseError,
     QueueFullError,
@@ -219,7 +221,15 @@ def test_run_service_rejection_is_terminal_without_resume(
 def test_run_service_cancels_a_queued_run_without_execution(
     tmp_path: Path, monkeypatch
 ) -> None:
-    workflow = ApprovalWorkflow()
+    class CancelSpyWorkflow(ApprovalWorkflow):
+        def __init__(self) -> None:
+            super().__init__()
+            self.cancel_calls: list[str] = []
+
+        def cancel(self, run_id: str) -> None:
+            self.cancel_calls.append(run_id)
+
+    workflow = CancelSpyWorkflow()
     service = RunService(
         tmp_path / "data",
         allowed_repo_roots=(tmp_path,),
@@ -233,6 +243,7 @@ def test_run_service_cancels_a_queued_run_without_execution(
         assert cancelled.status == "cancelled"
         assert cancelled.cancel_requested is True
         assert workflow.calls == []
+        assert workflow.cancel_calls == []
         assert publications == [
             ("cancelled", "cancelled", True, "cancel_requested")
         ]
@@ -255,6 +266,437 @@ def test_run_service_enforces_waiting_queue_limit(tmp_path: Path) -> None:
             service.create_run(repo_path=tmp_path, task="third")
     finally:
         service.close()
+
+
+def test_scheduler_snapshot_fifo_and_cancelled_tombstone_releases_capacity(
+    tmp_path: Path,
+) -> None:
+    class ControlledWorkflow:
+        def __init__(self) -> None:
+            self.started = threading.Event()
+            self.release_first = threading.Event()
+            self.calls: list[str] = []
+            self.active = 0
+            self.max_active = 0
+            self.lock = threading.Lock()
+
+        def execute(self, record, _context, *, resume):
+            del resume
+            with self.lock:
+                self.calls.append(record.run_id)
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+                call_number = len(self.calls)
+            try:
+                if call_number == 1:
+                    self.started.set()
+                    assert self.release_first.wait(timeout=5)
+                return RunRecord.model_validate(
+                    {
+                        **record.model_dump(mode="python"),
+                        "status": "succeeded",
+                        "current_node": "finalize",
+                    }
+                )
+            finally:
+                with self.lock:
+                    self.active -= 1
+
+        def cancel(self, _run_id: str) -> None:
+            return None
+
+    workflow = ControlledWorkflow()
+    with RunService(
+        tmp_path / "data",
+        allowed_repo_roots=(tmp_path,),
+        runner=workflow,
+        max_queue=2,
+    ) as service:
+        first = service.create_run(repo_path=tmp_path, task="first")
+        assert workflow.started.wait(timeout=5)
+        second = service.create_run(repo_path=tmp_path, task="second")
+        third = service.create_run(repo_path=tmp_path, task="third")
+
+        saturated = service.scheduler_snapshot()
+        assert saturated.queue_capacity == 2
+        assert saturated.max_concurrency == 1
+        assert saturated.active_run_ids == (first.run_id,)
+        assert saturated.queued_run_ids == (second.run_id, third.run_id)
+        assert service.queue_position(second.run_id) == 1
+        assert service.queue_position(third.run_id) == 2
+        with pytest.raises(QueueFullError, match="queue is full"):
+            service.create_run(repo_path=tmp_path, task="rejected")
+
+        assert service.cancel(second.run_id).status == "cancelled"
+        after_cancel = service.scheduler_snapshot()
+        assert after_cancel.queue_depth == 1
+        assert after_cancel.queued_run_ids == (third.run_id,)
+        assert service.queue_position(second.run_id) is None
+        assert service.queue_position(third.run_id) == 1
+        assert tuple(job.run_id for job in service._queue) == (third.run_id,)
+
+        cancelled_ids: list[str] = []
+        for index in range(20):
+            transient = service.create_run(
+                repo_path=tmp_path,
+                task=f"cancelled waiting run {index}",
+            )
+            cancelled_ids.append(transient.run_id)
+            assert service.cancel(transient.run_id).status == "cancelled"
+            assert tuple(job.run_id for job in service._queue) == (third.run_id,)
+
+        fourth = service.create_run(repo_path=tmp_path, task="fourth")
+        assert service.queue_position(fourth.run_id) == 2
+        workflow.release_first.set()
+        assert service.wait(first.run_id, timeout=5).status == "succeeded"
+        assert service.wait(third.run_id, timeout=5).status == "succeeded"
+        assert service.wait(fourth.run_id, timeout=5).status == "succeeded"
+
+        fifth = service.create_run(repo_path=tmp_path, task="fifth")
+        assert service.wait(fifth.run_id, timeout=5).status == "succeeded"
+        assert workflow.calls == [
+            first.run_id,
+            third.run_id,
+            fourth.run_id,
+            fifth.run_id,
+        ]
+        assert not set(cancelled_ids).intersection(workflow.calls)
+        assert workflow.max_active == 1
+        assert service.scheduler_snapshot().queue_depth == 0
+        assert service.ready() is True
+
+
+def test_concurrent_producers_and_cancellations_preserve_queue_invariants(
+    tmp_path: Path,
+) -> None:
+    class BlockingWorkflow:
+        def __init__(self) -> None:
+            self.started = threading.Event()
+            self.release = threading.Event()
+            self.calls: list[str] = []
+            self.active_run_id: str | None = None
+
+        def execute(self, record, _context, *, resume):
+            del resume
+            self.calls.append(record.run_id)
+            self.active_run_id = record.run_id
+            self.started.set()
+            assert self.release.wait(timeout=10)
+            return record.model_copy(
+                update={"status": "succeeded", "current_node": "finalize"}
+            )
+
+        def cancel(self, run_id: str) -> None:
+            if run_id == self.active_run_id:
+                self.release.set()
+
+    workflow = BlockingWorkflow()
+    with RunService(
+        tmp_path / "data",
+        allowed_repo_roots=(tmp_path,),
+        runner=workflow,
+        max_queue=8,
+    ) as service:
+        active = service.create_run(repo_path=tmp_path, task="hold worker")
+        assert workflow.started.wait(timeout=5)
+        barrier = threading.Barrier(9)
+        failures: list[BaseException] = []
+        cancelled_ids: list[str] = []
+        result_lock = threading.Lock()
+
+        def produce(worker_index: int) -> None:
+            barrier.wait(timeout=5)
+            for item_index in range(10):
+                try:
+                    record = service.create_run(
+                        repo_path=tmp_path,
+                        task=f"producer {worker_index} item {item_index}",
+                    )
+                except QueueFullError:
+                    continue
+                try:
+                    service.cancel(record.run_id)
+                    with result_lock:
+                        cancelled_ids.append(record.run_id)
+                except BaseException as exc:
+                    with result_lock:
+                        failures.append(exc)
+
+        producers = [
+            threading.Thread(target=produce, args=(index,)) for index in range(8)
+        ]
+        for producer in producers:
+            producer.start()
+        barrier.wait(timeout=5)
+        for producer in producers:
+            producer.join(timeout=15)
+
+        assert all(not producer.is_alive() for producer in producers)
+        assert failures == []
+        assert cancelled_ids
+        with service._lock:
+            queued_ids = tuple(job.run_id for job in service._queue)
+            assert queued_ids == tuple(service._scheduled)
+            assert len(queued_ids) <= 8
+            assert len(set(queued_ids)) == len(queued_ids)
+        assert service.scheduler_snapshot().queue_depth == 0
+
+        capacity = [service._pending_slots.acquire(blocking=False) for _ in range(8)]
+        try:
+            assert capacity == [True] * 8
+            assert service._pending_slots.acquire(blocking=False) is False
+        finally:
+            for held in capacity:
+                if held:
+                    service._pending_slots.release()
+
+        workflow.release.set()
+        assert service.wait(active.run_id, timeout=5).status == "succeeded"
+        assert workflow.calls == [active.run_id]
+
+
+def test_wait_for_events_closes_query_wait_race_and_validates_bounds(
+    tmp_path: Path, monkeypatch
+) -> None:
+    service = RunService(
+        tmp_path / "data",
+        allowed_repo_roots=(tmp_path,),
+        runner=ApprovalWorkflow(),
+        start_worker=False,
+    )
+    try:
+        created = service.create_run(repo_path=tmp_path, task="observe events")
+        initial = service.event_page(created.run_id, after_sequence=0)
+        assert [event["event"] for event in initial.events] == ["run_created"]
+
+        first_empty_query = threading.Event()
+        release_query = threading.Event()
+        original_event_page = service.database.event_page
+        observed_empty = False
+
+        def pause_after_empty(*args, **kwargs):
+            nonlocal observed_empty
+            page = original_event_page(*args, **kwargs)
+            if not page.events and not observed_empty:
+                observed_empty = True
+                first_empty_query.set()
+                assert release_query.wait(timeout=5)
+            return page
+
+        monkeypatch.setattr(service.database, "event_page", pause_after_empty)
+        pages = []
+        waiter = threading.Thread(
+            target=lambda: pages.append(
+                service.wait_for_events(
+                    created.run_id,
+                    after_sequence=initial.latest_sequence,
+                    timeout=5,
+                )
+            )
+        )
+        waiter.start()
+        assert first_empty_query.wait(timeout=5)
+
+        published = threading.Event()
+
+        def publish() -> None:
+            service.database.append_event(
+                created.run_id,
+                {"event": "test_event", "detail": {}, "timestamp": "now"},
+            )
+            published.set()
+            service._notify(created.run_id)
+
+        publisher = threading.Thread(target=publish)
+        publisher.start()
+        assert published.wait(timeout=5)
+        release_query.set()
+        publisher.join(timeout=5)
+        waiter.join(timeout=5)
+
+        assert publisher.is_alive() is False
+        assert waiter.is_alive() is False
+        assert [event["event"] for event in pages[0].events] == ["test_event"]
+
+        for cursor in (-1, True, 1 << 63):
+            with pytest.raises(ValueError, match="after_sequence"):
+                service.event_page(created.run_id, after_sequence=cursor)  # type: ignore[arg-type]
+        for limit in (0, True, 257):
+            with pytest.raises(ValueError, match="limit"):
+                service.event_page(
+                    created.run_id,
+                    after_sequence=0,
+                    limit=limit,  # type: ignore[arg-type]
+                )
+        for timeout in (-1, True, float("nan")):
+            with pytest.raises(ValueError, match="finite non-negative"):
+                service.wait_for_events(
+                    created.run_id,
+                    after_sequence=0,
+                    timeout=timeout,  # type: ignore[arg-type]
+                )
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize(
+    ("status", "current_node", "event_name"),
+    (
+        ("awaiting_approval", "approval", "plan_approved"),
+        ("interrupted", "implement", "run_resumed"),
+    ),
+)
+def test_approve_and_resume_events_wake_unbounded_subscribers_after_schedule(
+    tmp_path: Path,
+    monkeypatch,
+    status: str,
+    current_node: str,
+    event_name: str,
+) -> None:
+    service = RunService(
+        tmp_path / "data",
+        allowed_repo_roots=(tmp_path,),
+        runner=ApprovalWorkflow(),
+        start_worker=False,
+    )
+    waiter_thread: threading.Thread | None = None
+    action_thread: threading.Thread | None = None
+    try:
+        run_id = "a" * 32
+        now = utc_now()
+        plan = ChangePlan(
+            goal="Repair safely",
+            files=("src/app.py",),
+            steps=("Apply the reviewed change",),
+            checks=("python-pytest",),
+        )
+        record = RunRecord(
+            run_id=run_id,
+            repo_path=str(tmp_path),
+            task="repair",
+            status=status,
+            current_node=current_node,
+            plan=plan,
+            created_at=now,
+            updated_at=now,
+        )
+        artifact_dir = service.artifacts.initialize(run_id)
+        service.database.create(record, artifact_dir)
+        service.artifacts.write_record(record)
+        cursor = service.database.append_event(
+            run_id,
+            {"event": "workflow_checkpoint", "timestamp": now},
+        )
+
+        first_empty_query = threading.Event()
+        second_empty_query = threading.Event()
+        trace_reached = threading.Event()
+        waiter_queries = 0
+        original_event_page = service.database.event_page
+        original_trace = service._trace
+
+        def observe_empty_page(*args, **kwargs):
+            nonlocal waiter_queries
+            page = original_event_page(*args, **kwargs)
+            if threading.current_thread() is waiter_thread and not page.events:
+                waiter_queries += 1
+                if waiter_queries == 1:
+                    first_empty_query.set()
+                elif waiter_queries == 2:
+                    second_empty_query.set()
+            return page
+
+        def pause_trace(
+            traced_record: RunRecord,
+            traced_event: str,
+            *,
+            detail: dict[str, object],
+        ) -> None:
+            if traced_event == event_name:
+                trace_reached.set()
+                assert second_empty_query.wait(timeout=5)
+            original_trace(traced_record, traced_event, detail=detail)
+
+        monkeypatch.setattr(service.database, "event_page", observe_empty_page)
+        monkeypatch.setattr(service, "_trace", pause_trace)
+        pages = []
+        action_errors: list[BaseException] = []
+        waiter_thread = threading.Thread(
+            target=lambda: pages.append(
+                service.wait_for_events(
+                    run_id,
+                    after_sequence=cursor,
+                    timeout=None,
+                )
+            )
+        )
+        waiter_thread.start()
+        assert first_empty_query.wait(timeout=5)
+
+        def act() -> None:
+            try:
+                if status == "awaiting_approval":
+                    service.decide(run_id, approve=True)
+                else:
+                    service.resume(run_id)
+            except BaseException as exc:
+                action_errors.append(exc)
+
+        action_thread = threading.Thread(target=act)
+        action_thread.start()
+        assert trace_reached.wait(timeout=5)
+        action_thread.join(timeout=5)
+        waiter_thread.join(timeout=5)
+
+        assert action_thread.is_alive() is False
+        assert waiter_thread.is_alive() is False
+        assert action_errors == []
+        assert [event["event"] for event in pages[0].events] == [event_name]
+    finally:
+        service._notify("a" * 32)
+        if action_thread is not None:
+            action_thread.join(timeout=5)
+        if waiter_thread is not None:
+            waiter_thread.join(timeout=5)
+        service.close()
+
+
+def test_workflow_auxiliary_event_is_persisted_and_wakes_subscribers(
+    tmp_path: Path,
+) -> None:
+    class EventWorkflow:
+        def execute(self, record, context, *, resume):
+            del resume
+            context.publish_event(
+                {
+                    "event": "model_tool_summary",
+                    "phase": "implement",
+                    "tool_calls": 1,
+                    "timestamp": "2026-10-09T00:00:00.000Z",
+                }
+            )
+            return record.model_copy(
+                update={"status": "succeeded", "current_node": "finalize"}
+            )
+
+        def cancel(self, _run_id: str) -> None:
+            return None
+
+    with RunService(
+        tmp_path / "data",
+        allowed_repo_roots=(tmp_path,),
+        runner=EventWorkflow(),
+    ) as service:
+        created = service.create_run(repo_path=tmp_path, task="publish progress")
+        finished = service.wait(created.run_id, timeout=5)
+        events = service.event_page(created.run_id, after_sequence=0).events
+
+    assert finished.status == "succeeded"
+    summary = next(
+        event for event in events if event["event"] == "model_tool_summary"
+    )
+    assert summary["phase"] == "implement"
+    assert summary["tool_calls"] == 1
 
 
 def test_run_service_rejects_extreme_timeout_and_wait_flag_values(
@@ -284,7 +726,7 @@ def test_run_service_rejects_extreme_timeout_and_wait_flag_values(
         with pytest.raises(ValueError, match="stop_at_approval"):
             service.wait("a" * 32, timeout=0, stop_at_approval=1)  # type: ignore[arg-type]
 
-        for value in invalid_timeouts:
+        for value in invalid_timeouts[:-1]:
             with pytest.raises(ValueError, match="finite non-negative"):
                 service.close(timeout=value)  # type: ignore[arg-type]
             assert service._lease is not None and service._lease.held
@@ -355,6 +797,14 @@ def test_service_hides_persisted_runs_outside_current_allowed_roots(
         assert second.list_runs() == ()
         with pytest.raises(RepositoryNotAllowedError, match="outside"):
             second.get_run(created.run_id)
+        with pytest.raises(RepositoryNotAllowedError, match="outside"):
+            second.event_page(created.run_id, after_sequence=0)
+        with pytest.raises(RepositoryNotAllowedError, match="outside"):
+            second.wait_for_events(
+                created.run_id,
+                after_sequence=0,
+                timeout=0,
+            )
     finally:
         second.close()
 
@@ -401,6 +851,31 @@ def test_run_service_cooperatively_cancels_active_workflow(
         assert publications == [
             ("cancelled", "cancelled", True, "workflow_cancelled")
         ]
+
+
+def test_active_cancel_hook_failure_does_not_undo_durable_cancellation(
+    tmp_path: Path,
+) -> None:
+    class RaisingCancelWorkflow(BlockingWorkflow):
+        def cancel(self, run_id: str) -> None:
+            del run_id
+            raise RuntimeError("cancel hook failed")
+
+    workflow = RaisingCancelWorkflow()
+    with RunService(
+        tmp_path / "data",
+        allowed_repo_roots=(tmp_path,),
+        runner=workflow,
+    ) as service:
+        created = service.create_run(repo_path=tmp_path, task="repair")
+        assert workflow.started.wait(timeout=5)
+
+        requested = service.cancel(created.run_id)
+        finished = service.wait(created.run_id, timeout=5)
+
+    assert requested.cancel_requested is True
+    assert finished.status == "cancelled"
+    assert workflow.cancelled.is_set()
 
 
 def test_active_cancel_cannot_overwrite_terminal_artifact(
@@ -512,6 +987,52 @@ def test_default_workflow_receives_service_bootstrap_authorization(
         assert getattr(service._runner, "allow_bootstrap") is True
     finally:
         service.close()
+
+
+@pytest.mark.parametrize(
+    ("resume", "status", "current_node"),
+    [
+        (False, "queued", None),
+        (True, "interrupted", "implement"),
+    ],
+)
+def test_default_workflow_rejects_maven_before_execute_or_checkpoint_resume(
+    monkeypatch,
+    tmp_path: Path,
+    resume: bool,
+    status: str,
+    current_node: str | None,
+) -> None:
+    delegate = ApprovalWorkflow()
+    runner = service_module._PythonOnlyWorkflowRunner(delegate)
+    profile = CheckProfile(
+        id="maven-test",
+        language="java",
+        image="repo-agent-maven:0.1",
+        manifest="pom.xml",
+        bootstrap_argv=(),
+        check_argv=("mvn", "--offline", "test"),
+        java_release=21,
+    )
+    monkeypatch.setattr(
+        service_module, "detect_check_profile", lambda _repo_path: profile
+    )
+    record = RunRecord(
+        run_id="a" * 32,
+        repo_path=str(tmp_path),
+        task="repair",
+        status=status,
+        current_node=current_node,
+        created_at="2026-09-29T00:00:00.000Z",
+        updated_at="2026-09-29T00:00:00.000Z",
+    )
+
+    with pytest.raises(
+        RuntimeError, match="durable workflows support only Python repositories"
+    ):
+        runner.execute(record, None, resume=resume)  # type: ignore[arg-type]
+
+    assert delegate.calls == []
 
 
 def test_service_rejects_non_boolean_bootstrap_authorization(tmp_path: Path) -> None:
@@ -698,6 +1219,86 @@ def test_close_timeout_keeps_lease_until_worker_exits(tmp_path: Path) -> None:
         service.close(timeout=5)
         if replacement is not None:
             replacement.close()
+
+
+def test_close_cannot_start_a_job_already_dequeued_by_the_worker(
+    tmp_path: Path, monkeypatch
+) -> None:
+    workflow = ApprovalWorkflow()
+    service = RunService(
+        tmp_path / "data",
+        allowed_repo_roots=(tmp_path,),
+        runner=workflow,
+        start_worker=False,
+    )
+    before_execute = threading.Event()
+    release_execute = threading.Event()
+    observed_cancel_events: list[threading.Event] = []
+    close_errors: list[BaseException] = []
+    original_execute_job = service._execute_job
+
+    def pause_before_execute(job, cancel_event: threading.Event) -> None:
+        observed_cancel_events.append(cancel_event)
+        before_execute.set()
+        assert release_execute.wait(timeout=5)
+        original_execute_job(job, cancel_event)
+
+    monkeypatch.setattr(service, "_execute_job", pause_before_execute)
+    service.start()
+    created = service.create_run(repo_path=tmp_path, task="queued shutdown")
+    assert before_execute.wait(timeout=5)
+
+    def close_service() -> None:
+        try:
+            service.close(timeout=5)
+        except BaseException as exc:
+            close_errors.append(exc)
+
+    close_thread = threading.Thread(target=close_service)
+    close_thread.start()
+    try:
+        assert observed_cancel_events[0].wait(timeout=5)
+    finally:
+        release_execute.set()
+        close_thread.join(timeout=5)
+        service.close(timeout=5)
+
+    assert close_thread.is_alive() is False
+    assert close_errors == []
+    assert workflow.calls == []
+    assert service.get_run(created.run_id).status == "interrupted"
+
+
+def test_close_uses_runner_budget_unless_timeout_is_explicit(tmp_path: Path) -> None:
+    class BudgetedWorkflow(ApprovalWorkflow):
+        close_timeout_seconds = 125.0
+
+    class ObservedWorker:
+        def __init__(self) -> None:
+            self.join_timeouts: list[float | None] = []
+
+        def join(self, timeout: float | None = None) -> None:
+            self.join_timeouts.append(timeout)
+
+        def is_alive(self) -> bool:
+            return False
+
+    observed: list[tuple[float, float]] = []
+    for index, explicit_timeout in enumerate((None, 0.01)):
+        service = RunService(
+            tmp_path / f"data-{index}",
+            allowed_repo_roots=(tmp_path,),
+            runner=BudgetedWorkflow(),
+            start_worker=False,
+        )
+        worker = ObservedWorker()
+        service._worker = worker  # type: ignore[assignment]
+
+        service.close(timeout=explicit_timeout)
+
+        observed.append((service.close_timeout_seconds, worker.join_timeouts[0]))
+
+    assert observed == [(125.0, 125.0), (125.0, 0.01)]
 
 
 def test_closed_service_cannot_mutate_after_a_new_owner_acquires_the_lease(

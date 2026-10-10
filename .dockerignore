@@ -9,6 +9,16 @@ __pycache__
 .ruff_cache
 .mypy_cache
 *.log
+.coverage
 .coverage-*
+build
+dist
+evaluation-results
+evaluation-report
+target
 .env
 .env.*
+credentials.json
+**/credentials.json
+relay.json
+**/relay.json

@@ -648,6 +648,16 @@ function Assert-DevelopmentEvaluationAcceptance {
             $report.actionable_tool_error_rate,
             [Globalization.CultureInfo]::InvariantCulture
         )
+        $summaryUsageComplete = $false
+        $tokensProperty = $report.PSObject.Properties["tokens"]
+        if ($null -ne $tokensProperty -and $null -ne $tokensProperty.Value) {
+            $completeProperty = $tokensProperty.Value.PSObject.Properties["complete"]
+            $summaryUsageComplete = (
+                $null -ne $completeProperty -and
+                $completeProperty.Value -is [bool] -and
+                $completeProperty.Value -eq $true
+            )
+        }
         $tasks = @($report.tasks)
         $taskIds = @($tasks | ForEach-Object { [string]$_.task_id })
         $rowSolvedTaskCount = @(
@@ -659,6 +669,50 @@ function Assert-DevelopmentEvaluationAcceptance {
                 $_.model -cne $ExpectedModelId -or
                 $_.language -cne "python" -or
                 $_.solved -isnot [bool]
+            }
+        )
+        $taskTimeoutFailures = @(
+            $tasks | Where-Object {
+                $agentProperty = $_.PSObject.Properties["agent"]
+                if ($null -eq $agentProperty -or $null -eq $agentProperty.Value) {
+                    $true
+                }
+                else {
+                    $timedOutProperty = (
+                        $agentProperty.Value.PSObject.Properties["timed_out"]
+                    )
+                    (
+                        $null -eq $timedOutProperty -or
+                        $timedOutProperty.Value -isnot [bool] -or
+                        $timedOutProperty.Value -ne $false
+                    )
+                }
+            }
+        )
+        $taskUsageFailures = @(
+            $tasks | Where-Object {
+                $agentProperty = $_.PSObject.Properties["agent"]
+                if ($null -eq $agentProperty -or $null -eq $agentProperty.Value) {
+                    $true
+                }
+                else {
+                    $usageProperty = (
+                        $agentProperty.Value.PSObject.Properties["usage"]
+                    )
+                    if ($null -eq $usageProperty -or $null -eq $usageProperty.Value) {
+                        $true
+                    }
+                    else {
+                        $completeProperty = (
+                            $usageProperty.Value.PSObject.Properties["complete"]
+                        )
+                        (
+                            $null -eq $completeProperty -or
+                            $completeProperty.Value -isnot [bool] -or
+                            $completeProperty.Value -ne $true
+                        )
+                    }
+                }
             }
         )
     }
@@ -706,6 +760,12 @@ function Assert-DevelopmentEvaluationAcceptance {
     if (@($tasks | Where-Object { $_.budget_passed -ne $true }).Count -ne 0) {
         throw "Development evaluation acceptance failed: a task exceeded its budget."
     }
+    if (-not $summaryUsageComplete -or $taskUsageFailures.Count -ne 0) {
+        throw "Development evaluation acceptance failed: token usage is incomplete."
+    }
+    if ($taskTimeoutFailures.Count -ne 0) {
+        throw "Development evaluation acceptance failed: a task timed out or timeout status is missing."
+    }
     if (
         [Double]::IsNaN($actionableRate) -or
         [Double]::IsInfinity($actionableRate) -or
@@ -727,18 +787,22 @@ function Invoke-RelayFormalEvaluation {
     $pythonExecutable = $PythonInvocation[0]
     $pythonPrefix = @($PythonInvocation | Select-Object -Skip 1)
     $projectRoot = Split-Path -Parent $scriptDirectory
-    $benchmarkDirectory = Join-Path $projectRoot "benchmarks"
+    $benchmarkDirectory = Join-Path `
+        $projectRoot "benchmarks\tasks\python\bugfix"
     if (-not (Test-Path -LiteralPath $benchmarkDirectory -PathType Container)) {
         throw "The fixed formal benchmark suite is unavailable."
     }
     $runId = "{0}-{1}" -f (
         [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssfffZ")
     ), ([Guid]::NewGuid().ToString("N"))
-    $outputDirectory = Join-Path (
-        (Join-Path $projectRoot (
-            "evaluation-results\formal-v1-regression-acceptance"
-        ))
-    ) $runId
+    # Keep the formal result hierarchy outside the repository and close to its
+    # parent.  The evaluator creates several nested task/scoring/workspace
+    # directories; anchoring this root beside the repository avoids WinError
+    # 206 on Windows without hard-coding a drive letter.
+    $formalOutputRoot = Join-Path (
+        (Split-Path -Parent $projectRoot)
+    ) "repo-agent-py-formal-v1"
+    $outputDirectory = Join-Path $formalOutputRoot $runId
     if (Test-Path -LiteralPath $outputDirectory) {
         throw "The fresh formal acceptance output directory already exists."
     }
@@ -759,7 +823,6 @@ function Invoke-RelayFormalEvaluation {
             $outputDirectory,
             "--execute",
             "--allow-remote-model",
-            "--allow-bootstrap",
             "--task-timeout-seconds",
             "1200",
             "--max-output-bytes",
@@ -768,7 +831,7 @@ function Invoke-RelayFormalEvaluation {
             "json"
         )
     )
-    Write-Host "Running the fixed 12-task formal full trial-1 acceptance..."
+    Write-Host "Running the fixed 6-task Python formal full trial-1 acceptance..."
     Write-Host "Formal acceptance output: $outputDirectory"
     & $pythonExecutable @evaluationArguments
     if ($LASTEXITCODE -ne 0) {
@@ -777,7 +840,7 @@ function Invoke-RelayFormalEvaluation {
     Assert-FormalEvaluationAcceptance `
         -SummaryPath (Get-EvaluationSummaryPath `
             -OutputDirectory $outputDirectory `
-            -SuiteId "repo-agent-python-java-day3-v1") `
+            -SuiteId "repo-agent-python-bugfix-v1") `
         -ExpectedModelId $env:REPO_AGENT_MODEL
 }
 
@@ -808,12 +871,6 @@ function Assert-FormalEvaluationAcceptance {
         $pythonSolved = [Convert]::ToInt32(
             $report.language_success.python.solved
         )
-        $javaTaskCount = [Convert]::ToInt32(
-            $report.language_success.java.tasks
-        )
-        $javaSolved = [Convert]::ToInt32(
-            $report.language_success.java.solved
-        )
         if ($null -eq $report.latency_ms.p95) {
             throw "missing p95 latency"
         }
@@ -829,14 +886,8 @@ function Assert-FormalEvaluationAcceptance {
         $pythonRows = @(
             $tasks | Where-Object { $_.language -ceq "python" }
         )
-        $javaRows = @(
-            $tasks | Where-Object { $_.language -ceq "java" }
-        )
         $pythonRowSolved = @(
             $pythonRows | Where-Object { $_.solved -eq $true }
-        ).Count
-        $javaRowSolved = @(
-            $javaRows | Where-Object { $_.solved -eq $true }
         ).Count
         $invalidTaskRows = @(
             $tasks | Where-Object {
@@ -846,10 +897,6 @@ function Assert-FormalEvaluationAcceptance {
                 (
                     $_.task_id -clike "py-*" -and
                     $_.language -cne "python"
-                ) -or
-                (
-                    $_.task_id -clike "java-*" -and
-                    $_.language -cne "java"
                 )
             }
         )
@@ -860,21 +907,19 @@ function Assert-FormalEvaluationAcceptance {
 
     if (
         $report.status -cne "completed" -or
-        $report.suite_id -cne "repo-agent-python-java-day3-v1" -or
+        $report.suite_id -cne "repo-agent-python-bugfix-v1" -or
         $report.variant -cne "full" -or
         $trial -ne 1 -or
         $report.model -cne $ExpectedModelId -or
-        $taskCount -ne 12 -or
-        $completedTaskCount -ne 12 -or
-        $tasks.Count -ne 12
+        $taskCount -ne 6 -or
+        $completedTaskCount -ne 6 -or
+        $tasks.Count -ne 6
     ) {
         throw "Formal acceptance did not complete the fixed full trial-1 suite."
     }
 
     $expectedTaskIds = @(
         1..6 | ForEach-Object { "py-bugfix-{0:D3}" -f $_ }
-    ) + @(
-        1..6 | ForEach-Object { "java-bugfix-{0:D3}" -f $_ }
     )
     $taskIdDifferences = @(
         Compare-Object `
@@ -889,22 +934,16 @@ function Assert-FormalEvaluationAcceptance {
         $invalidTaskRows.Count -ne 0 -or
         $rowSolvedTaskCount -ne $solvedTaskCount -or
         $pythonRows.Count -ne $pythonTaskCount -or
-        $pythonRowSolved -ne $pythonSolved -or
-        $javaRows.Count -ne $javaTaskCount -or
-        $javaRowSolved -ne $javaSolved
+        $pythonRowSolved -ne $pythonSolved
     ) {
         throw "Formal acceptance task rows do not match its aggregate totals."
     }
-    if ($solvedTaskCount -lt 8) {
-        throw "Formal acceptance failed: fewer than 8 of 12 tasks solved."
+    if ($solvedTaskCount -lt 4) {
+        throw "Formal acceptance failed: fewer than 4 of 6 tasks solved."
     }
     if ($pythonTaskCount -ne 6 -or $pythonSolved -lt 4) {
         throw "Formal acceptance failed: fewer than 4 of 6 Python tasks solved."
     }
-    if ($javaTaskCount -ne 6 -or $javaSolved -lt 4) {
-        throw "Formal acceptance failed: fewer than 4 of 6 Java tasks solved."
-    }
-
     $budgetFailures = @(
         $tasks | Where-Object { $_.budget_passed -ne $true }
     )
@@ -941,10 +980,9 @@ function Assert-FormalEvaluationAcceptance {
         throw "Formal acceptance failed: p95 latency exceeds 480 seconds."
     }
     Write-Host (
-        "Formal acceptance passed: {0}/12 solved; Python {1}/6; Java {2}/6; p95 {3:N0} ms." -f
+        "Formal acceptance passed: {0}/6 solved; Python {1}/6; p95 {2:N0} ms." -f
         $solvedTaskCount,
         $pythonSolved,
-        $javaSolved,
         $p95Milliseconds
     )
 }

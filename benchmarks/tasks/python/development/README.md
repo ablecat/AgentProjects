@@ -1,8 +1,8 @@
 # Python development tasks
 
-These four small repositories are prompt-development fixtures. They exercise
-feature work that is broader than the frozen bug-fix suite while remaining
-fast enough for local iteration:
+These four small repositories are the only prompt-development fixtures for the
+active Python/pytest v1 profile. They exercise feature work that is broader
+than the frozen bug-fix suite while remaining fast enough for local iteration:
 
 | ID | Directory | Intended behavior |
 |---|---|---|
@@ -14,8 +14,16 @@ fast enough for local iteration:
 Each task contains a clean `baseline/`, the prompt in `issue.md`, withheld
 acceptance tests in `hidden_tests/`, a reviewed `gold.patch`, and metadata. The
 independent `manifest.json` locks all four task directories. They are not part
-of `benchmarks/manifest.json`, the frozen 12-task suite, or the 44-run formal
-evaluation.
+of the active `repo-agent-python-bugfix-v1` formal selection and never count
+toward its 4/6 release threshold. They are also not part of the retained legacy
+12-task manifest or its read-only 44-run result set.
+
+The restricted `scripts/start-relay.ps1 -Evaluate` entry point runs exactly
+these four tasks and accepts the development gate only at 3/4 solved, complete
+usage, no timeout or budget failure, and `actionable_tool_error_rate <= 5%`.
+After the code, prompt, model, and budgets are frozen,
+`scripts/start-relay.ps1 -FormalEvaluate` selects only `py-bugfix-001` through
+`py-bugfix-006`; it never promotes these development fixtures into formal data.
 
 Run the complete development lifecycle validation from this directory or the
 repository root:

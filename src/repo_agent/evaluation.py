@@ -7,6 +7,7 @@ from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
+import errno
 import hashlib
 import json
 import math
@@ -31,6 +32,7 @@ from .models import FinalAnswer, ToolCall, ToolResult
 from .openai_provider import (
     OpenAIConfig,
     OpenAIProvider,
+    OpenAIRequestCapacityError,
     ProviderUsage,
     is_official_deepseek_base_url,
 )
@@ -51,6 +53,7 @@ EXPERIMENT_ID = "repo-agent-day7-v1"
 MAX_EVALUATION_OUTPUT_BYTES = 64 * 1024
 MAX_AGENT_SECONDS = 1200.0
 MAX_AGENT_STEPS = 30
+MAX_AGENT_TOKENS = 30_000
 MAX_EVALUATION_FILES = 12
 MAX_EVALUATION_CHANGED_LINES = 1200
 MAX_STATE_BYTES = 256 * 1024
@@ -60,7 +63,7 @@ DEFAULT_CANARY_TASK_ID = "py-bugfix-001"
 FORMAL_BUDGET_POLICY = {
     "agent_timeout_seconds": MAX_AGENT_SECONDS,
     "max_tool_calls": MAX_AGENT_STEPS,
-    "max_tokens": 30000,
+    "max_tokens": MAX_AGENT_TOKENS,
     "max_changed_files": MAX_EVALUATION_FILES,
     "max_changed_lines": MAX_EVALUATION_CHANGED_LINES,
     "max_patch_bytes": MAX_PATCH_BYTES,
@@ -83,11 +86,17 @@ EXPECTED_EXPERIMENT_COUNTS = {
     "full": 20,
     "total": 44,
 }
-
 _FORMAL_TASK_ID_RE = re.compile(r"^(?:py|java)-bugfix-[0-9]{3}$")
-_DEVELOPMENT_TASK_ID_RE = re.compile(r"^(?:py|java)-development-[0-9]{3}$")
-_TASK_ID_RE = re.compile(r"^(?:py|java)-(?:bugfix|development)-[0-9]{3}$")
+_OSS_TASK_ID_RE = re.compile(r"^py-oss-[0-9]{3}$")
+_NON_FORMAL_TASK_ID_RE = re.compile(
+    r"^(?:(?:py|java)-development|py-oss)-[0-9]{3}$"
+)
+_TASK_ID_RE = re.compile(
+    r"^(?:(?:py|java)-(?:bugfix|development)|py-oss)-[0-9]{3}$"
+)
 _DIGEST_RE = re.compile(r"^[a-f0-9]{64}$")
+_SCORE_TEMP_PREFIX = "s-"
+_REGRESSION_TEMP_PREFIX = "r-"
 _DESCRIPTOR_NAMES = frozenset(
     {"pom.xml", "pyproject.toml", "pytest.ini", "requirements.txt", "setup.cfg"}
 )
@@ -106,6 +115,13 @@ _BASELINE_SYSTEM_PROMPT = (
     "Never weaken existing tests or change build descriptors. Return a concise final "
     "answer when finished."
 )
+
+
+def _scoring_temp_prefix(task_id: str, *, regression: bool = False) -> str:
+    """Keep nested scoring checkouts short enough for Windows path limits."""
+
+    marker = _REGRESSION_TEMP_PREFIX if regression else _SCORE_TEMP_PREFIX
+    return f"{marker}{task_id}-"
 
 
 class EvaluationError(RuntimeError):
@@ -218,7 +234,7 @@ class EvaluationTaskResult(BaseModel):
     suite_id: str = Field(min_length=1, max_length=256)
     manifest_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     task_id: str = Field(
-        pattern=r"^(?:py|java)-(?:bugfix|development)-[0-9]{3}$"
+        pattern=r"^(?:(?:py|java)-(?:bugfix|development)|py-oss)-[0-9]{3}$"
     )
     task_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     variant: EvaluationVariant
@@ -261,6 +277,7 @@ class EvaluationReport(BaseModel):
     schema_version: Literal[1] = 1
     experiment_id: str = Field(min_length=1, max_length=256)
     suite_id: str = Field(min_length=1, max_length=256)
+    formal_evaluation: bool | None = None
     manifest_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     variant: EvaluationVariant
     trial: int = Field(ge=1, le=3)
@@ -407,7 +424,7 @@ def load_benchmark_suite(
     if type(formal_evaluation) is not bool:
         raise EvaluationError("benchmark manifest formal_evaluation must be boolean")
     task_id_pattern = (
-        _FORMAL_TASK_ID_RE if formal_evaluation else _DEVELOPMENT_TASK_ID_RE
+        _FORMAL_TASK_ID_RE if formal_evaluation else _NON_FORMAL_TASK_ID_RE
     )
     requested = _validate_task_selection(task_ids, pattern=task_id_pattern)
     entries: dict[str, Mapping[str, object]] = {}
@@ -446,9 +463,10 @@ def load_benchmark_suite(
         if not isinstance(assets, Mapping):
             raise EvaluationError(f"{task_id}: metadata assets are malformed")
         setup_asset = assets.get("setup_patch")
-        if formal_evaluation:
+        if formal_evaluation or _OSS_TASK_ID_RE.fullmatch(task_id):
             if setup_asset != "setup.patch":
-                raise EvaluationError(f"{task_id}: formal task setup patch is missing")
+                kind = "formal" if formal_evaluation else "OSS"
+                raise EvaluationError(f"{task_id}: {kind} task setup patch is missing")
             setup_patch = _safe_suite_path(task_root, setup_asset, directory=False)
             _read_bounded(setup_patch, MAX_PATCH_BYTES, "setup patch")
         else:
@@ -745,9 +763,10 @@ class EvaluationRunner:
         return False
 
     def close(self) -> None:
-        service, self._service = self._service, None
+        service = self._service
         if service is not None:
-            service.close(timeout=45.0)
+            service.close()
+            self._service = None
 
     def run(self) -> EvaluationReport:
         results: list[EvaluationTaskResult] = []
@@ -1101,8 +1120,33 @@ class EvaluationRunner:
                     )
                     break
                 try:
+                    current_usage = provider.usage
+                    if current_usage.response_count == 0:
+                        response_tokens = MAX_AGENT_TOKENS
+                    elif (
+                        not current_usage.complete
+                        or current_usage.total_tokens is None
+                    ):
+                        status = "usage_unavailable"
+                        error = "model response did not report complete token usage"
+                        break
+                    else:
+                        response_tokens = (
+                            MAX_AGENT_TOKENS - current_usage.total_tokens
+                        )
+                    if response_tokens <= 0:
+                        status = "budget_exceeded"
+                        error = (
+                            f"model token budget exhausted {MAX_AGENT_TOKENS} tokens"
+                        )
+                        break
+                    provider.set_response_token_budget(response_tokens)
                     provider.set_request_timeout(max(0.001, min(30.0, remaining)))
                     decision = provider.next_step(task.issue, tuple(results))
+                except OpenAIRequestCapacityError as exc:
+                    status = "budget_exceeded"
+                    error = _safe_error(exc, self.secrets)
+                    break
                 except Exception as exc:
                     timed_out = time.time() >= deadline_epoch
                     status = "timed_out" if timed_out else "provider_error"
@@ -1125,9 +1169,11 @@ class EvaluationRunner:
                     status = "usage_unavailable"
                     error = "model response did not report complete token usage"
                     break
-                if current_usage.total_tokens > 30000:
+                if current_usage.total_tokens > MAX_AGENT_TOKENS:
                     status = "budget_exceeded"
-                    error = "model token budget exceeded 30000 tokens"
+                    error = (
+                        f"model token budget exceeded {MAX_AGENT_TOKENS} tokens"
+                    )
                     break
                 if isinstance(decision, FinalAnswer):
                     status = (
@@ -1250,7 +1296,10 @@ class EvaluationRunner:
         timed_out = record.status not in TERMINAL_STATUSES
         if timed_out:
             service.cancel(record.run_id)
-            record = service.wait(record.run_id, timeout=45.0)
+            record = service.wait(
+                record.run_id,
+                timeout=service.close_timeout_seconds,
+            )
         patch_path = service.artifact_path(record.run_id, "patch")
         patch_bytes = _read_bounded(
             patch_path, MAX_PATCH_BYTES + 1, "candidate patch"
@@ -1300,13 +1349,15 @@ class EvaluationRunner:
         self, task: BenchmarkTask, patch: ValidatedPatch
     ) -> ScoreOutcome:
         original_tests_unchanged, build_unchanged = _candidate_policy(task, patch)
-        public = self._run_score_check(task, patch.text, hidden=False)
-        hidden = self._run_score_check(task, patch.text, hidden=True)
+        public = self._run_score_check(task, patch, hidden=False)
+        hidden = self._run_score_check(task, patch, hidden=True)
         public_digest = self._persist_scoring_result(task, "public", public)
         hidden_digest = self._persist_scoring_result(task, "hidden", hidden)
         regression_paths = _regression_test_paths(task, patch)
         regression_added = bool(regression_paths)
-        regression_candidate = hidden.ok if regression_paths else False
+        # The public candidate run includes every newly added regression test.
+        # Hidden-only failures must not be reported as a regression-test failure.
+        regression_candidate = public.ok if regression_paths else False
         regression_result: CheckRunResult | None = None
         if regression_paths:
             regression_buggy, regression_result = self._regression_fails_on_buggy(
@@ -1349,22 +1400,28 @@ class EvaluationRunner:
     def _run_score_check(
         self,
         task: BenchmarkTask,
-        patch: str,
+        patch: ValidatedPatch,
         *,
         hidden: bool,
     ) -> CheckRunResult:
         with tempfile.TemporaryDirectory(
-            prefix=f"repo-agent-eval-score-{task.id}-",
+            # Keep the disposable checkout path below Windows MAX_PATH even
+            # when the durable result directory has the full trial hierarchy.
+            prefix=_scoring_temp_prefix(task.id),
             dir=self.result_dir,
         ) as temporary:
             repository = Path(temporary) / "repository"
             _copy_baseline_and_setup(task, repository)
             if hidden:
-                _inject_hidden_tests(task, repository)
+                _inject_hidden_tests(
+                    task,
+                    repository,
+                    occupied_paths=patch.paths,
+                )
             _initialize_repository(repository)
             return CheckRunner(
                 repository,
-                candidate_patch=patch,
+                candidate_patch=patch.text,
                 allow_bootstrap=self.allow_bootstrap,
                 phase_timeout_seconds=300.0,
                 total_timeout_seconds=MAX_AGENT_SECONDS,
@@ -1379,7 +1436,9 @@ class EvaluationRunner:
         regression_paths: Sequence[str],
     ) -> tuple[bool, CheckRunResult]:
         with tempfile.TemporaryDirectory(
-            prefix=f"repo-agent-eval-regression-{task.id}-",
+            # The regression checkout is nested one level deeper than score
+            # checkouts; use the shortest descriptive prefix here.
+            prefix=_scoring_temp_prefix(task.id, regression=True),
             dir=self.result_dir,
         ) as temporary:
             root = Path(temporary)
@@ -1601,6 +1660,7 @@ class EvaluationRunner:
                 _read_bounded(path, MAX_STATE_BYTES, "experiment manifest"),
                 "experiment manifest",
             )
+            existing = _normalize_legacy_group_manifest(existing, payload)
             if existing != payload:
                 raise EvaluationError(
                     "evaluation output already belongs to a different experiment"
@@ -1671,12 +1731,17 @@ class EvaluationRunner:
         return EvaluationReport(
             experiment_id=EXPERIMENT_ID,
             suite_id=self.suite.suite_id,
+            formal_evaluation=self.suite.formal_evaluation,
             manifest_sha256=self.suite.manifest_sha256,
             variant=self.variant,
             trial=self.trial,
             model=self.model,
-            status="completed" if len(completed) == len(results) else "partial",
-            task_count=len(results),
+            status=(
+                "completed"
+                if len(completed) == len(results) == len(self.suite.tasks)
+                else "partial"
+            ),
+            task_count=len(self.suite.tasks),
             completed_task_count=len(completed),
             skipped_task_count=skipped,
             solved_task_count=solved,
@@ -2004,10 +2069,11 @@ def _group_manifest_payload(
     price_source: PriceSource = (
         "configured" if input_cost_per_million is not None else "unavailable"
     )
-    return {
+    payload: dict[str, object] = {
         "schema_version": EVALUATION_SCHEMA_VERSION,
         "experiment_id": EXPERIMENT_ID,
         "suite_id": suite.suite_id,
+        "formal_evaluation": suite.formal_evaluation,
         "manifest_sha256": suite.manifest_sha256,
         "variant": variant,
         "trial": trial,
@@ -2027,9 +2093,11 @@ def _group_manifest_payload(
             "output_cost_per_million": output_cost_per_million,
             "price_source": price_source,
         },
-        "experiment_counts": EXPECTED_EXPERIMENT_COUNTS,
-        "full_repeat_task_ids": list(FULL_REPEAT_TASK_IDS),
     }
+    if suite.formal_evaluation:
+        payload["experiment_counts"] = EXPECTED_EXPERIMENT_COUNTS
+        payload["full_repeat_task_ids"] = list(FULL_REPEAT_TASK_IDS)
+    return payload
 
 
 def _write_or_validate_json(
@@ -2153,8 +2221,33 @@ def _validate_group_manifest(
         _read_bounded(path, MAX_STATE_BYTES, "formal group manifest"),
         "formal group manifest",
     )
+    value = _normalize_legacy_group_manifest(value, expected)
     if value != expected:
         raise EvaluationError(f"formal group manifest does not match its job group: {path}")
+
+
+def _normalize_legacy_group_manifest(
+    value: object,
+    expected: Mapping[str, object],
+) -> object:
+    """Interpret pre-flag manifests without rewriting historical evidence."""
+
+    if not isinstance(value, dict) or "formal_evaluation" in value:
+        return value
+    expected_scope = expected.get("formal_evaluation")
+    if type(expected_scope) is not bool:
+        return value
+    if expected_scope is False and (
+        value.get("experiment_counts") != EXPECTED_EXPERIMENT_COUNTS
+        or value.get("full_repeat_task_ids") != list(FULL_REPEAT_TASK_IDS)
+    ):
+        return value
+    normalized = dict(value)
+    normalized["formal_evaluation"] = expected_scope
+    if expected_scope is False:
+        normalized.pop("experiment_counts")
+        normalized.pop("full_repeat_task_ids")
+    return normalized
 
 
 def _read_scoring_artifact(path: Path, phase: str) -> tuple[CheckRunResult, str]:
@@ -2289,7 +2382,7 @@ def _validate_result_provenance(
             build_unchanged,
             bool(regression_paths),
             regression_failed,
-            hidden.ok if regression_paths else False,
+            public.ok if regression_paths else False,
             original_tests_unchanged
             and build_unchanged
             and public.status
@@ -2905,6 +2998,7 @@ def _attributable_regression_failure(
         re.search(
             r"(?im)(?:^|\s)(?:SUB)?FAILED(?:\s|$)"
             r"|(?:^|\s)\d+\s+failed(?:\s|,|=|$)"
+            r"|(?:^|\s)ERROR\s+collecting(?:\s|$)"
             r"|=+[^\n]*\bfailed\b",
             combined,
         )
@@ -2935,23 +3029,64 @@ def _copy_baseline_and_setup(task: BenchmarkTask, destination: Path) -> None:
     _apply_patch(destination, patch, task.id)
 
 
-def _inject_hidden_tests(task: BenchmarkTask, repository: Path) -> None:
+def _inject_hidden_tests(
+    task: BenchmarkTask,
+    repository: Path,
+    *,
+    occupied_paths: Sequence[str] = (),
+) -> None:
     hidden = task.root / "hidden_tests"
     _reject_links(hidden)
-    files = tuple(path for path in hidden.rglob("*") if path.is_file())
+    files = tuple(sorted(path for path in hidden.rglob("*") if path.is_file()))
     if not files:
         raise EvaluationError(f"{task.id}: hidden test directory is empty")
+    occupied = {
+        PurePosixPath(path).as_posix().casefold() for path in occupied_paths
+    }
+    occupied.update(
+        path.relative_to(repository).as_posix().casefold()
+        for path in repository.rglob("*")
+        if path.is_file()
+    )
     for source in files:
         relative = source.relative_to(hidden)
-        target = (
-            repository / "tests" / relative
+        target_relative = (
+            Path("tests") / relative
             if task.language == "python"
-            else repository / "src" / "test" / "java" / relative
+            else Path("src") / "test" / "java" / relative
         )
+        target = repository / target_relative
+        if target_relative.as_posix().casefold() in occupied:
+            if (
+                task.language == "python"
+                and source.suffix == ".py"
+                and source.name.startswith("test_")
+            ):
+                safe_task_id = task.id.replace("-", "_")
+                for index in range(1, MAX_EVALUATION_FILES + 2):
+                    remapped_relative = target_relative.with_name(
+                        f"test_repo_agent_hidden_{safe_task_id}_{index:02d}.py"
+                    )
+                    remapped = repository / remapped_relative
+                    if (
+                        remapped_relative.as_posix().casefold() not in occupied
+                    ):
+                        target = remapped
+                        target_relative = remapped_relative
+                        break
+                else:  # pragma: no cover - bounded by the candidate file limit
+                    raise EvaluationError(
+                        f"{task.id}: no collision-free hidden test path is available"
+                    )
+            else:
+                raise EvaluationError(
+                    f"{task.id}: hidden test collides with public or candidate file"
+                )
         if target.exists():
             raise EvaluationError(f"{task.id}: hidden test collides with public test")
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, target)
+        occupied.add(target_relative.as_posix().casefold())
 
 
 def _initialize_repository(repository: Path) -> None:
@@ -2966,7 +3101,21 @@ def _initialize_repository(repository: Path) -> None:
             f"--template={template}",
         )
     finally:
-        template.rmdir()
+        # Git may remove an empty custom template directory while initializing
+        # on Windows. Treat that specific race as already-cleaned; any other
+        # filesystem error remains visible instead of broadening cleanup.
+        try:
+            template.rmdir()
+        except FileNotFoundError:
+            # Git may remove an empty template before returning on Windows.
+            pass
+        except OSError as exc:
+            # Windows may report a vanished temporary template as WinError 3
+            # rather than the platform-independent FileNotFoundError errno.
+            # Only that specific no-such-path race is idempotent; preserve all
+            # other cleanup failures.
+            if exc.errno != errno.ENOENT and getattr(exc, "winerror", None) != 3:
+                raise
     _run_git(repository, "add", "--all")
     environment = _subprocess_environment()
     environment.update(
@@ -3131,8 +3280,19 @@ def _durable_usage(
         if not isinstance(usage, Mapping):
             complete = False
             continue
-        response_count += _nonnegative_int(usage.get("response_count"))
-        reported_count += _nonnegative_int(usage.get("reported_response_count"))
+        event_response_count = _nonnegative_int(usage.get("response_count"))
+        event_reported_count = _nonnegative_int(usage.get("reported_response_count"))
+        response_count += event_response_count
+        reported_count += event_reported_count
+        # A phase can fail closed during local request-capacity validation before
+        # any HTTP request. That zero-response summary is neutral: it must not
+        # erase complete usage already reported by earlier phases.
+        if (
+            event_response_count == 0
+            and event_reported_count == 0
+            and event.get("request_not_started") is True
+        ):
+            continue
         values = (
             usage.get("input_tokens"),
             usage.get("cached_input_tokens"),
@@ -3243,17 +3403,17 @@ def _request_policy(model: str, base_url: str | None) -> dict[str, Any]:
         ),
         "tool_choice": {
             "basic_loop": "auto (provider default)",
-            "planning_initial": "auto (provider default)",
-            "planning_follow_up": "submit_change_plan",
-            "implement": "auto (provider default)",
-            "repair": "auto (provider default)",
+            "planning_initial": "submit_change_plan (sole advertised tool)",
+            "planning_follow_up": "not applicable (single response)",
+            "implement": "read_files forced initially; write_files forced after read",
+            "repair": "read_files forced initially; write_files forced after read",
             "review": "submit_review",
         },
         "phase_reasoning_effort": {
             "basic_loop": default_reasoning,
             "planning": "none" if official_deepseek else default_reasoning,
-            "implement": "low" if official_deepseek else default_reasoning,
-            "repair": "low" if official_deepseek else default_reasoning,
+            "implement": "none" if official_deepseek else default_reasoning,
+            "repair": "none" if official_deepseek else default_reasoning,
             "review": "none" if official_deepseek else default_reasoning,
         },
         "parallel_tool_calls": False,
@@ -3349,7 +3509,7 @@ def _validate_task_selection(
 def _require_formal_suite(suite: BenchmarkSuite) -> None:
     if not suite.formal_evaluation:
         raise EvaluationError(
-            "development benchmark suites are supported only in single mode"
+            "non-formal benchmark suites are supported only in single mode"
         )
 
 

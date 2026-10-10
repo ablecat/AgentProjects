@@ -62,8 +62,7 @@
           <fieldset>
             <legend>Sandbox image</legend>
             <div class="segmented-control">
-              <label><input type="radio" name="image" value="repo-agent-python:0.1" checked><span>Python 3.11</span></label>
-              <label><input type="radio" name="image" value="repo-agent-maven:0.1"><span>Maven / Java 21</span></label>
+              <label><input type="radio" name="image" value="repo-agent-python:0.1" checked><span>Python 3.11 / pytest</span></label>
             </div>
           </fieldset>
           <details class="advanced-settings">
@@ -131,6 +130,10 @@
 
           <section class="answer-section" aria-labelledby="answer-heading">
             <h3 id="answer-heading">Run summary</h3><p id="answer-text"></p><p class="run-error" id="run-error" hidden></p>
+          </section>
+          <section class="activity-section" id="activity-section" aria-labelledby="activity-heading" hidden>
+            <div class="section-heading-row"><h3 id="activity-heading">Live activity</h3><span id="activity-state" aria-live="polite">Idle</span></div>
+            <ol class="activity-list" id="activity-list" aria-live="polite"></ol>
           </section>
           <section class="tools-section" aria-labelledby="tools-heading">
             <div class="section-heading-row"><h3 id="tools-heading">Verification</h3><span id="tool-summary"></span></div>

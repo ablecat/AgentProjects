@@ -17,13 +17,14 @@ import pytest
 
 import repo_agent.web as web
 from repo_agent.artifacts import ArtifactError
-from repo_agent.persistence import RunNotFoundError
+from repo_agent.persistence import EventPage, RunNotFoundError
 from repo_agent.processes import CapturedProcess
 from repo_agent.run_models import RunRecord
 from repo_agent.service import (
     InvalidRunTransitionError,
     QueueFullError,
     RepositoryNotAllowedError,
+    ServiceSnapshot,
 )
 
 
@@ -79,6 +80,7 @@ class EdgeService:
         )
         (self.checks / "verify.log").write_text("passed\n", encoding="utf-8")
         self.record = _record(repository)
+        self.events: tuple[dict[str, object], ...] = ()
         self.actions: list[str] = []
         self.list_error: Exception | None = None
 
@@ -88,6 +90,27 @@ class EdgeService:
 
     def ready(self) -> bool:
         return True
+
+    def scheduler_snapshot(self) -> ServiceSnapshot:
+        queued = (self.record.run_id,) if self.record.status == "queued" else ()
+        active = (
+            (self.record.run_id,)
+            if self.record.status in {"planning", "running"}
+            else ()
+        )
+        return ServiceSnapshot(
+            ready=True,
+            queue_depth=len(queued),
+            queue_capacity=4,
+            active_count=len(active),
+            max_concurrency=1,
+            queued_run_ids=queued,
+            active_run_ids=active,
+        )
+
+    def queue_position(self, run_id: str) -> int | None:
+        queued = self.scheduler_snapshot().queued_run_ids
+        return queued.index(run_id) + 1 if run_id in queued else None
 
     def list_runs(self):
         if self.list_error is not None:
@@ -123,6 +146,29 @@ class EdgeService:
         if kind == "checks":
             return self.checks
         return self.artifacts / {"patch": "patch.diff"}.get(kind, "missing")
+
+    def event_page(
+        self, run_id: str, *, after_sequence: int, limit: int = 64
+    ) -> EventPage:
+        self.get_run(run_id)
+        events = tuple(
+            event for event in self.events if event["sequence"] > after_sequence
+        )[:limit]
+        latest = max((int(event["sequence"]) for event in self.events), default=0)
+        return EventPage(events, latest)
+
+    def wait_for_events(
+        self,
+        run_id: str,
+        *,
+        after_sequence: int,
+        timeout: float,
+        limit: int = 64,
+    ) -> EventPage:
+        del timeout
+        return self.event_page(
+            run_id, after_sequence=after_sequence, limit=limit
+        )
 
 
 @contextmanager
@@ -160,6 +206,181 @@ def _request(
     raw = response.read()
     connection.close()
     return response.status, json.loads(raw.decode("utf-8"))
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "after=",
+        "after=-1",
+        "after=abc",
+        "after=1&after=2",
+        "after=9223372036854775808",
+        "before=1",
+        "broken",
+    ),
+)
+def test_event_stream_rejects_invalid_cursors(
+    committed_repository: Path, tmp_path: Path, query: str
+) -> None:
+    service = EdgeService(committed_repository, tmp_path / "artifacts")
+    with _running_server(committed_repository, service=service) as (_, server):
+        status, payload = _request(
+            server,
+            "GET",
+            f"/api/agent/runs/{'a' * 32}/events?{query}",
+        )
+
+    assert status == HTTPStatus.BAD_REQUEST
+    assert payload["error"]["code"] == "invalid_cursor"
+
+
+def test_event_cursor_prefers_last_event_id_header() -> None:
+    handler = object.__new__(web.RepoAgentRequestHandler)
+    handler.headers = Message()
+    handler.headers.add_header("Last-Event-ID", "7")
+
+    assert handler._validated_event_cursor("after=2") == 7
+
+    handler.headers.add_header("Last-Event-ID", "8")
+    with pytest.raises(web._WebRequestError, match="at most once"):
+        handler._validated_event_cursor("")
+
+
+def test_public_event_allowlists_strings_and_omits_raw_detail() -> None:
+    secret = "configured-secret-value"
+    payload = web._public_event(
+        "a" * 32,
+        {
+            "sequence": 3,
+            "event": f"Bearer {secret}",
+            "node": secret,
+            "phase": secret,
+            "timestamp": secret,
+            "tool_calls": 4,
+            "model_usage": {
+                "total_tokens": 1200,
+                "complete": True,
+                "private": "private-value",
+            },
+            "detail": {"authorization": "Bearer private-value"},
+            "tool_failures": [{"error_summary": "private-value"}],
+        },
+    )
+
+    assert payload["sequence"] == 3
+    assert payload["event"] == "workflow_event"
+    assert payload["tool_calls"] == 4
+    assert payload["model_usage"] == {"total_tokens": 1200, "complete": True}
+    assert "node" not in payload
+    assert "phase" not in payload
+    assert "timestamp" not in payload
+    assert "detail" not in payload
+    assert "tool_failures" not in payload
+    assert secret not in json.dumps(payload)
+    assert "Bearer" not in json.dumps(payload)
+    assert "private-value" not in json.dumps(payload)
+
+    legitimate = web._public_event(
+        "a" * 32,
+        {
+            "sequence": 4,
+            "event": "model_tool_summary",
+            "node": "verify",
+            "phase": "implement",
+            "timestamp": "2026-10-09T01:02:03.456Z",
+        },
+    )
+    assert legitimate == {
+        "run_id": "a" * 32,
+        "sequence": 4,
+        "event": "model_tool_summary",
+        "node": "verify",
+        "phase": "implement",
+        "timestamp": "2026-10-09T01:02:03.456Z",
+    }
+
+    now = "2026-10-09T01:02:03.456Z"
+    state = web._event_state(
+        RunRecord(
+            run_id="a" * 32,
+            repo_path="D:/repository",
+            task="repair",
+            status="running",
+            current_node="verify",
+            created_at=now,
+            updated_at=secret,
+        ),
+        cursor=4,
+    )
+    assert state == {
+        "run_id": "a" * 32,
+        "status": "running",
+        "node": "verify",
+        "cursor": 4,
+        "reset": False,
+    }
+
+
+def test_event_stream_limit_returns_429_without_entering_service(
+    committed_repository: Path, tmp_path: Path
+) -> None:
+    service = EdgeService(committed_repository, tmp_path / "artifacts")
+    with _running_server(committed_repository, service=service) as (_, server):
+        acquired = [
+            server.event_stream_slots.acquire(blocking=False)
+            for _ in range(web.MAX_EVENT_STREAMS)
+        ]
+        try:
+            connection = HTTPConnection(
+                web.HOST, server.server_address[1], timeout=5
+            )
+            connection.request(
+                "GET", f"/api/agent/runs/{'a' * 32}/events"
+            )
+            response = connection.getresponse()
+            payload = json.loads(response.read().decode("utf-8"))
+            assert response.status == HTTPStatus.TOO_MANY_REQUESTS
+            assert response.headers["Retry-After"] == "2"
+            assert payload["error"]["code"] == "too_many_streams"
+            connection.close()
+        finally:
+            for held in acquired:
+                if held:
+                    server.event_stream_slots.release()
+
+
+def test_event_stream_disconnect_releases_its_slot(
+    committed_repository: Path, tmp_path: Path
+) -> None:
+    service = EdgeService(committed_repository, tmp_path / "artifacts")
+    service.record = _record(committed_repository, status="awaiting_approval")
+
+    class DisconnectedWriter:
+        def write(self, _body: bytes) -> None:
+            raise BrokenPipeError
+
+        def flush(self) -> None:
+            raise AssertionError("flush must not follow a failed write")
+
+    slots = threading.BoundedSemaphore(1)
+    handler = object.__new__(web.RepoAgentRequestHandler)
+    handler.server = SimpleNamespace(
+        durable_service=service,
+        event_stream_slots=slots,
+        event_stream_shutdown=threading.Event(),
+    )
+    handler.headers = Message()
+    handler.wfile = DisconnectedWriter()
+    handler.close_connection = False
+    handler.send_response = lambda _status: None
+    handler.send_header = lambda _name, _value: None
+    handler.end_headers = lambda: None
+
+    handler._handle_agent_events("a" * 32, "")
+
+    assert handler.close_connection is True
+    assert slots.acquire(blocking=False) is True
 
 
 def _raw_post(
@@ -606,17 +827,33 @@ def test_durable_service_state_tracks_model_configuration(monkeypatch) -> None:
         "enabled": False,
         "ready": False,
         "queue_depth": 0,
+        "queue_capacity": 0,
+        "active_count": 0,
+        "max_concurrency": 0,
         "model_configured": False,
         "model": None,
     }
 
     for name in ("REPO_AGENT_API_KEY", "REPO_AGENT_BASE_URL", "REPO_AGENT_MODEL"):
         monkeypatch.setenv(name, "configured")
-    service = SimpleNamespace(ready=lambda: True, queue_depth=2)
+    service = SimpleNamespace(
+        scheduler_snapshot=lambda: ServiceSnapshot(
+            ready=True,
+            queue_depth=2,
+            queue_capacity=4,
+            active_count=1,
+            max_concurrency=1,
+            queued_run_ids=("a" * 32, "b" * 32),
+            active_run_ids=("c" * 32,),
+        )
+    )
     enabled = web._durable_service_state(service)
     assert enabled["enabled"] is True
     assert enabled["ready"] is True
     assert enabled["queue_depth"] == 2
+    assert enabled["queue_capacity"] == 4
+    assert enabled["active_count"] == 1
+    assert enabled["max_concurrency"] == 1
     assert enabled["model_configured"] is True
     assert enabled["model"] == "configured"
 
@@ -655,8 +892,13 @@ def test_application_state_marks_individually_missing_images(
     state = web._application_state(committed_repository)
 
     images = {image["tag"]: image for image in state["docker"]["images"]}
-    assert images["repo-agent-python:0.1"]["present"] is False
-    assert images["repo-agent-maven:0.1"]["present"] is True
+    assert images == {
+        "repo-agent-python:0.1": {
+            "tag": "repo-agent-python:0.1",
+            "label": "Python 3.11",
+            "present": False,
+        }
+    }
 
 
 def test_command_capture_maps_spawn_timeout_and_exit_errors(

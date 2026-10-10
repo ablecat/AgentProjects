@@ -554,14 +554,29 @@ class WorkflowEngine:
                     status = "failed"
                     error = outcome.error or outcome.summary or "review rejected changes"
             elif not outcome.ok:
-                return self._save_failed_outcome(
-                    latest,
-                    node=node,
-                    attempt=attempt,
-                    outcome=outcome,
-                    duration_ms=duration_ms,
-                    metrics=metrics,
-                )
+                # A model can spend its implement turn on a malformed tool
+                # call and leave no candidate at all. Give that specific,
+                # recoverable outcome the already-budgeted single repair pass;
+                # all other implementation failures remain terminal.
+                if (
+                    node == "implement"
+                    and outcome.error in {
+                        "model finished without producing a candidate patch",
+                        "candidate patch does not add the required regression test",
+                    }
+                    and record.metrics.repair_attempts < MAX_REPAIR_ATTEMPTS
+                ):
+                    next_node = "repair"
+                    status = "running"
+                else:
+                    return self._save_failed_outcome(
+                        latest,
+                        node=node,
+                        attempt=attempt,
+                        outcome=outcome,
+                        duration_ms=duration_ms,
+                        metrics=metrics,
+                    )
             else:
                 next_node = _successor(node)
                 if node == "prepare":

@@ -25,6 +25,9 @@ jobs:
       - run: mypy src/repo_agent
       - run: python -m pytest --cov=repo_agent --cov-report=term-missing --cov-fail-under=80
       - run: python benchmarks/validate.py --structure-only
+      - run: python benchmarks/tasks/python/development/validate.py --structure-only
+      - run: python benchmarks/tasks/python/bugfix/validate.py
+      - run: python benchmarks/tasks/python/oss/validate.py
 
   docker-e2e:
     runs-on: ubuntu-latest
@@ -35,8 +38,9 @@ jobs:
         with:
           python-version: "3.11"
       - run: python -m pip install -e ".[dev]"
+      - name: Pull pinned sandbox bases
+        run: docker pull python:3.11.16-slim-bookworm@sha256:528257d48c1da0dcecc2e725d1ae34498d60c965f1241e39cd6a85a8859bdf84
       - run: docker build --pull=false -t repo-agent-python:0.1 docker/python
-      - run: docker build --pull=false -t repo-agent-maven:0.1 docker/maven
       - run: python scripts/smoke-day1.py
       - run: python scripts/smoke-day2.py
       - run: python scripts/smoke-day3.py
@@ -58,3 +62,5 @@ jobs:
           tests/test_processes.py
           tests/test_sandbox.py
           tests/test_repository_map_edges.py
+          tests/test_start_relay_script.py
+      - run: python benchmarks/tasks/python/oss/validate.py

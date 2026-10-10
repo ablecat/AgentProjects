@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Callable, Literal, Protocol, Sequence, TypeAlias, cast
 import uuid
 
+from .git_environment import _sanitized_git_environment
 from .models import CandidateArtifact, ToolCall, ToolResult
 from .patches import ValidatedPatch
 from .policy import DEFAULT_PATH_POLICY, RepositoryPathError
@@ -492,6 +493,23 @@ class DockerSandbox:
                     exit_code=applied.returncode,
                 )
             self._verify_patch_postcondition(patch, before_paths)
+            after_patch = _git_bytes(
+                self.snapshot_path,
+                "diff",
+                "--cached",
+                "--binary",
+                "--no-ext-diff",
+                "--no-textconv",
+                "HEAD",
+                "--",
+            )
+            if after_patch == before_patch:
+                return _failed_result(
+                    call,
+                    "Patch made no effective change to the candidate workspace; "
+                    "submit an incremental correction diff against the current "
+                    "candidate workspace",
+                )
             self._workspace_revision += 1
         except (OSError, RepositoryPathError, SandboxError) as exc:
             if mutation_attempted:
@@ -1282,36 +1300,6 @@ def _restore_candidate_state(repo: Path, prior_patch: bytes) -> None:
 
 def _git_output(repo: Path, *args: str) -> str:
     return _run_git("-C", str(repo), *args)
-
-
-def _sanitized_git_environment() -> dict[str, str]:
-    blocked_credentials = {
-        "ANTHROPIC_API_KEY",
-        "AZURE_OPENAI_API_KEY",
-        "OPENAI_API_KEY",
-        "REPO_AGENT_API_KEY",
-        "REPO_AGENT_BEARER_TOKEN",
-    }
-    environment = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.upper().startswith("GIT_")
-        and key.upper() not in blocked_credentials
-    }
-    environment.update(
-        {
-            "GIT_ALLOW_PROTOCOL": "file",
-            "GIT_ATTR_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": os.devnull,
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_SYSTEM": os.devnull,
-            "GIT_LFS_SKIP_SMUDGE": "1",
-            "GIT_NO_LAZY_FETCH": "1",
-            "GIT_PROTOCOL_FROM_USER": "0",
-            "GIT_TERMINAL_PROMPT": "0",
-        }
-    )
-    return environment
 
 
 def _validate_run_directory(run_root: Path, expected_base: Path) -> None:

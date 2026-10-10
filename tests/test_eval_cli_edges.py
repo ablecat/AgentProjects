@@ -305,6 +305,8 @@ def test_merge_forwards_publish_directory_and_emits_text(
         [
             "eval",
             "--merge",
+            "--benchmark-dir",
+            "benchmarks",
             "--output-dir",
             str(output_dir),
             "--report-dir",
@@ -398,6 +400,42 @@ def test_single_variant_validation_emits_text_and_forwards_selection(
         "variant": "no-review",
         "task_ids": ("py-bugfix-005",),
         "secrets": ("validation-secret",),
+    }
+
+
+def test_single_variant_defaults_to_python_bugfix_suite(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    received: dict[str, Any] = {}
+
+    def fake_validation(benchmark_dir, variant, *, task_ids, secrets):
+        received.update(
+            benchmark_dir=benchmark_dir,
+            variant=variant,
+            task_ids=task_ids,
+            secrets=secrets,
+        )
+        return {
+            "status": "validated",
+            "variant": variant,
+            "suite_id": "repo-agent-python-bugfix-v1",
+            "task_count": 6,
+            "benchmark_dir": str(benchmark_dir),
+            "execution_started": False,
+        }
+
+    monkeypatch.setattr(cli, "validation_manifest", fake_validation)
+
+    exit_code = cli.main(["eval", "--variant", "full", "--format", "json"])
+
+    assert exit_code == 0
+    assert json.loads(capsys.readouterr().out)["task_count"] == 6
+    assert received == {
+        "benchmark_dir": Path("benchmarks/tasks/python/bugfix"),
+        "variant": "full",
+        "task_ids": (),
+        "secrets": (),
     }
 
 

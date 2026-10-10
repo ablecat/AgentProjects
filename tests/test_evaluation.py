@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import shutil
 import time
 from types import SimpleNamespace
@@ -32,10 +32,10 @@ from repo_agent.evaluation import (
     run_experiment_shard,
     write_experiment_matrix_manifest,
 )
-from repo_agent.openai_provider import OpenAIConfig
+from repo_agent.openai_provider import OpenAIConfig, OpenAIRequestCapacityError
 from repo_agent.openai_provider import ProviderUsage
 from repo_agent.patches import PatchFile, ValidatedPatch
-from repo_agent.models import ToolCall, ToolResult
+from repo_agent.models import FinalAnswer, ToolCall, ToolResult
 
 
 PROJECT_ROOT = Path(__file__).parents[1]
@@ -99,7 +99,9 @@ def _synthetic_result(
             build_unchanged=True,
             regression_test_added=True,
             regression_failed_on_buggy=True,
-            regression_passed_on_candidate=solved,
+            # Public evidence includes the added regression test even when an
+            # unrelated hidden behavior remains unsolved.
+            regression_passed_on_candidate=True,
             policy_passed=True,
             public_check_sha256=digest,
             hidden_check_sha256=digest,
@@ -352,8 +354,8 @@ def test_committed_experiment_matrix_is_locked_to_44_runs() -> None:
             {
                 "basic_loop": None,
                 "planning": "none",
-                "implement": "low",
-                "repair": "low",
+                "implement": "none",
+                "repair": "none",
                 "review": "none",
             },
         ),
@@ -381,10 +383,10 @@ def test_request_policy_records_actual_phase_overrides(
     assert policy["phase_reasoning_effort"] == reasoning
     assert policy["tool_choice"] == {
         "basic_loop": "auto (provider default)",
-        "planning_initial": "auto (provider default)",
-        "planning_follow_up": "submit_change_plan",
-        "implement": "auto (provider default)",
-        "repair": "auto (provider default)",
+        "planning_initial": "submit_change_plan (sole advertised tool)",
+        "planning_follow_up": "not applicable (single response)",
+        "implement": "read_files forced initially; write_files forced after read",
+        "repair": "read_files forced initially; write_files forced after read",
         "review": "submit_review",
     }
 
@@ -946,7 +948,7 @@ def test_merge_rejects_unlocked_formal_request_policy(tmp_path: Path) -> None:
     _materialize_formal_results(state_root)
     manifest = state_root / "experiment.json"
     value = json.loads(manifest.read_text(encoding="utf-8"))
-    value["request_policy"]["phase_reasoning_effort"]["implement"] = "none"
+    value["request_policy"]["phase_reasoning_effort"]["implement"] = "low"
     manifest.write_text(
         json.dumps(value, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -1070,6 +1072,93 @@ def test_interrupted_baseline_is_terminal_without_model_retry(tmp_path: Path) ->
     assert second.skipped_task_count == 1
 
 
+def test_evaluation_close_retains_service_after_timeout_for_retry(tmp_path: Path) -> None:
+    runner = EvaluationRunner(
+        BENCHMARKS,
+        tmp_path / "results",
+        variant="full",
+        task_ids=("py-bugfix-001",),
+        model="test-model",
+    )
+
+    class RetryableService:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise TimeoutError("still stopping")
+
+    service = RetryableService()
+    runner._service = service  # type: ignore[assignment]
+
+    with pytest.raises(TimeoutError, match="still stopping"):
+        runner.close()
+
+    assert runner._service is service
+    runner.close()
+    assert runner._service is None
+    assert service.close_calls == 2
+
+
+def test_durable_timeout_uses_service_close_budget(
+    tmp_path: Path,
+) -> None:
+    runner = EvaluationRunner(
+        BENCHMARKS,
+        tmp_path / "results",
+        variant="full",
+        task_ids=("py-bugfix-001",),
+        model="test-model",
+    )
+    task = runner.suite.tasks[0]
+    patch_path = tmp_path / "candidate.patch"
+    patch_path.write_text("", encoding="utf-8")
+    record = SimpleNamespace(
+        run_id="a" * 32,
+        status="queued",
+        checks=(),
+        metrics=SimpleNamespace(tool_calls=0, duration_ms=0),
+        error=None,
+    )
+
+    class TimedOutService:
+        close_timeout_seconds = 37.5
+
+        def __init__(self) -> None:
+            self.database = SimpleNamespace(events=lambda _run_id: ())
+            self.cancelled: list[str] = []
+            self.wait_timeouts: list[float] = []
+
+        def get_run(self, _run_id: str):
+            return record
+
+        def cancel(self, run_id: str) -> None:
+            self.cancelled.append(run_id)
+
+        def wait(self, _run_id: str, *, timeout: float, **_kwargs):
+            self.wait_timeouts.append(timeout)
+            return record
+
+        def artifact_path(self, _run_id: str, _kind: str) -> Path:
+            return patch_path
+
+    service = TimedOutService()
+    runner._durable_service = lambda: service  # type: ignore[method-assign,return-value]
+
+    artifact = runner._execute_durable(
+        task,
+        task.root / "baseline",
+        {"run_id": record.run_id},
+        time.time() - 1,
+    )
+
+    assert artifact.execution.timed_out is True
+    assert service.cancelled == [record.run_id]
+    assert service.wait_timeouts == [service.close_timeout_seconds]
+
+
 def test_evaluation_root_lock_is_exclusive_and_releasable(tmp_path: Path) -> None:
     root = evaluation_module._evaluation_output_root(tmp_path / "state")
     with evaluation_module._formal_shard_lock(root):
@@ -1125,7 +1214,7 @@ def test_regression_test_contract_covers_python_and_java() -> None:
         "SUBFAILED tests/test_slug_regression.py::test_suffix - subcase 7\n"
         "=========================== 10 failed in 0.12s ===========================",
     )
-    assert not evaluation_module._attributable_regression_failure(
+    assert evaluation_module._attributable_regression_failure(
         python_task,
         ("tests/test_slug_regression.py",),
         failed,
@@ -1181,6 +1270,269 @@ def test_development_suite_is_available_only_to_single_mode(tmp_path: Path) -> N
     assert (materialized / "tasklib" / "scanner.py").is_file()
     assert not (materialized / "hidden_tests").exists()
     assert not (materialized / "gold.patch").exists()
+
+    runner = EvaluationRunner(
+        DEVELOPMENT_BENCHMARKS,
+        tmp_path / "results",
+        variant="full",
+        task_ids=("py-development-001",),
+        model="offline-test-model",
+    )
+    report = runner._aggregate((), 0)
+    manifest = json.loads(
+        (runner.result_dir / "experiment.json").read_text(encoding="utf-8")
+    )
+    runner.close()
+    assert report.formal_evaluation is False
+    legacy_report = report.model_dump(mode="json")
+    legacy_report.pop("formal_evaluation")
+    assert (
+        EvaluationReport.model_validate(legacy_report).formal_evaluation is None
+    )
+    assert manifest["formal_evaluation"] is False
+    assert "experiment_counts" not in manifest
+    assert "full_repeat_task_ids" not in manifest
+
+
+def test_non_formal_group_manifest_accepts_legacy_scope_fields(
+    tmp_path: Path,
+) -> None:
+    options = {
+        "variant": "full",
+        "task_ids": ("py-development-001",),
+        "model": "offline-test-model",
+    }
+    first = EvaluationRunner(
+        DEVELOPMENT_BENCHMARKS,
+        tmp_path / "results",
+        **options,
+    )
+    manifest_path = first.result_dir / "experiment.json"
+    first.close()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest.pop("formal_evaluation") is False
+    manifest["experiment_counts"] = EXPECTED_EXPERIMENT_COUNTS
+    manifest["full_repeat_task_ids"] = list(FULL_REPEAT_TASK_IDS)
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    second = EvaluationRunner(
+        DEVELOPMENT_BENCHMARKS,
+        tmp_path / "results",
+        **options,
+    )
+    second.close()
+
+    persisted = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert "formal_evaluation" not in persisted
+    assert persisted["experiment_counts"] == EXPECTED_EXPERIMENT_COUNTS
+
+
+@pytest.mark.parametrize(
+    "single_legacy_field",
+    (None, "experiment_counts", "full_repeat_task_ids"),
+)
+def test_non_formal_group_manifest_rejects_ambiguous_missing_scope(
+    tmp_path: Path,
+    single_legacy_field: str | None,
+) -> None:
+    options = {
+        "variant": "full",
+        "task_ids": ("py-development-001",),
+        "model": "offline-test-model",
+    }
+    first = EvaluationRunner(
+        DEVELOPMENT_BENCHMARKS,
+        tmp_path / "results",
+        **options,
+    )
+    manifest_path = first.result_dir / "experiment.json"
+    first.close()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest.pop("formal_evaluation") is False
+    if single_legacy_field == "experiment_counts":
+        manifest[single_legacy_field] = EXPECTED_EXPERIMENT_COUNTS
+    elif single_legacy_field == "full_repeat_task_ids":
+        manifest[single_legacy_field] = list(FULL_REPEAT_TASK_IDS)
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(evaluation_module.EvaluationError, match="different experiment"):
+        EvaluationRunner(
+            DEVELOPMENT_BENCHMARKS,
+            tmp_path / "results",
+            **options,
+        )
+
+
+def test_formal_group_manifest_accepts_legacy_missing_scope_flag(
+    tmp_path: Path,
+) -> None:
+    options = {
+        "variant": "full",
+        "task_ids": ("py-bugfix-001",),
+        "model": "offline-test-model",
+    }
+    first = EvaluationRunner(BENCHMARKS, tmp_path / "results", **options)
+    manifest_path = first.result_dir / "experiment.json"
+    first.close()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest.pop("formal_evaluation") is True
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    second = EvaluationRunner(BENCHMARKS, tmp_path / "results", **options)
+    second.close()
+
+    persisted = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert "formal_evaluation" not in persisted
+
+
+@pytest.mark.parametrize(
+    "candidate_path",
+    ("tests/test_regression.py", "tests/Test_Regression.py"),
+)
+def test_hidden_test_injection_avoids_candidate_test_name_collision(
+    tmp_path: Path,
+    candidate_path: str,
+) -> None:
+    task_root = tmp_path / "task"
+    baseline_tests = task_root / "baseline" / "tests"
+    hidden_tests = task_root / "hidden_tests"
+    baseline_tests.mkdir(parents=True)
+    hidden_tests.mkdir()
+    (baseline_tests / "test_public.py").write_text(
+        "def test_public():\n    assert True\n", encoding="utf-8"
+    )
+    (hidden_tests / "test_regression.py").write_text(
+        "def test_hidden():\n    assert True\n", encoding="utf-8"
+    )
+    task = evaluation_module.BenchmarkTask(
+        id="py-oss-999",
+        digest="0" * 64,
+        root=task_root,
+        language="python",
+        category="local_logic",
+        difficulty="easy",
+        timeout_seconds=10,
+        issue="Fix the regression.",
+        setup_patch=None,
+    )
+    candidate_text = (
+        f"diff --git a/{candidate_path} b/{candidate_path}\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        f"+++ b/{candidate_path}\n"
+        "@@ -0,0 +1,2 @@\n"
+        "+def test_candidate():\n"
+        "+    assert True\n"
+    )
+    candidate = evaluation_module.validate_patch(candidate_text)
+    repository = tmp_path / "repository"
+
+    evaluation_module._copy_baseline_and_setup(task, repository)
+    evaluation_module._inject_hidden_tests(
+        task,
+        repository,
+        occupied_paths=candidate.paths,
+    )
+    evaluation_module._initialize_repository(repository)
+    evaluation_module._apply_patch(repository, candidate.text, task.id)
+
+    assert (repository / Path(PurePosixPath(candidate_path))).is_file()
+    assert tuple(
+        (repository / "tests").glob("test_repo_agent_hidden_py_oss_999_*.py")
+    )
+
+
+def test_initialize_repository_tolerates_template_removed_during_init(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (repository / "app.py").write_text("value = 1\n", encoding="utf-8")
+    original_run_git = evaluation_module._run_git
+    removed = False
+
+    def run_git_and_remove_template(
+        target: Path, *arguments: str, **kwargs: object
+    ) -> str:
+        nonlocal removed
+        result = original_run_git(target, *arguments, **kwargs)
+        if "init" in arguments and "--template=" in " ".join(arguments):
+            templates = tuple(target.parent.glob(".empty-git-template-*"))
+            assert len(templates) == 1
+            templates[0].rmdir()
+            removed = True
+        return result
+
+    monkeypatch.setattr(evaluation_module, "_run_git", run_git_and_remove_template)
+
+    evaluation_module._initialize_repository(repository)
+
+    assert removed is True
+    assert (repository / ".git").is_dir()
+    assert evaluation_module._run_git(repository, "status", "--porcelain").strip() == ""
+
+
+def test_initialize_repository_does_not_hide_non_missing_template_cleanup_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (repository / "app.py").write_text("value = 1\n", encoding="utf-8")
+    original_rmdir = Path.rmdir
+    injected = False
+
+    def rmdir_with_permission_error(path: Path) -> None:
+        nonlocal injected
+        if path.name.startswith(".empty-git-template-"):
+            injected = True
+            error = PermissionError(13, "access denied", str(path))
+            error.winerror = 5  # type: ignore[attr-defined]
+            raise error
+        original_rmdir(path)
+
+    monkeypatch.setattr(Path, "rmdir", rmdir_with_permission_error)
+
+    with pytest.raises(PermissionError):
+        evaluation_module._initialize_repository(repository)
+
+    assert injected is True
+
+
+def test_scoring_temp_prefix_avoids_windows_max_path_for_deep_trials() -> None:
+    result_root = (
+        "D:\\projects\\AgentProjects\\evaluation-results\\development-v1\\"
+        + "2" * 50
+        + r"\repo-agent-python-development-v1\full\trial-1"
+    )
+    task_id = "py-development-001"
+    template_name = ".empty-git-template-" + "a" * 32
+    safe = "\\".join(
+        (
+            result_root,
+            evaluation_module._scoring_temp_prefix(task_id, regression=True)
+            + "b" * 8,
+            template_name,
+        )
+    )
+    legacy = "\\".join(
+        (
+            result_root,
+            f"repo-agent-eval-regression-{task_id}-" + "b" * 8,
+            template_name,
+        )
+    )
+
+    assert len(safe) < 260
+    assert len(legacy) >= 260
 
 
 def test_evaluation_preserves_safe_credential_reference_patch(tmp_path: Path) -> None:
@@ -1283,6 +1635,77 @@ def test_durable_usage_separates_check_failures_from_actionable_errors() -> None
     assert (calls, errors, actionable) == (4, 3, 1)
 
 
+@pytest.mark.parametrize(
+    ("request_not_started", "expected_complete"),
+    [(True, True), (False, False)],
+)
+def test_durable_usage_only_treats_explicit_preflight_zero_as_neutral(
+    request_not_started: bool, expected_complete: bool
+) -> None:
+    reported = {
+        "event": "model_tool_summary",
+        "tool_calls": 1,
+        "tool_errors": 0,
+        "tool_outcomes": {
+            "ok": 1,
+            "check_failed": 0,
+            "invalid_args": 0,
+            "policy_denied": 0,
+            "transport_error": 0,
+            "patch_rejected": 0,
+            "other_error": 0,
+        },
+        "model_usage": {
+            "response_count": 1,
+            "reported_response_count": 1,
+            "input_tokens": 100,
+            "cached_input_tokens": 0,
+            "output_tokens": 20,
+            "total_tokens": 120,
+            "complete": True,
+        },
+    }
+    zero_response = {
+        "event": "model_tool_summary",
+        "tool_calls": 0,
+        "tool_errors": 0,
+        "tool_outcomes": {
+            "ok": 0,
+            "check_failed": 0,
+            "invalid_args": 0,
+            "policy_denied": 0,
+            "transport_error": 0,
+            "patch_rejected": 0,
+            "other_error": 0,
+        },
+        "model_usage": {
+            "response_count": 0,
+            "reported_response_count": 0,
+            "input_tokens": None,
+            "cached_input_tokens": None,
+            "output_tokens": None,
+            "total_tokens": None,
+            "complete": False,
+        },
+        "request_not_started": request_not_started,
+    }
+    service = SimpleNamespace(
+        database=SimpleNamespace(events=lambda _run_id: (reported, zero_response))
+    )
+    record = SimpleNamespace(
+        run_id="f" * 32,
+        metrics=SimpleNamespace(tool_calls=1),
+    )
+
+    usage, calls, errors, actionable = evaluation_module._durable_usage(
+        service, record
+    )
+
+    assert usage.complete is expected_complete
+    assert usage.total_tokens == 120
+    assert (calls, errors, actionable) == (1, 0, 0)
+
+
 def test_scoring_summaries_are_redacted_and_hashed(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1317,7 +1740,7 @@ def test_scoring_summaries_are_redacted_and_hashed(
     monkeypatch.setattr(
         runner,
         "_run_score_check",
-        lambda _task, _patch, *, hidden: passed,
+        lambda _task, _patch, *, hidden: failed if hidden else passed,
     )
     monkeypatch.setattr(
         runner,
@@ -1330,6 +1753,7 @@ def test_scoring_summaries_are_redacted_and_hashed(
     assert score.regression_test_added
     assert score.regression_failed_on_buggy
     assert score.regression_passed_on_candidate
+    assert not score.hidden_passed
     for phase, digest in (
         ("public", score.public_check_sha256),
         ("hidden", score.hidden_check_sha256),
@@ -1473,6 +1897,9 @@ def test_baseline_does_not_execute_tool_after_model_crosses_deadline(
         def set_request_timeout(self, timeout_seconds):
             observed_timeouts.append(timeout_seconds)
 
+        def set_response_token_budget(self, _total_tokens):
+            pass
+
         def next_step(self, _task, _results):
             time.sleep(0.04)
             return ToolCall("call-1", "git_status", {})
@@ -1516,4 +1943,136 @@ def test_baseline_does_not_execute_tool_after_model_crosses_deadline(
     assert artifact.execution.tool_calls == 0
     assert observed_timeouts and observed_timeouts[0] <= 0.02
     assert not tool_executed
+    runner.close()
+
+
+def test_baseline_sets_a_hard_remaining_budget_before_every_model_request(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runner = EvaluationRunner(
+        BENCHMARKS,
+        tmp_path / "baseline-preflight",
+        variant="baseline",
+        task_ids=("py-bugfix-001",),
+        model_config=_model_config(),
+    )
+    task = runner.suite.tasks[0]
+    budgets: list[int] = []
+
+    class FakeProvider:
+        def __init__(self, *_args, **_kwargs):
+            self.usage = ProviderUsage(0, 0, None, None, None, None)
+            self.calls = 0
+
+        def set_request_timeout(self, _timeout_seconds):
+            pass
+
+        def set_response_token_budget(self, total_tokens):
+            budgets.append(total_tokens)
+
+        def next_step(self, _task, _results):
+            self.calls += 1
+            if self.calls == 1:
+                self.usage = ProviderUsage(1, 1, 80, 0, 20, 100)
+                return ToolCall("call-1", "git_status", {})
+            self.usage = ProviderUsage(2, 2, 150, 0, 50, 200)
+            return FinalAnswer("done")
+
+    class FakeSandbox:
+        workspace_revision = 0
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+        def candidate_artifact(self):
+            return None
+
+    class FakeExecutor:
+        total_timeout_seconds = 0.0
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def execute(self, decision):
+            return ToolResult(decision.id, decision.name, True, "clean")
+
+    monkeypatch.setattr(evaluation_module, "OpenAIProvider", FakeProvider)
+    monkeypatch.setattr(evaluation_module, "DockerSandbox", FakeSandbox)
+    monkeypatch.setattr(evaluation_module, "AgentToolExecutor", FakeExecutor)
+
+    artifact = runner._execute_baseline(
+        task,
+        task.root / "baseline",
+        time.time() + 30,
+    )
+
+    assert artifact.execution.status == "completed"
+    assert budgets == [
+        evaluation_module.MAX_AGENT_TOKENS,
+        evaluation_module.MAX_AGENT_TOKENS - 100,
+    ]
+    runner.close()
+
+
+def test_baseline_classifies_pre_http_capacity_failure_as_budget_exceeded(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runner = EvaluationRunner(
+        BENCHMARKS,
+        tmp_path / "baseline-capacity",
+        variant="baseline",
+        task_ids=("py-bugfix-001",),
+        model_config=_model_config(),
+    )
+    task = runner.suite.tasks[0]
+
+    class FakeProvider:
+        usage = ProviderUsage(0, 0, None, None, None, None)
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def set_request_timeout(self, _timeout_seconds):
+            pass
+
+        def set_response_token_budget(self, _total_tokens):
+            pass
+
+        def next_step(self, _task, _results):
+            raise OpenAIRequestCapacityError("request cannot fit token budget")
+
+    class FakeSandbox:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+        def candidate_artifact(self):
+            return None
+
+    monkeypatch.setattr(evaluation_module, "OpenAIProvider", FakeProvider)
+    monkeypatch.setattr(evaluation_module, "DockerSandbox", FakeSandbox)
+
+    artifact = runner._execute_baseline(
+        task,
+        task.root / "baseline",
+        time.time() + 30,
+    )
+
+    assert artifact.execution.status == "budget_exceeded"
+    assert artifact.execution.tool_calls == 0
+    assert artifact.execution.error is not None
+    assert artifact.execution.error.endswith("request cannot fit token budget")
     runner.close()

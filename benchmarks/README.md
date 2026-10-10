@@ -1,10 +1,60 @@
-# Frozen Python and Java benchmark suite
+# Python v1 acceptance and legacy benchmark evidence
 
-This directory contains twelve frozen bug-fix fixtures: six Python tasks from
-Day 2 and six single-module Maven tasks added on Day 3. The suite is independent
-from the model runtime and never needs a model key. Python lifecycle validation
-uses only the standard library; Java lifecycle validation uses the pinned local
-Maven sandbox image and an explicitly authorized dependency bootstrap.
+## Active Python v1 contract
+
+The active suite ID is `repo-agent-python-bugfix-v1`. It selects exactly these
+six frozen tasks from the retained fixture tree:
+
+- `py-bugfix-001`
+- `py-bugfix-002`
+- `py-bugfix-003`
+- `py-bugfix-004`
+- `py-bugfix-005`
+- `py-bugfix-006`
+
+The release gate requires exactly 6/6 selected tasks to complete, at least 4/6
+to be independently scored as solved, complete per-task usage at or below
+30,000 tokens, no budget failure or timeout, and finite p95 latency no greater
+than 480 seconds. The four `py-development-*` tasks remain non-formal tuning
+fixtures and must pass their separate 3/4 development gate first.
+
+On Windows, `scripts/start-relay.ps1 -Evaluate` runs the fixed development
+suite, while `scripts/start-relay.ps1 -FormalEvaluate` runs only the six-task
+Python `full` trial 1. Neither command writes the legacy published results.
+
+Validate the six active fixtures, including healthy baseline, injected bug,
+candidate regression, hidden tests, gold repair, and source restoration:
+
+```powershell
+python ./benchmarks/tasks/python/bugfix/validate.py
+```
+
+## Public OSS regression suite (non-formal)
+
+`tasks/python/oss` contains three independently frozen public GitHub issues
+from PySnooper, HTTPie, and The Fuck. Each task records the issue, exact
+base/fix commits, and commit-addressed target/license URLs and hashes. The
+fixtures are curated exact target-source snapshots with dependency-free tests, not full
+upstream repository or full historical test-suite claims.
+
+Validate their complete zero-model lifecycle with:
+
+```powershell
+python ./benchmarks/tasks/python/oss/validate.py
+repo-agent eval --benchmark-dir ./benchmarks/tasks/python/oss --variant full
+```
+
+The second command is a dry-run contract check unless `--execute` is supplied.
+This suite is non-formal and intentionally limited to single mode; matrix,
+canary, shard, and merge release paths reject it.
+
+## Legacy mixed suite (read-only)
+
+The original `repo-agent-python-java-day3-v1` suite contains twelve frozen
+bug-fix fixtures: six Python tasks and six single-module Maven tasks. Its 44-job
+matrix, fixtures, and `results/v1` files are immutable historical evidence, not
+the active release gate. The following legacy protocol is retained for audit
+and reproducibility; its published numbers must not be rewritten.
 
 ## Layout
 
@@ -20,7 +70,7 @@ benchmarks/
     hidden_tests/               tests withheld from the agent
     gold.patch                  reference repair, applied after setup.patch
     metadata.json               task contract instance
-  tasks/python/development/     reserved locations for four later tasks
+  tasks/python/development/     four non-formal Python tuning tasks
   tasks/java/bugfix/<slug>/
     baseline/                   healthy Java 17 single-module Maven project
     setup.patch                 injects the issue into production code
@@ -38,12 +88,15 @@ sources and the `pom.xml`, and also add at least one focused `*RegressionTest`.
 The validator applies only that new test to the buggy setup and proves it fails
 before accepting the repaired state.
 
-## Validate
+## Legacy mixed-suite validation
 
 Run the complete validation from the repository root. The flag is an explicit
-authorization for a fixed `maven-dependency-plugin:go-offline` command followed
-by allowlisted `dependency:get` calls for the pinned Surefire and JUnit Platform
-runtime artifacts:
+authorization for a fixed bootstrap invocation containing `-DskipTests`,
+`process-test-classes`, and
+`org.apache.maven.plugins:maven-surefire-plugin:3.5.2:help`, followed by
+allowlisted `dependency:get` calls for the pinned Surefire and JUnit Platform
+runtime artifacts. The explicit Surefire `help` goal preloads the plugin used by
+the later offline verification phase:
 
 ```powershell
 python ./benchmarks/validate.py --allow-bootstrap-network
@@ -53,7 +106,8 @@ Each bootstrap step runs in a short-lived hardened Maven container with network
 access but does not execute repository tests. Before any network access, the
 validator parses each fixture POM and requires the exact project, dependency,
 plugin, and bootstrap-profile structure; parent POMs, custom repositories,
-extensions, and extra build inputs cannot enter `go-offline`. A timed-out step,
+extensions, and extra build inputs cannot enter the fixed bootstrap command. A
+timed-out step,
 or the specific Maven transport error for a truncated `Content-Length` download,
 is retried once with the same run-scoped cache. Other failures are deterministic
 and fail immediately. Every healthy, setup, hidden, regression, and gold
@@ -102,15 +156,20 @@ evidence are stored outside this frozen task tree. Unknown token prices must not
 be guessed: omit both price options so raw token usage is retained while cost
 remains unavailable.
 
-## Evaluation CLI
+## Legacy evaluation CLI (audit only)
+
+The generic matrix, canary, shard, and merge commands below describe the retired
+mixed-suite experiment. Do not use them as the active Python release gate or
+overwrite `benchmarks/results/v1`.
 
 Inspect one variant or the complete locked matrix without calling a model:
 
 ```powershell
-repo-agent eval --variant full --format json
+repo-agent eval --benchmark-dir .\benchmarks --variant full --format json
 $projectParent = Split-Path -Parent (Get-Location).Path
 $evaluationRoot = Join-Path $projectParent ".repo-agent-eval-day7-v1"
 repo-agent eval --matrix-only `
+  --benchmark-dir .\benchmarks `
   --output-dir $evaluationRoot `
   --format json
 ```
@@ -127,6 +186,7 @@ under a separate directory and is never merged into the formal 44 jobs:
 
 ```powershell
 repo-agent eval `
+  --benchmark-dir .\benchmarks `
   --canary --execute `
   --allow-remote-model `
   --allow-bootstrap `
@@ -140,14 +200,16 @@ and at most 30,000 reported tokens. Single-variant `--variant ... --execute`
 runs remain available for focused debugging but are not a replacement for the
 locked formal matrix.
 
-The four fixtures under `tasks/python/development` are explicitly non-formal.
-They may be run only through single-variant mode for prompt and workflow tuning;
-matrix, canary, shard, and merge paths reject them. On Windows, the restricted
+The four fixtures under `tasks/python/development` and three public issue
+fixtures under `tasks/python/oss` are explicitly non-formal. They may be run
+only through single-variant mode; matrix, canary, shard, and merge paths reject
+them. The development fixtures are for prompt and workflow tuning. On Windows,
+the restricted
 `scripts/start-relay.ps1 -Evaluate` entry point loads the DPAPI-protected model
 configuration and runs the fixed four-task `full` command. It never places the
 key in command arguments or evaluation artifacts.
 
-## Locked 44-run experiment
+## Legacy locked 44-run experiment
 
 The formal comparison is fixed before execution:
 
@@ -177,6 +239,7 @@ sequentially here so total model concurrency never exceeds two:
 ```powershell
 0..4 | ForEach-Object {
   repo-agent eval `
+    --benchmark-dir .\benchmarks `
     --matrix --execute `
     --shard-index $_ --shard-count 5 --workers 2 `
     --allow-remote-model --allow-bootstrap `
@@ -197,6 +260,7 @@ sanitized publish directory:
 
 ```powershell
 repo-agent eval `
+  --benchmark-dir .\benchmarks `
   --merge `
   --output-dir $evaluationRoot `
   --report-dir .\benchmarks\results\v1 `
@@ -229,6 +293,11 @@ records input, cached-input, output, and total tokens while `cost_usd` remains
 The immutable v1 result has a documented pytest `SUBFAILED` attribution issue.
 See [`ERRATA.md`](ERRATA.md). New acceptance output must live in a new directory
 and be labeled v1 regression acceptance rather than an independent holdout.
+
+For the active `repo-agent-python-bugfix-v1` gate, `full` must complete exactly
+6/6 fixed tasks and solve at least 4/6 while meeting the token, timeout, and p95
+requirements above. The thresholds below belong only to the immutable legacy
+mixed-suite comparison and are preserved for interpreting its published data.
 
 Publishing raw results does not automatically justify a positive architecture
 claim. The predeclared thresholds are:

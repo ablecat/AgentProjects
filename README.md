@@ -10,26 +10,31 @@ human to inspect. It never applies, commits, or pushes the patch to the source
 repository.
 
 The repository includes a Typer CLI, a loopback visual workspace, an
-authenticated FastAPI service, resumable LangGraph orchestration, Python and
-Maven sandboxes, and a frozen evaluation suite. Locked v1 model results are
-published below and in `benchmarks/results/v1`; the sanitized `results.jsonl`
-is the source of truth.
+authenticated FastAPI service, resumable LangGraph orchestration, a hardened
+Python/pytest sandbox, and a frozen Python acceptance suite. The earlier mixed
+Python/Java experiment is retained as read-only historical evidence in
+`benchmarks/results/v1`; its sanitized `results.jsonl` remains its source of
+truth.
 
 ## What it does
 
 - Accepts a clean, committed local Git repository and a natural-language
   maintenance task.
-- Builds a bounded repository map and lets the model use seven typed tools:
-  `list_files`, `read_file`, `read_files`, `search_code`, `apply_patch`,
-  `get_diff`, and `finish`.
+- Builds a bounded repository map and gives each phase a minimal typed-tool
+  surface. Durable change phases expose only `read_files`, followed by
+  full-content `write_files`; they expose no shell or direct check command.
 - Produces a structured change plan and waits for explicit approval unless
   auto-approval was requested.
 - Applies model patches only in a run-owned candidate clone, then runs
-  deterministic `pytest` or Maven checks in Docker.
+  deterministic `pytest` checks in Docker.
 - Allows at most one verification repair. Independent review is one response;
   rejection is terminal and preserves the candidate for inspection.
 - Enforces non-borrowable model budgets of 4,000 tokens for planning, 23,500
   across implementation and repair, and 2,500 for review (30,000 total).
+  The active DeepSeek durable workflow requires complete usage reporting and
+  fails closed when it is missing. Loopback providers without usage and the
+  archived baseline evaluator are development/legacy paths outside this v1
+  hard-limit guarantee.
 - Checkpoints every workflow boundary in SQLite so an interrupted run can
   resume without intentionally repeating completed side effects.
 - Publishes `patch.diff`, `report.md`, `run.json`, `trace.jsonl`, and bounded
@@ -52,7 +57,7 @@ flowchart LR
     T --> C
     T --> D[Hardened Docker sandbox]
     C --> D
-    D --> V[Deterministic pytest / Maven checks]
+    D --> V[Deterministic pytest checks]
     W --> A[Redacted run artifacts]
     DB --> A
     A --> H[Human review]
@@ -79,12 +84,22 @@ commit. Only committed content is copied into the candidate workspace.
 | Profile | Supported shape |
 |---|---|
 | Python | Python 3.11, `pytest`, one root project; optional, explicitly authorized dependency bootstrap from a root `requirements.txt` or PEP 621 metadata |
-| Maven | One root `jar` module, Java 17 or 21, Maven 3.9, pinned Surefire/JUnit configuration |
 
-Mixed Python/Maven layouts, Gradle, nested Maven modules, Git submodules, Git
-LFS, repository symlinks/reparse points, custom Maven repositories, build
-extensions, and dirty source worktrees are rejected. See the policy errors and
-check artifacts for the exact reason when a repository is outside this scope.
+The active v1 product accepts only this Python/pytest profile. Java/Maven
+fixtures and their image metadata are retained solely to reproduce the legacy
+mixed-suite evidence; they are not selectable in the UI. Mixed-language
+layouts, Git submodules, Git LFS, repository symlinks/reparse points, and dirty
+source worktrees are rejected. See policy errors and check artifacts for the
+exact reason when a repository is outside this scope.
+
+The active v1 complete-file editing contract is deliberately narrow. An
+existing file can be edited only when its complete contents are safe UTF-8 text
+with LF line endings, no more than 200 logical lines, and no more than 16 KiB.
+`read_files` accepts 1-4 unique existing paths and the complete rendered batch
+must also fit within 16 KiB; it fails closed instead of returning an editable
+prefix. New and replacement content has the same per-file line and byte limits.
+A repository may contain larger, CRLF, or non-text files, but this v1 workflow
+cannot modify them.
 
 ## Prerequisites
 
@@ -109,21 +124,34 @@ From the repository root in PowerShell:
 ./scripts/verify-docker.ps1
 py -3.11 -m pip install -e ".[dev]"
 python -m pytest
+python ./scripts/smoke-day2.py
 ```
 
-The sandbox images are:
-
-- `repo-agent-python:0.1`: Python 3.11, pytest, Git, and ripgrep
-- `repo-agent-maven:0.1`: Eclipse Temurin JDK 21, Maven 3.9, Git, and ripgrep
+The active sandbox image is `repo-agent-python:0.1`, containing Python 3.11,
+pytest, Git, and ripgrep.
 
 | Sandbox | Immutable base image |
 |---|---|
 | Python | `python:3.11.16-slim-bookworm@sha256:528257d48c1da0dcecc2e725d1ae34498d60c965f1241e39cd6a85a8859bdf84` |
-| Maven | `maven:3.9.16-eclipse-temurin-21-noble@sha256:8f6ac126f7810bb5549c4cd122d2bf0e9cda5bdeb0838aa928f09e779fd8bef8` |
 
-Their Dockerfiles pin immutable base-image digests. Local build metadata is
-recorded in `docker/image-lock.json`; CI validates the Dockerfiles and runtime
-contract without assuming a workstation-specific final image ID.
+Its Dockerfile pins an immutable base-image digest. Local build metadata is
+recorded in `docker/image-lock.json`; CI validates the Dockerfile and runtime
+contract without assuming a workstation-specific final image ID. The legacy
+Maven Dockerfile remains for historical fixture validation; its lock entry is
+emitted only by the explicit opt-in path below.
+
+Both scripts are Python-only by default. Building and verifying the retained
+Maven image is an explicit opt-in for reproducing archived mixed-suite
+evidence:
+
+```powershell
+./scripts/build-sandboxes.ps1 -IncludeLegacyMaven
+./scripts/verify-docker.ps1 -IncludeLegacyMaven
+```
+
+`build-sandboxes.ps1` refreshes machine-local image IDs in
+`docker/image-lock.json`; the Maven entry is included only with the switch.
+Review that file before committing any resulting change.
 
 ## Quick start without a model key
 
@@ -232,7 +260,7 @@ decisions through that service. The read-only `show` command remains safe.
 ## Visual workspace and REST API
 
 The loopback UI shows readiness, repository identity, sandbox policy, plan
-approval, checks, metrics, trace events, and downloadable artifacts:
+approval, checks, metrics, a live activity log, and downloadable artifacts:
 
 ```powershell
 repo-agent serve --repo D:\path\to\clean-repository --port 8765 --open
@@ -257,7 +285,10 @@ All run and artifact routes require `Authorization: Bearer ...`; only
 | Method and path | Purpose |
 |---|---|
 | `POST /v1/runs` | Queue a run and return its ID |
+| `GET /v1/runs?status=&limit=` | List recent runs with queue positions |
+| `GET /v1/service/status` | Read queue depth, capacity, and active worker state |
 | `GET /v1/runs/{id}` | Read status, plan, checks, metrics, and artifact links |
+| `GET /v1/runs/{id}/events` | Stream resumable SSE progress with `Last-Event-ID` |
 | `POST /v1/runs/{id}/decision` | Approve or reject a plan |
 | `POST /v1/runs/{id}/resume` | Resume an interrupted run |
 | `POST /v1/runs/{id}/cancel` | Request cancellation and sandbox cleanup |
@@ -265,6 +296,15 @@ All run and artifact routes require `Authorization: Bearer ...`; only
 
 API repository paths must be absolute and stay below a configured
 `--allowed-root`.
+
+The scheduler intentionally runs one workflow at a time and keeps at most four
+waiting runs. Cancelling a waiting run releases its slot immediately. Both HTTP
+surfaces cap live SSE streams at four connections. The visual UI reconnects with
+the SQLite event sequence as its cursor and falls back to 900 ms polling when
+`EventSource` is unavailable. SSE exposes only bounded, allowlisted activity
+metadata such as phase, node, tool counts, and model usage; raw event details and
+check output remain in the redacted downloadable artifacts. API SSE clients must
+send the Bearer token in the request header, never in the URL.
 
 ## Artifacts and states
 
@@ -316,7 +356,12 @@ The model provider is still an external trust boundary. Only use a remote
 endpoint for repositories whose relevant code and task text may be disclosed to
 that provider.
 
-## Measured benchmark results (v1)
+## Legacy measured benchmark results (read-only)
+
+The following numbers belong to the retired mixed Python/Java experiment, not
+the active Python-only release gate. Its fixtures, matrix, and published files
+are immutable archival evidence and are not rewritten by current acceptance
+runs.
 
 The locked 44-job evaluation completed with `gpt-5.6-sol` on 2026-09-12
 (UTC+8). The published v1 table and aggregate statistics are recomputable from
@@ -365,12 +410,13 @@ demonstrates stable success. See
 derived aggregates and failed-job inventory. These measurements characterize
 this model, budget, and locked suite only.
 
-## Evaluation and reproduction
+## Active Python acceptance
 
-The frozen suite contains six Python and six Java bug-fix tasks. Candidate
-Agents see a buggy setup, its public tests, and `issue.md`; independent scoring
-withholds `hidden_tests`, `gold.patch`, and expected failure signatures. A
-candidate is not solved merely because its workflow status is `succeeded`.
+The active frozen suite ID is `repo-agent-python-bugfix-v1`. It selects exactly
+`py-bugfix-001` through `py-bugfix-006`. Candidate Agents see a buggy setup,
+its public tests, and `issue.md`; independent scoring withholds `hidden_tests`,
+`gold.patch`, and expected failure signatures. A candidate is not solved merely
+because its workflow status is `succeeded`.
 
 Before a new formal run, tune only against the four non-formal development
 fixtures. With saved Windows relay configuration, the restricted helper runs
@@ -383,94 +429,61 @@ the fixed four-task `full` command and writes to a fresh ignored directory:
 The helper exits successfully only when at least 3/4 tasks are solved, every
 task stays within budget, and `actionable_tool_error_rate <= 5%`.
 
-After freezing the code, prompt, model, and budgets, the separate restricted
-formal acceptance entry point runs only the twelve-task `full` trial 1 and
-writes to a fresh `evaluation-results/formal-v1-regression-acceptance/`
-directory:
+For resume-grade real-project evidence, the separate non-formal
+`repo-agent-python-oss-v1` suite freezes three public regressions from
+PySnooper #2, HTTPie #235, and The Fuck #271. It uses exact upstream production
+files and licenses plus independently authored regression tests. These are
+curated source snapshots, not complete upstream repositories or an uncontaminated
+holdout. Validate all three lifecycles without a model, then inspect the
+single-mode evaluation contract with:
+
+```powershell
+python ./benchmarks/tasks/python/oss/validate.py
+repo-agent eval --benchmark-dir ./benchmarks/tasks/python/oss --variant full --format json
+```
+
+No model repair rate is claimed until an executed run exists. A later run can
+derive the final solved count, duration, and token usage from its evaluation
+report. The corresponding durable `run.json` records `checks[0].ok` for the
+first verification and `metrics.repair_attempts` for the bounded repair pass, so
+first-verify and repair-assisted outcomes remain distinguishable.
+
+After freezing the code, prompt, model, and budgets, the restricted formal
+entry point runs only the six Python tasks as `full` trial 1 and writes to a
+fresh directory outside the repository:
 
 ```powershell
 ./scripts/start-relay.ps1 -FormalEvaluate
 ```
 
-It succeeds only at `>=8/12`, with Python and Java each at `>=4/6`, complete
-per-task usage within 30,000 tokens, no timeouts or budget failures, and p95
-latency at most 480 seconds. This is a v1 regression acceptance run, not a new
-holdout or a 44-job matrix rerun; it never writes `benchmarks/results/v1`.
+It succeeds only when exactly 6/6 fixed Python tasks complete, at least 4/6 are
+solved, every task reports complete usage within 30,000 tokens, no task times
+out or exceeds budget, and p95 latency is at most 480 seconds. The result is a
+Python v1 regression acceptance run, not a new holdout. It never runs or
+rewrites the legacy 44-job matrix or `benchmarks/results/v1`.
 
-The generic CLI accepts that development suite only in single-variant mode;
-matrix, canary, shard, and merge modes remain restricted to the formal suite.
-
-Validate suite locks without Docker:
+Validate all six active Python fixture lifecycles, then audit the retained
+legacy fixture locks without executing them:
 
 ```powershell
+python ./benchmarks/tasks/python/bugfix/validate.py
 python ./benchmarks/validate.py --structure-only
-$projectParent = Split-Path -Parent (Get-Location).Path
-$evaluationRoot = Join-Path $projectParent ".repo-agent-eval-day7-v1"
-repo-agent eval `
-  --matrix-only `
-  --output-dir $evaluationRoot `
-  --format json
 ```
 
-`--matrix-only` performs no model call and atomically writes the reviewed
-44-job contract to `$evaluationRoot\matrix.json` before formal execution.
-Keep this durable state root outside the Git repository: it contains canary
-state, candidate workspaces, traces, patches, and scorer evidence and must not
-be committed.
-
-Validate complete fixture lifecycles, then run the offline Docker/security
-acceptance:
+Run the default Python-only offline Docker/security acceptance with the retained
+Day 6 probe:
 
 ```powershell
-python ./benchmarks/validate.py --allow-bootstrap-network
 python ./scripts/smoke-day6.py
 ```
 
-A model-backed evaluation requires the same explicit remote-model and bootstrap
-authorizations as a normal run. First run a three-variant canary that is kept
-outside the formal result set:
+To add its legacy Maven compatibility cases, use
+`python ./scripts/smoke-day6.py --include-legacy-maven` after building the
+legacy image. Those cases do not expand the released Agent or UI beyond Python.
 
-```powershell
-repo-agent eval `
-  --canary --execute `
-  --allow-remote-model `
-  --allow-bootstrap `
-  --workers 2 `
-  --output-dir $evaluationRoot `
-  --format json
-```
-
-Then run the five stable shards sequentially. Each shard uses at most two
-workers internally, and rerunning a shard resumes its completed jobs:
-
-```powershell
-0..4 | ForEach-Object {
-  repo-agent eval `
-    --matrix --execute `
-    --shard-index $_ --shard-count 5 --workers 2 `
-    --allow-remote-model --allow-bootstrap `
-    --output-dir $evaluationRoot `
-    --format json
-  if ($LASTEXITCODE -ne 0) { throw "Evaluation shard $_ failed." }
-}
-
-repo-agent eval `
-  --merge `
-  --output-dir $evaluationRoot `
-  --report-dir .\benchmarks\results\v1 `
-  --format json
-```
-
-Merge rejects missing, duplicate, misplaced, or incompatible jobs. On success,
-only the three sanitized files `results.jsonl`, `report.json`, and
-`failure-analysis.json` belong in `benchmarks/results/v1`; never copy private
-state, workspaces, traces, or machine-local paths into Git. The report is
-recomputed after reading the exact 44-line JSONL back from disk. Omit token
-price options when no verified price source exists:
-input, cached-input, output, and total token usage are still recorded while
-`cost_usd` remains `null` and `price_source` is `unavailable`. See
-[benchmarks/README.md](benchmarks/README.md) for the scorer boundary, locked
-matrix, resume rules, and claims policy.
+The retired mixed-suite matrix, canary, shard, and merge protocol is documented
+in [benchmarks/README.md](benchmarks/README.md) for audit purposes only. Do not
+rerun it as the active release gate or overwrite its three published v1 files.
 
 ## Development checks
 
@@ -481,16 +494,30 @@ ruff check src tests scripts benchmarks
 mypy src/repo_agent
 python -m pytest --cov=repo_agent --cov-report=term-missing --cov-fail-under=80
 python ./benchmarks/validate.py --structure-only
+python ./benchmarks/tasks/python/development/validate.py --structure-only
+python ./benchmarks/tasks/python/bugfix/validate.py
+python ./benchmarks/tasks/python/oss/validate.py
 ```
 
-Real-container smoke checks are intentionally separate because they require the
-two local sandbox images:
+The default real-container checks are all Python-only and require only the
+active image:
 
 ```powershell
 python ./scripts/smoke-day1.py
 python ./scripts/smoke-day2.py
 python ./scripts/smoke-day3.py
 python ./scripts/smoke-day6.py
+```
+
+To reproduce the legacy Maven compatibility cases, build and verify that image
+explicitly, then opt each applicable probe in:
+
+```powershell
+./scripts/build-sandboxes.ps1 -IncludeLegacyMaven
+./scripts/verify-docker.ps1 -IncludeLegacyMaven
+python ./scripts/smoke-day1.py --include-legacy-maven
+python ./scripts/smoke-day3.py --include-legacy-maven
+python ./scripts/smoke-day6.py --include-legacy-maven
 ```
 
 For a reproducible walkthrough, follow [docs/DEMO.md](docs/DEMO.md). Detailed

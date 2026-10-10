@@ -1,12 +1,14 @@
-"""Run the Day 1 read-only tools against both local sandbox images."""
+"""Run the Day 1 read-only tools against active local sandbox images."""
 
 from __future__ import annotations
 
+import argparse
 from contextlib import redirect_stdout
 from io import StringIO
 import json
 from pathlib import Path
 import sys
+from typing import Sequence
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -18,7 +20,8 @@ from repo_agent.models import ToolCall  # noqa: E402
 from repo_agent.sandbox import DockerSandbox  # noqa: E402
 
 
-IMAGES = ("repo-agent-python:0.1", "repo-agent-maven:0.1")
+PYTHON_IMAGE = "repo-agent-python:0.1"
+MAVEN_IMAGE = "repo-agent-maven:0.1"
 EXTRA_CALLS = (
     ToolCall("smoke-diff", "git_diff", {}),
     ToolCall("smoke-files", "list_files", {}),
@@ -30,11 +33,12 @@ EXTRA_CALLS = (
 )
 
 
-def main() -> int:
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parse_args(argv)
     summaries: list[dict[str, object]] = []
     failed = False
 
-    for image in IMAGES:
+    for image in _selected_images(args.include_legacy_maven):
         stdout = StringIO()
         with redirect_stdout(stdout):
             cli_exit_code = cli_main(
@@ -105,6 +109,25 @@ def main() -> int:
         )
     )
     return 1 if failed else 0
+
+
+def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run the Day 1 smoke checks against active sandbox images."
+    )
+    parser.add_argument(
+        "--include-legacy-maven",
+        action="store_true",
+        help="also check the legacy Maven sandbox image",
+    )
+    return parser.parse_args(argv)
+
+
+def _selected_images(include_legacy_maven: bool) -> tuple[str, ...]:
+    images = [PYTHON_IMAGE]
+    if include_legacy_maven:
+        images.append(MAVEN_IMAGE)
+    return tuple(images)
 
 
 if __name__ == "__main__":

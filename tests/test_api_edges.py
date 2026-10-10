@@ -2,20 +2,25 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import json
 from pathlib import Path
+import threading
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, ValidationError
 import pytest
+from starlette.requests import Request
 
 import repo_agent.api as api
 from repo_agent.artifacts import ArtifactError
-from repo_agent.persistence import RunNotFoundError
+from repo_agent.persistence import EventPage, RunNotFoundError
+from repo_agent.run_models import RunRecord, utc_now
 from repo_agent.service import (
     InvalidRunTransitionError,
     QueueFullError,
     RepositoryNotAllowedError,
+    ServiceSnapshot,
 )
 
 
@@ -25,6 +30,9 @@ class MinimalService:
 
     def get_run(self, _run_id):
         raise AssertionError("not called")
+
+    def list_runs(self):
+        return ()
 
     def decide(self, _run_id, **_kwargs):
         raise AssertionError("not called")
@@ -40,6 +48,35 @@ class MinimalService:
 
     def ready(self):
         return True
+
+    def scheduler_snapshot(self):
+        return ServiceSnapshot(
+            ready=True,
+            queue_depth=0,
+            queue_capacity=4,
+            active_count=0,
+            max_concurrency=1,
+            queued_run_ids=(),
+            active_run_ids=(),
+        )
+
+    def queue_position(self, _run_id):
+        return None
+
+    def event_page(self, _run_id, *, after_sequence, limit=64):
+        del after_sequence, limit
+        return EventPage((), 0)
+
+    def wait_for_events(
+        self,
+        _run_id,
+        *,
+        after_sequence,
+        timeout,
+        limit=64,
+    ):
+        del after_sequence, timeout, limit
+        return EventPage((), 0)
 
 
 @pytest.mark.parametrize(
@@ -88,6 +125,68 @@ def test_bearer_authorization_requires_one_well_formed_value() -> None:
     assert middleware._authorized(b"Bearer") is False
     assert middleware._authorized(b"Bearer secret extra") is False
     assert middleware._authorized(b"Bearer secret\t") is False
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        b"after=",
+        b"after=-1",
+        b"after=%2B1",
+        b"after=+1",
+        b"after=1.0",
+        b"after=1e2",
+        b"after=%EF%BC%91",
+        b"after=9223372036854775808",
+        b"after=0&after=1",
+        b"token=secret",
+        b"after=0&unexpected=1",
+    ),
+)
+def test_event_cursor_rejects_ambiguous_or_non_ascii_values(query: bytes) -> None:
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/v1/runs/" + "a" * 32 + "/events",
+            "query_string": query,
+            "headers": [],
+        }
+    )
+
+    with pytest.raises(api.ApiError) as rejected:
+        api._validated_event_cursor(request)
+
+    assert rejected.value.status_code == 400
+    assert rejected.value.code == "invalid_cursor"
+
+
+def test_event_cursor_prefers_one_last_event_id_and_rejects_duplicates() -> None:
+    preferred = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/events",
+            "query_string": b"after=1",
+            "headers": [(b"last-event-id", b"2")],
+        }
+    )
+    duplicate = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/events",
+            "query_string": b"",
+            "headers": [
+                (b"last-event-id", b"1"),
+                (b"Last-Event-ID", b"2"),
+            ],
+        }
+    )
+
+    assert api._validated_event_cursor(preferred) == 2
+    with pytest.raises(api.ApiError, match="at most once"):
+        api._validated_event_cursor(duplicate)
 
 
 def test_bearer_middleware_passes_non_http_scopes_through() -> None:
@@ -183,6 +282,38 @@ def test_request_body_limit_replays_exact_boundary_and_rejects_stream_overflow()
     assert accepted_messages[0]["status"] == 200
     assert rejected_body == b""
     assert rejected_messages[0]["status"] == 413
+
+
+def test_request_body_limit_forwards_the_real_disconnect_after_replay() -> None:
+    source = [
+        {"type": "http.request", "body": b"", "more_body": False},
+        {"type": "http.disconnect", "reason": "client_closed"},
+    ]
+    observed: list[dict[str, object]] = []
+
+    async def downstream(_scope, receive, _send):
+        observed.append(await receive())
+        observed.append(await receive())
+
+    async def receive():
+        return source.pop(0)
+
+    async def send(_message):
+        return None
+
+    middleware = api._RequestBodyLimitMiddleware(downstream)
+    asyncio.run(
+        middleware(
+            {"type": "http", "method": "GET", "headers": []},
+            receive,
+            send,
+        )
+    )
+
+    assert observed == [
+        {"type": "http.request", "body": b"", "more_body": False},
+        {"type": "http.disconnect", "reason": "client_closed"},
+    ]
 
 
 @pytest.mark.parametrize(
@@ -366,6 +497,286 @@ def test_api_disconnect_stops_before_service_dispatch(tmp_path: Path) -> None:
     assert sent == []
 
 
+def test_event_stream_heartbeat_stops_when_the_asgi_client_disconnects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class LiveEventService(MinimalService):
+        def __init__(self) -> None:
+            now = utc_now()
+            self.record = RunRecord(
+                run_id="a" * 32,
+                repo_path=str(tmp_path),
+                task="watch progress",
+                status="running",
+                created_at=now,
+                updated_at=now,
+            )
+            self.wait_calls = 0
+
+        def get_run(self, run_id):
+            assert run_id == self.record.run_id
+            return self.record
+
+        def wait_for_events(
+            self,
+            _run_id,
+            *,
+            after_sequence,
+            timeout,
+            limit=64,
+        ):
+            del after_sequence, timeout, limit
+            self.wait_calls += 1
+            return EventPage((), 0)
+
+    service = LiveEventService()
+    app = api.create_app(
+        service,
+        bearer_token="token",
+        allowed_roots=tmp_path,
+    )
+    monkeypatch.setattr(api, "EVENT_HEARTBEAT_SECONDS", 0.0)
+    disconnected = asyncio.Event()
+    receive_count = 0
+    sent: list[dict[str, object]] = []
+
+    async def receive():
+        nonlocal receive_count
+        receive_count += 1
+        if receive_count == 1:
+            return {"type": "http.request", "body": b"", "more_body": False}
+        await disconnected.wait()
+        return {"type": "http.disconnect", "reason": "test_client_closed"}
+
+    async def send(message):
+        sent.append(message)
+        if message.get("body") == b": heartbeat\n\n":
+            disconnected.set()
+        await asyncio.sleep(0)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": f"/v1/runs/{'a' * 32}/events",
+        "raw_path": f"/v1/runs/{'a' * 32}/events".encode("ascii"),
+        "query_string": b"after=0",
+        "root_path": "",
+        "headers": [(b"authorization", b"Bearer token")],
+        "client": ("testclient", 50000),
+        "server": ("testserver", 80),
+    }
+
+    async def exercise() -> None:
+        await asyncio.wait_for(app(scope, receive, send), timeout=2.0)
+
+    asyncio.run(exercise())
+
+    bodies = [message.get("body", b"") for message in sent]
+    assert b": heartbeat\n\n" in bodies
+    assert service.wait_calls >= 1
+    assert disconnected.is_set()
+    slots = app.state.event_stream_slots
+    acquired = [slots.acquire(blocking=False) for _ in range(api.MAX_EVENT_STREAMS)]
+    try:
+        assert all(acquired)
+    finally:
+        for held in acquired:
+            if held:
+                slots.release()
+
+
+def test_event_projection_allowlists_strings_and_omits_unsafe_state_time() -> None:
+    secret = "configured-secret-value"
+    projected = api._public_event(
+        "a" * 32,
+        {
+            "sequence": 1,
+            "event": f"Bearer {secret}",
+            "node": secret,
+            "phase": secret,
+            "timestamp": secret,
+        },
+    )
+    legitimate = api._public_event(
+        "a" * 32,
+        {
+            "sequence": 2,
+            "event": "model_tool_summary",
+            "node": "verify",
+            "phase": "implement",
+            "timestamp": "2026-10-09T01:02:03.456Z",
+        },
+    )
+    state = api._event_state(
+        {
+            "run_id": "a" * 32,
+            "status": "running",
+            "current_node": "verify",
+            "updated_at": secret,
+        },
+        cursor=2,
+    )
+
+    assert projected == {
+        "run_id": "a" * 32,
+        "sequence": 1,
+        "event": "workflow_event",
+    }
+    assert legitimate == {
+        "run_id": "a" * 32,
+        "sequence": 2,
+        "event": "model_tool_summary",
+        "node": "verify",
+        "phase": "implement",
+        "timestamp": "2026-10-09T01:02:03.456Z",
+    }
+    assert state == {
+        "run_id": "a" * 32,
+        "status": "running",
+        "node": "verify",
+        "cursor": 2,
+        "reset": False,
+    }
+    assert secret not in json.dumps((projected, legitimate, state))
+
+
+def test_event_stream_keeps_its_slot_until_cancelled_thread_wait_finishes(
+    tmp_path: Path,
+) -> None:
+    class BlockingWaitService(MinimalService):
+        def __init__(self) -> None:
+            now = utc_now()
+            self.record = RunRecord(
+                run_id="a" * 32,
+                repo_path=str(tmp_path),
+                task="block event wait",
+                status="running",
+                created_at=now,
+                updated_at=now,
+            )
+            self.wait_started = threading.Event()
+            self.release_wait = threading.Event()
+
+        def get_run(self, _run_id):
+            return self.record
+
+        def wait_for_events(
+            self,
+            _run_id,
+            *,
+            after_sequence,
+            timeout,
+            limit=64,
+        ):
+            del after_sequence, timeout, limit
+            self.wait_started.set()
+            assert self.release_wait.wait(timeout=5)
+            return EventPage((), 0)
+
+    service = BlockingWaitService()
+    app = api.create_app(
+        service,
+        bearer_token="token",
+        allowed_roots=tmp_path,
+    )
+    receive_count = 0
+
+    async def receive():
+        nonlocal receive_count
+        receive_count += 1
+        if receive_count == 1:
+            return {"type": "http.request", "body": b"", "more_body": False}
+        await asyncio.to_thread(service.wait_started.wait, 2)
+        return {"type": "http.disconnect"}
+
+    async def send(_message):
+        await asyncio.sleep(0)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": f"/v1/runs/{'a' * 32}/events",
+        "raw_path": f"/v1/runs/{'a' * 32}/events".encode("ascii"),
+        "query_string": b"after=0",
+        "root_path": "",
+        "headers": [(b"authorization", b"Bearer token")],
+        "client": ("testclient", 50000),
+        "server": ("testserver", 80),
+    }
+
+    async def exercise() -> None:
+        request = asyncio.create_task(app(scope, receive, send))
+        assert await asyncio.to_thread(service.wait_started.wait, 2)
+        await asyncio.wait_for(request, timeout=2)
+
+        slots = app.state.event_stream_slots
+        other_slots = [
+            slots.acquire(blocking=False) for _ in range(api.MAX_EVENT_STREAMS - 1)
+        ]
+        try:
+            assert all(other_slots)
+            assert slots.acquire(blocking=False) is False
+        finally:
+            for held in other_slots:
+                if held:
+                    slots.release()
+
+        service.release_wait.set()
+        all_slots: list[bool] = []
+        capacity_restored = False
+        for _attempt in range(100):
+            all_slots = [
+                slots.acquire(blocking=False) for _ in range(api.MAX_EVENT_STREAMS)
+            ]
+            if all(all_slots):
+                capacity_restored = True
+                break
+            for held in all_slots:
+                if held:
+                    slots.release()
+            all_slots = []
+            await asyncio.sleep(0.01)
+        try:
+            assert capacity_restored
+        finally:
+            for held in all_slots:
+                if held:
+                    slots.release()
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        service.release_wait.set()
+
+
+@pytest.mark.parametrize(
+    "page,after_sequence",
+    (
+        (EventPage(({"sequence": 1, "event": "duplicate"},), 1), 1),
+        (EventPage(({"sequence": 2}, {"sequence": 1}), 2), 0),
+        (EventPage(({"sequence": 2},), 1), 0),
+        (EventPage((), 1), 0),
+        (EventPage((), -1), 0),
+    ),
+)
+def test_event_page_validation_rejects_stale_or_inconsistent_sequences(
+    page: EventPage,
+    after_sequence: int,
+) -> None:
+    with pytest.raises(api.ApiError) as rejected:
+        api._validated_event_page(page, after_sequence=after_sequence)
+
+    assert rejected.value.status_code == 502
+    assert rejected.value.code == "invalid_service_response"
+
+
 def test_api_rejects_oversized_json_after_authentication(tmp_path: Path) -> None:
     app = api.create_app(
         MinimalService(), bearer_token="token", allowed_roots=tmp_path
@@ -448,6 +859,47 @@ def test_create_app_validates_service_roots_token_and_mount(tmp_path: Path) -> N
             api._validated_mount_path(mount)
 
     assert api._validated_mount_path("/workspace/") == "/workspace"
+
+
+def test_scheduler_endpoints_reject_invalid_service_objects_without_leaking(
+    tmp_path: Path,
+) -> None:
+    class BrokenSnapshotService(MinimalService):
+        def scheduler_snapshot(self):
+            return ServiceSnapshot(
+                ready=True,
+                queue_depth=1,
+                queue_capacity=4,
+                active_count=0,
+                max_concurrency=1,
+                queued_run_ids=(),
+                active_run_ids=(),
+            )
+
+    class BrokenListService(MinimalService):
+        def list_runs(self):
+            return "private run list detail"
+
+    snapshot_app = api.create_app(
+        BrokenSnapshotService(), bearer_token="token", allowed_roots=tmp_path
+    )
+    list_app = api.create_app(
+        BrokenListService(), bearer_token="token", allowed_roots=tmp_path
+    )
+    with TestClient(snapshot_app, raise_server_exceptions=False) as client:
+        bad_snapshot = client.get(
+            "/v1/service/status", headers={"Authorization": "Bearer token"}
+        )
+    with TestClient(list_app, raise_server_exceptions=False) as client:
+        bad_list = client.get(
+            "/v1/runs", headers={"Authorization": "Bearer token"}
+        )
+
+    assert bad_snapshot.status_code == 502
+    assert bad_snapshot.json()["error"]["code"] == "invalid_service_response"
+    assert bad_list.status_code == 502
+    assert bad_list.json()["error"]["code"] == "invalid_service_response"
+    assert "private run list detail" not in bad_list.text
 
 
 def test_repository_path_validation_distinguishes_bad_and_forbidden_paths(

@@ -18,11 +18,23 @@
 ./scripts/build-sandboxes.ps1
 ./scripts/verify-docker.ps1
 py -3.11 -m pip install -e ".[dev]"
-python ./benchmarks/validate.py --structure-only
+python ./scripts/smoke-day2.py
+python ./benchmarks/tasks/python/bugfix/validate.py
 ```
 
-验收重点：Docker Server 是 Linux/amd64，两个镜像存在，镜像默认用户为
-UID/GID `10001`，结构校验返回成功。任一步失败时先停止，不进入真实模型演示。
+验收重点：Docker Server 是 Linux/amd64，Python 镜像存在，镜像默认用户为
+UID/GID `10001`，Python 容器 smoke 与 fixture 生命周期校验成功。任一步失败时
+先停止，不进入真实模型演示。
+
+本演示不需要 Maven。只有复现旧 Python/Java 混合证据时才显式运行
+`./scripts/build-sandboxes.ps1 -IncludeLegacyMaven` 和
+`./scripts/verify-docker.ps1 -IncludeLegacyMaven`；默认不带开关的命令只构建、检查
+Python 镜像。旧 Maven 路径不代表当前 Agent 支持 Java 仓库。
+
+当前 v1 只能修改完整 UTF-8、LF 文本文件：已有目标文件必须不超过 200 个逻辑行
+和 16 KiB；`read_files` 每次接受 1-4 个已有路径，完整批次输出也不得超过
+16 KiB。超限、CRLF 或非文本目标会被拒绝而非截断。`py-bugfix-002` 示例符合这些
+限制；换用自己的仓库演示前应先检查目标实现文件和测试文件。
 
 ## 2. 创建独立 Bug 仓库
 
@@ -149,7 +161,7 @@ docker ps `
 - 当前运行拥有的短生命周期容器已经回收；
 - 补丁只存在于运行产物中，等待人工审阅。
 
-进一步运行 Day 6 离线安全验收：
+进一步运行默认 Python-only 的 Day 6 离线安全验收：
 
 ```powershell
 python ./scripts/smoke-day6.py
@@ -157,7 +169,10 @@ python ./scripts/smoke-day6.py
 
 该命令输出机器可读 JSON，并检查容器身份、只读 rootfs、写入边界、网络隔离、
 资源限制、无宿主 Key/Docker socket、canary 隔离和精确超时清理。以进程退出码和
-JSON 中每项检查为准，不要只截取一行日志作为结论。
+JSON 中每项检查为准，不要只截取一行日志作为结论。若要额外复现旧 Maven case，
+先按第 1 节显式构建旧镜像，再运行
+`python ./scripts/smoke-day6.py --include-legacy-maven`；该 case 不属于当前
+Python-only 演示的必需步骤。
 
 ## 7. 在独立副本中复核补丁
 

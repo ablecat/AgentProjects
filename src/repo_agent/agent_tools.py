@@ -4,12 +4,17 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import asdict
+import difflib
 import json
-from pathlib import PurePosixPath
+import os
+from pathlib import Path, PurePosixPath
+import stat
 from typing import Any, Mapping
+import unicodedata
 
 from .checks import CheckRunner
 from .models import ToolCall, ToolResult
+from .patches import PatchValidationError, normalize_model_patch
 from .policy import DEFAULT_PATH_POLICY
 from .sandbox import DockerSandbox
 from .tools import ToolDefinition
@@ -20,6 +25,10 @@ MAX_AGENT_SEARCH_RESULTS = 200
 MAX_AGENT_BATCH_FILES = 4
 MAX_AGENT_BATCH_LINES = 200
 MAX_AGENT_BATCH_BYTES = 16 * 1024
+MAX_AGENT_WRITE_FILE_BYTES = MAX_AGENT_BATCH_BYTES
+MAX_AGENT_WRITE_TOTAL_BYTES = 48 * 1024
+MAX_AGENT_WRITE_FILE_LINES = MAX_AGENT_BATCH_LINES
+MAX_AGENT_WRITE_TOTAL_LINES = MAX_AGENT_BATCH_FILES * MAX_AGENT_BATCH_LINES
 
 
 AGENT_TOOL_DEFINITIONS: tuple[ToolDefinition, ...] = (
@@ -56,8 +65,13 @@ AGENT_TOOL_DEFINITIONS: tuple[ToolDefinition, ...] = (
     ToolDefinition(
         "read_files",
         (
-            "Read the first 200 lines from 1 to 4 non-sensitive repository files "
-            "in one bounded response."
+            "Read the complete contents of 1 to 4 non-sensitive repository files "
+            "when each file fits within 200 lines and the batch fits within 16 KiB. "
+            "Oversized batches fail closed instead of returning an editable prefix. "
+            "Call exactly as "
+            "{\"paths\":[\"existing/path.py\"]}: paths must be a unique array "
+            "of existing repository-relative files, never a bare string, an extra "
+            "key, or a newly planned regression-test path."
         ),
         {
             "type": "object",
@@ -98,7 +112,13 @@ AGENT_TOOL_DEFINITIONS: tuple[ToolDefinition, ...] = (
     ),
     ToolDefinition(
         "apply_patch",
-        "Apply a bounded Git-style unified diff only to the disposable candidate.",
+        (
+            "Apply a bounded Git-style unified diff only to the disposable candidate. "
+            "The sole argument key is unified_diff; do not use patch, diff, or content. "
+            "A newly added regression test must use `new file mode 100644`, "
+            "`--- /dev/null`, and `+++ b/tests/test_*_regression.py`; do not add "
+            "tests/__init__.py or mark a new file as a modification."
+        ),
         {
             "type": "object",
             "properties": {
@@ -109,6 +129,44 @@ AGENT_TOOL_DEFINITIONS: tuple[ToolDefinition, ...] = (
                 }
             },
             "required": ["unified_diff"],
+            "additionalProperties": False,
+        },
+    ),
+    ToolDefinition(
+        "write_files",
+        (
+            "Create or replace 1 to 4 UTF-8 text files in the disposable candidate "
+            "using their complete contents. Call exactly as "
+            '{"files":[{"path":"safe/relative.py","content":"complete file\\n"}]}. '
+            "Each path must be unique and repository-relative. Content uses LF line "
+            "endings; a final LF is optional and preserved. Deletion is not supported."
+        ),
+        {
+            "type": "object",
+            "properties": {
+                "files": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 512,
+                            },
+                            "content": {
+                                "type": "string",
+                                "maxLength": MAX_AGENT_WRITE_FILE_BYTES,
+                            },
+                        },
+                        "required": ["path", "content"],
+                        "additionalProperties": False,
+                    },
+                    "minItems": 1,
+                    "maxItems": MAX_AGENT_BATCH_FILES,
+                }
+            },
+            "required": ["files"],
             "additionalProperties": False,
         },
     ),
@@ -168,6 +226,7 @@ class AgentToolExecutor:
         total_timeout_seconds: float = 1200.0,
         max_output_bytes: int = 65536,
         mutation_callback: Callable[[str], None] | None = None,
+        require_complete_read_before_write: bool = False,
     ) -> None:
         self.sandbox = sandbox
         self.repo_path = repo_path
@@ -177,6 +236,10 @@ class AgentToolExecutor:
         self.total_timeout_seconds = total_timeout_seconds
         self.max_output_bytes = max_output_bytes
         self.mutation_callback = mutation_callback
+        if type(require_complete_read_before_write) is not bool:
+            raise ValueError("require_complete_read_before_write must be a boolean")
+        self.require_complete_read_before_write = require_complete_read_before_write
+        self._complete_read_paths: set[str] = set()
         self._mutation_persistence_failed = False
 
     @property
@@ -186,6 +249,20 @@ class AgentToolExecutor:
     @property
     def mutation_persistence_failed(self) -> bool:
         return self._mutation_persistence_failed
+
+    def confirm_complete_read(self, call: ToolCall, result: ToolResult) -> None:
+        """Authorize writes only after the exact read result reached the model intact."""
+
+        if call.name != "read_files" or not result.ok or result.truncated:
+            return
+        arguments = _arguments(call, {"paths"})
+        raw_paths = arguments.get("paths")
+        if not isinstance(raw_paths, list):
+            return
+        paths = [DEFAULT_PATH_POLICY.validate(path, access="read") for path in raw_paths]
+        if len(paths) != len(set(paths)):
+            return
+        self._complete_read_paths.update(paths)
 
     def execute(self, call: ToolCall) -> ToolResult:
         try:
@@ -199,6 +276,8 @@ class AgentToolExecutor:
                 return self._search_code(call)
             if call.name == "apply_patch":
                 return self._apply_patch(call)
+            if call.name == "write_files":
+                return self._write_files(call)
             if call.name == "get_diff":
                 arguments = dict(call.arguments)
                 arguments["staged"] = True
@@ -279,6 +358,56 @@ class AgentToolExecutor:
         if len(set(paths)) != len(paths):
             raise ValueError("read_files paths must be unique")
 
+        repository = getattr(self.sandbox, "snapshot_path", None)
+        if isinstance(repository, Path):
+            targets: list[tuple[str, Path]] = []
+            for path in paths:
+                target = DEFAULT_PATH_POLICY.validate_disk_path(
+                    repository, path, access="read"
+                )
+                target_stat = os.lstat(target)
+                if not stat.S_ISREG(target_stat.st_mode) or target_stat.st_nlink > 1:
+                    raise ValueError(
+                        f"read_files target is not a safe regular file: {path}"
+                    )
+                if target_stat.st_size > MAX_AGENT_WRITE_FILE_BYTES:
+                    raise ValueError(
+                        f"read_files target {path} exceeds the complete-file limit of "
+                        f"{MAX_AGENT_WRITE_FILE_BYTES} bytes"
+                    )
+                targets.append((path, target))
+
+            preview_sections: list[str] = []
+            for path, target in targets:
+                try:
+                    raw_content = target.read_bytes()
+                    content = raw_content.decode("utf-8")
+                except (OSError, UnicodeError) as exc:
+                    raise ValueError(
+                        f"read_files target is not readable UTF-8 text: {path}"
+                    ) from exc
+                if len(raw_content) > MAX_AGENT_WRITE_FILE_BYTES:
+                    raise ValueError(
+                        f"read_files target {path} exceeds the complete-file limit of "
+                        f"{MAX_AGENT_WRITE_FILE_BYTES} bytes"
+                    )
+                if "\x00" in content or "\r" in content:
+                    raise ValueError(
+                        f"read_files target must be LF-delimited UTF-8 text: {path}"
+                    )
+                if _logical_line_count(content) > MAX_AGENT_BATCH_LINES:
+                    raise ValueError(
+                        f"read_files target {path} exceeds the complete-file limit of "
+                        f"{MAX_AGENT_BATCH_LINES} lines"
+                    )
+                preview_sections.append(f"===== {path} =====\n{content}")
+            preview = "\n".join(preview_sections)
+            if len(preview.encode("utf-8")) > MAX_AGENT_BATCH_BYTES:
+                raise ValueError(
+                    "read_files batch exceeds the 16384-byte complete-output limit; "
+                    "retry with fewer paths"
+                )
+
         sections: list[str] = []
         failures: list[str] = []
         exit_code: int | None = 0
@@ -313,10 +442,29 @@ class AgentToolExecutor:
         arguments = _arguments(call, {"unified_diff"})
         if "unified_diff" not in arguments:
             raise ValueError("apply_patch requires unified_diff")
+        raw_patch = arguments["unified_diff"]
+        # Production sandboxes expose a disposable snapshot so model patches can
+        # be canonicalized and checked against the exact checkout. Keep the
+        # executor usable with lightweight test doubles that only implement the
+        # tool delegation protocol; those doubles do not have a repository to
+        # validate against and retain the historical pass-through behavior.
+        repository = getattr(self.sandbox, "snapshot_path", None)
+        if repository is None:
+            canonical_text = raw_patch
+        else:
+            try:
+                canonical_text = normalize_model_patch(
+                    raw_patch, repository=repository
+                ).text
+            except PatchValidationError as exc:
+                raise ValueError(
+                    "patch rejected: "
+                    f"{exc}; submit a complete diff --git patch with matching hunk counts"
+                ) from exc
         result = self._delegate(
             call,
             "apply_patch",
-            {"patch": arguments["unified_diff"]},
+            {"patch": canonical_text},
         )
         if result.ok and self.mutation_callback is not None:
             try:
@@ -329,6 +477,160 @@ class AgentToolExecutor:
                     "candidate patch persistence failed"
                     + (f": {detail}" if detail else "")
                 ) from exc
+        return result
+
+    def _write_files(self, call: ToolCall) -> ToolResult:
+        arguments = _arguments(call, {"files"})
+        raw_files = arguments.get("files")
+        if not isinstance(raw_files, list):
+            raise ValueError("write_files files must be an array")
+        if not 1 <= len(raw_files) <= MAX_AGENT_BATCH_FILES:
+            raise ValueError(
+                f"write_files requires 1 to {MAX_AGENT_BATCH_FILES} files"
+            )
+
+        repository = getattr(self.sandbox, "snapshot_path", None)
+        if not isinstance(repository, Path):
+            raise RuntimeError("write_files requires an active candidate snapshot")
+
+        preflight: list[tuple[str, str, Path, bool]] = []
+        seen: set[str] = set()
+        total_bytes = 0
+        total_lines = 0
+        for index, raw_file in enumerate(raw_files, 1):
+            if not isinstance(raw_file, Mapping):
+                raise ValueError(f"write_files entry {index} must be an object")
+            if any(not isinstance(key, str) for key in raw_file):
+                raise ValueError(f"write_files entry {index} fields must be text")
+            unexpected = sorted(set(raw_file) - {"path", "content"})
+            if unexpected:
+                raise ValueError(
+                    "write_files entry "
+                    f"{index} has unexpected field(s): {', '.join(unexpected)}"
+                )
+            if "path" not in raw_file or "content" not in raw_file:
+                raise ValueError(
+                    f"write_files entry {index} requires path and content"
+                )
+
+            path = DEFAULT_PATH_POLICY.validate(raw_file["path"], access="write")
+            identity = _portable_path_identity(path)
+            if identity in seen:
+                raise ValueError("write_files paths must be unique")
+            seen.add(identity)
+
+            content = raw_file["content"]
+            if not isinstance(content, str):
+                raise ValueError(f"write_files content for {path} must be text")
+            if "\x00" in content:
+                raise ValueError(f"write_files content for {path} must not contain NUL")
+            if "\r" in content:
+                raise ValueError(
+                    f"write_files content for {path} must use LF line endings"
+                )
+            try:
+                content_bytes = content.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise ValueError(
+                    f"write_files content for {path} must be valid UTF-8 text"
+                ) from exc
+            if len(content_bytes) > MAX_AGENT_WRITE_FILE_BYTES:
+                raise ValueError(
+                    f"write_files content for {path} exceeds "
+                    f"{MAX_AGENT_WRITE_FILE_BYTES} bytes"
+                )
+            line_count = _logical_line_count(content)
+            if line_count > MAX_AGENT_WRITE_FILE_LINES:
+                raise ValueError(
+                    f"write_files content for {path} exceeds "
+                    f"{MAX_AGENT_WRITE_FILE_LINES} lines"
+                )
+            total_bytes += len(content_bytes)
+            total_lines += line_count
+            if total_bytes > MAX_AGENT_WRITE_TOTAL_BYTES:
+                raise ValueError(
+                    "write_files total content exceeds "
+                    f"{MAX_AGENT_WRITE_TOTAL_BYTES} bytes"
+                )
+            if total_lines > MAX_AGENT_WRITE_TOTAL_LINES:
+                raise ValueError(
+                    "write_files total content exceeds "
+                    f"{MAX_AGENT_WRITE_TOTAL_LINES} lines"
+                )
+
+            target = DEFAULT_PATH_POLICY.validate_disk_path(
+                repository,
+                path,
+                access="write",
+                allow_missing_leaf=True,
+            )
+            _reject_case_colliding_path(repository, path)
+            exists = target.exists()
+            if exists:
+                target_stat = os.lstat(target)
+                if not stat.S_ISREG(target_stat.st_mode) or target_stat.st_nlink > 1:
+                    raise ValueError(f"write_files target is not a safe regular file: {path}")
+                if (
+                    self.require_complete_read_before_write
+                    and path not in self._complete_read_paths
+                ):
+                    raise ValueError(
+                        f"write_files target must be read completely before editing: {path}"
+                    )
+                if target_stat.st_size > MAX_AGENT_WRITE_FILE_BYTES:
+                    raise ValueError(
+                        f"write_files target {path} exceeds "
+                        f"{MAX_AGENT_WRITE_FILE_BYTES} bytes"
+                    )
+            elif not content:
+                raise ValueError(f"write_files cannot create an empty file: {path}")
+            preflight.append((path, content, target, exists))
+
+        # Validate the complete batch, including every disk target, before reading
+        # any repository content. A malicious later entry must not turn an otherwise
+        # rejected request into a partial repository read.
+        writes: list[tuple[str, str, str, bool]] = []
+        for path, content, target, exists in preflight:
+            if exists:
+                try:
+                    before_bytes = target.read_bytes()
+                    if len(before_bytes) > MAX_AGENT_WRITE_FILE_BYTES:
+                        raise ValueError(
+                            f"write_files target {path} exceeds "
+                            f"{MAX_AGENT_WRITE_FILE_BYTES} bytes"
+                        )
+                    before = before_bytes.decode("utf-8")
+                except (OSError, UnicodeError) as exc:
+                    raise ValueError(
+                        f"write_files target is not readable UTF-8 text: {path}"
+                    ) from exc
+                if "\x00" in before or "\r" in before:
+                    raise ValueError(
+                        f"write_files target must be LF-delimited UTF-8 text: {path}"
+                    )
+                if _logical_line_count(before) > MAX_AGENT_WRITE_FILE_LINES:
+                    raise ValueError(
+                        f"write_files target {path} exceeds "
+                        f"{MAX_AGENT_WRITE_FILE_LINES} lines"
+                    )
+                if before == content:
+                    continue
+            else:
+                before = ""
+            writes.append((path, before, content, exists))
+
+        if not writes:
+            raise ValueError("write_files makes no changes")
+        rendered = [
+            _render_full_file_diff(path, before, content, exists=exists)
+            for path, before, content, exists in sorted(writes, key=lambda item: item[0])
+        ]
+        unified_diff = "".join(rendered)
+        result = self._apply_patch(
+            ToolCall(call.id, call.name, {"unified_diff": unified_diff})
+        )
+        if result.ok:
+            self._complete_read_paths.update(path for path, *_rest in writes)
         return result
 
     def _run_check(self, call: ToolCall) -> ToolResult:
@@ -396,6 +698,74 @@ def _bounded_int(value: object, name: str, maximum: int) -> int:
     return value
 
 
+def _portable_path_identity(path: str) -> str:
+    return "/".join(
+        unicodedata.normalize("NFC", part).casefold()
+        for part in PurePosixPath(path).parts
+    )
+
+
+def _reject_case_colliding_path(repository: Path, path: str) -> None:
+    current = repository
+    for part in PurePosixPath(path).parts:
+        try:
+            entries = tuple(current.iterdir())
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise ValueError(f"write_files path cannot be inspected: {path}") from exc
+        identity = unicodedata.normalize("NFC", part).casefold()
+        matches = [
+            entry.name
+            for entry in entries
+            if unicodedata.normalize("NFC", entry.name).casefold() == identity
+        ]
+        if len(matches) > 1 or (matches and part not in matches):
+            raise ValueError(f"write_files path collides with an existing path: {path}")
+        if not matches:
+            return
+        current /= part
+
+
+def _logical_line_count(value: str) -> int:
+    if not value:
+        return 0
+    return value.count("\n") + int(not value.endswith("\n"))
+
+
+def _lf_lines(value: str) -> list[str]:
+    if not value:
+        return []
+    parts = value.split("\n")
+    lines = [part + "\n" for part in parts[:-1]]
+    if parts[-1]:
+        lines.append(parts[-1])
+    return lines
+
+
+def _render_full_file_diff(
+    path: str, before: str, after: str, *, exists: bool
+) -> str:
+    body = difflib.unified_diff(
+        _lf_lines(before),
+        _lf_lines(after),
+        fromfile=f"a/{path}" if exists else "/dev/null",
+        tofile=f"b/{path}",
+        n=3,
+        lineterm="\n",
+    )
+    rendered: list[str] = [f"diff --git a/{path} b/{path}\n"]
+    if not exists:
+        rendered.append("new file mode 100644\n")
+    for line in body:
+        rendered.append(line if line.endswith("\n") else line + "\n")
+        if not line.endswith("\n") and line[:1] in {" ", "+", "-"}:
+            rendered.append("\\ No newline at end of file\n")
+    if len(rendered) <= (2 if not exists else 1):
+        raise ValueError(f"write_files makes no change to {path}")
+    return "".join(rendered)
+
+
 def _limit_lines(result: ToolResult, limit: int) -> ToolResult:
     lines = result.output.splitlines()
     if len(lines) <= limit:
@@ -429,4 +799,8 @@ __all__ = [
     "MAX_AGENT_BATCH_LINES",
     "MAX_AGENT_FILE_RESULTS",
     "MAX_AGENT_SEARCH_RESULTS",
+    "MAX_AGENT_WRITE_FILE_BYTES",
+    "MAX_AGENT_WRITE_FILE_LINES",
+    "MAX_AGENT_WRITE_TOTAL_BYTES",
+    "MAX_AGENT_WRITE_TOTAL_LINES",
 ]

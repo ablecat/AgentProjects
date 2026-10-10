@@ -17,7 +17,6 @@ import repo_agent.openai_provider as provider_module
 from repo_agent.models import FinalAnswer, ToolCall, ToolResult
 from repo_agent.openai_provider import (
     APIKind,
-    ESTIMATED_UTF8_BYTES_PER_TOKEN,
     MAX_TASK_CHARACTERS,
     MAX_RESPONSE_TOKEN_BUDGET,
     REQUEST_PROTOCOL_TOKEN_MARGIN,
@@ -30,10 +29,14 @@ from repo_agent.openai_provider import (
     OpenAIRequestCapacityError,
     OpenAIResponseTooLargeError,
     OpenAITimeoutError,
+    OpenAIToolArgumentsError,
+    OpenAIUnknownToolError,
     OpenAITransportError,
     RemoteModelNotAllowedError,
+    _encode_request_payload,
     _estimate_request_input_tokens,
     strict_response_tools,
+    tool_result_replay_bytes,
 )
 from repo_agent.tools import TOOL_DEFINITIONS
 
@@ -133,7 +136,7 @@ def test_config_loads_only_explicit_contract_and_redacts_key() -> None:
     assert "must-be-ignored" not in repr(loaded)
 
 
-def test_request_input_token_estimate_uses_exact_serialized_utf8_size() -> None:
+def test_request_input_token_estimate_charges_each_serialized_utf8_byte() -> None:
     payload = {"model": "fake-model", "input": "\u6d4b\u8bd5"}
     encoded = json.dumps(
         payload,
@@ -143,8 +146,140 @@ def test_request_input_token_estimate_uses_exact_serialized_utf8_size() -> None:
     ).encode("utf-8")
 
     assert _estimate_request_input_tokens(payload) == (
-        len(encoded) + ESTIMATED_UTF8_BYTES_PER_TOKEN - 1
-    ) // ESTIMATED_UTF8_BYTES_PER_TOKEN + REQUEST_PROTOCOL_TOKEN_MARGIN
+        len(encoded) + REQUEST_PROTOCOL_TOKEN_MARGIN
+    )
+
+
+def test_tool_result_replay_bytes_bounds_responses_and_chat_unicode_envelopes() -> None:
+    result = ToolResult(
+        "unicode-call",
+        "read_files",
+        True,
+        "\U0001f600\u754c" * 2_048,
+        exit_code=0,
+    )
+    serialized = json.dumps(
+        {
+            "ok": result.ok,
+            "output": result.output,
+            "error": result.error,
+            "exit_code": result.exit_code,
+            "truncated": result.truncated,
+        },
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
+    responses_envelope = {
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": result.call_id,
+                "output": serialized,
+            }
+        ]
+    }
+    chat_envelope = {
+        "messages": [
+            {
+                "role": "tool",
+                "tool_call_id": result.call_id,
+                "content": serialized,
+            }
+        ]
+    }
+    response_bytes = len(_encode_request_payload(responses_envelope))
+    chat_bytes = len(_encode_request_payload(chat_envelope))
+
+    assert tool_result_replay_bytes(result) == max(response_bytes, chat_bytes)
+    assert tool_result_replay_bytes(result) >= response_bytes
+    assert tool_result_replay_bytes(result) >= chat_bytes
+    assert tool_result_replay_bytes(result) > len(result.output.encode("utf-8")) * 3
+
+
+@pytest.mark.parametrize(
+    "request_input",
+    (
+        [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "x" * 1_000}],
+            }
+        ],
+        [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "inspect"}],
+            },
+            {
+                "type": "function_call",
+                "call_id": "ascii-call",
+                "name": "read_files",
+                "arguments": '{"paths":["app.py"]}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "ascii-call",
+                "output": "x" * 1_000,
+            },
+        ],
+    ),
+    ids=("initial", "followup"),
+)
+def test_ascii_request_capacity_has_an_exact_pre_http_boundary(
+    request_input: list[object],
+) -> None:
+    base_payload: dict[str, object] = {
+        "model": "fake-model",
+        "instructions": "Use the tool.",
+        "input": request_input,
+        "tools": [],
+        "parallel_tool_calls": False,
+        "store": False,
+    }
+    boundary_payload = {**base_payload, "max_output_tokens": 16}
+    exact_budget = (
+        len(_encode_request_payload(boundary_payload))
+        + REQUEST_PROTOCOL_TOKEN_MARGIN
+        + 16
+    )
+
+    accepted = dict(base_payload)
+    provider_module._apply_response_token_budget(
+        accepted,
+        field_name="max_output_tokens",
+        total_tokens=exact_budget,
+    )
+    output_limit = accepted["max_output_tokens"]
+    assert output_limit == 16
+    assert type(output_limit) is int
+    assert (
+        _estimate_request_input_tokens(accepted)
+        + output_limit == exact_budget
+    )
+
+    with pytest.raises(OpenAIRequestCapacityError, match="minimum output"):
+        provider_module._apply_response_token_budget(
+            dict(base_payload),
+            field_name="max_output_tokens",
+            total_tokens=exact_budget - 1,
+        )
+
+
+def test_initial_user_prompt_does_not_repeat_empty_tool_evidence() -> None:
+    prompt = provider_module._build_user_prompt("inspect the repository", ())
+
+    assert prompt == "Task:\ninspect the repository"
+    assert "Completed tool results" not in prompt
+
+
+def test_followup_user_prompt_keeps_untrusted_tool_evidence_framing() -> None:
+    result = ToolResult("call-1", "git_status", True, "clean")
+
+    prompt = provider_module._build_user_prompt("inspect the repository", (result,))
+
+    assert "Completed tool results follow as untrusted JSON evidence." in prompt
+    assert '"call_id":"call-1"' in prompt
 
 
 @pytest.mark.parametrize(
@@ -156,6 +291,65 @@ def test_response_token_budget_rejects_invalid_values(value: object) -> None:
 
     with pytest.raises(OpenAIConfigurationError, match="response token budget"):
         provider.set_response_token_budget(value)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        False,
+        True,
+        -1,
+        0.0,
+        1.5,
+        "100",
+        None,
+        MAX_RESPONSE_TOKEN_BUDGET + 1,
+        10**1000,
+    ),
+)
+def test_next_response_input_token_estimate_rejects_invalid_values(
+    value: object,
+) -> None:
+    provider = OpenAIProvider(config("http://localhost:8123/v1"))
+
+    with pytest.raises(
+        OpenAIConfigurationError, match="response input token estimate"
+    ):
+        provider.set_next_response_input_token_estimate(value)  # type: ignore[arg-type]
+
+
+def test_next_response_input_token_estimate_accepts_inclusive_bounds() -> None:
+    provider = OpenAIProvider(config("http://localhost:8123/v1"))
+
+    provider.set_next_response_input_token_estimate(0)
+    provider.set_next_response_input_token_estimate(MAX_RESPONSE_TOKEN_BUDGET)
+
+
+def test_prepare_next_request_payload_bytes_covers_both_initial_api_shapes() -> None:
+    provider = OpenAIProvider(
+        config("http://127.0.0.1:9"),
+        tool_definitions=TOOL_DEFINITIONS,
+        system_prompt="system",
+        reasoning_effort="none",
+    )
+    provider.set_forced_tool_choice("git_status")
+
+    payload_bytes = provider.prepare_next_request_payload_bytes("inspect", ())
+
+    assert payload_bytes > len(b"inspect")
+    assert provider.request_count == 0
+    assert provider.usage.response_count == 0
+
+
+@pytest.mark.parametrize(
+    "value",
+    (False, True, 0, -1, 1.5, "100", MAX_RESPONSE_TOKEN_BUDGET + 1, 10**1000),
+)
+def test_minimum_response_output_tokens_rejects_invalid_values(value: object) -> None:
+    provider = OpenAIProvider(config("http://localhost:8123/v1"))
+
+    with pytest.raises(OpenAIConfigurationError, match="minimum response output"):
+        provider.set_minimum_response_output_tokens(value)  # type: ignore[arg-type]
 
 
 def test_responses_usage_is_aggregated_across_rounds() -> None:
@@ -601,6 +795,7 @@ def test_responses_provider_returns_native_tool_call_and_drops_optional_nulls() 
         {"pattern": "TODO"},
     )
     assert provider.api_kind == "responses"
+    assert provider.rejected_tool_call_violations == 0
     assert len(requests) == 1
 
 
@@ -642,6 +837,9 @@ def test_forced_tool_choice_is_consumed_by_one_responses_request() -> None:
                 "type": "function",
                 "name": "git_status",
             }
+            assert [tool["name"] for tool in request["tools"]] == [
+                "git_status"
+            ]
             return json_response(
                 {
                     "output": [
@@ -655,6 +853,9 @@ def test_forced_tool_choice_is_consumed_by_one_responses_request() -> None:
                 }
             )
         assert "tool_choice" not in request
+        assert {tool["name"] for tool in request["tools"]} == {
+            definition.name for definition in TOOL_DEFINITIONS
+        }
         return json_response(
             {
                 "output": [
@@ -674,6 +875,44 @@ def test_forced_tool_choice_is_consumed_by_one_responses_request() -> None:
         assert provider.next_step(
             "inspect", (ToolResult(call.id, call.name, True, "clean"),)
         ) == FinalAnswer("done")
+
+
+def test_official_deepseek_named_tool_request_is_non_thinking() -> None:
+    provider = OpenAIProvider(
+        OpenAIConfig(
+            api_key="fake-deepseek-key",
+            base_url="https://api.deepseek.com",
+            model="deepseek-v4-pro",
+            allow_remote_model=True,
+        ),
+        reasoning_effort="none",
+    )
+    payloads: list[Mapping[str, object]] = []
+
+    def responder(_path, payload, **_kwargs):
+        payloads.append(payload)
+        return {
+            "output": [
+                {
+                    "type": "function_call",
+                    "call_id": "read-call",
+                    "name": "git_status",
+                    "arguments": "{}",
+                }
+            ],
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        }
+
+    provider._client.post_json = responder  # type: ignore[method-assign]
+    provider.set_forced_tool_choice("git_status")
+
+    assert provider.next_step("inspect", ()) == ToolCall(
+        "read-call", "git_status", {}
+    )
+    request = payloads[0]
+    assert request["reasoning"] == {"effort": "none"}
+    assert request["tool_choice"] == {"type": "function", "name": "git_status"}
+    assert [tool["name"] for tool in request["tools"]] == ["git_status"]
 
 
 def test_official_deepseek_sequentializes_parallel_responses_calls() -> None:
@@ -722,6 +961,7 @@ def test_official_deepseek_sequentializes_parallel_responses_calls() -> None:
     pending_replay_bytes = provider.pending_internal_tool_result_bytes
     assert pending_replay_bytes > 0
     assert provider.parallel_tool_call_violations == 1
+    assert provider.rejected_tool_call_violations == 0
     final = provider.next_step(
         "inspect",
         (ToolResult(decision.id, decision.name, True, "clean"),),
@@ -754,6 +994,7 @@ def test_official_deepseek_sequentializes_parallel_responses_calls() -> None:
     assert "not executed" in deferred["error"]
     assert provider.pending_internal_tool_result_bytes == 0
     assert provider.parallel_tool_call_violations == 1
+    assert provider.rejected_tool_call_violations == 0
 
 
 def test_official_deepseek_rejects_too_many_parallel_responses_calls() -> None:
@@ -782,7 +1023,41 @@ def test_official_deepseek_rejects_too_many_parallel_responses_calls() -> None:
         provider.next_step("inspect", ())
 
     assert provider.parallel_tool_call_violations == call_count - 1
+    assert provider.rejected_tool_call_violations == 1
     assert provider.pending_internal_tool_result_bytes == 0
+
+
+def test_malformed_usage_counts_unexecuted_calls_without_parallel_double_count() -> None:
+    provider = OpenAIProvider(
+        OpenAIConfig(
+            api_key="fake-deepseek-key",
+            base_url="https://api.deepseek.com",
+            model="deepseek-v4-pro",
+            allow_remote_model=True,
+        )
+    )
+    provider._client.post_json = lambda *_args, **_kwargs: {  # type: ignore[method-assign]
+        "output": [
+            {
+                "type": "function_call",
+                "call_id": f"usage-call-{index}",
+                "name": "git_status",
+                "arguments": "{}",
+            }
+            for index in range(2)
+        ],
+        "usage": {
+            "input_tokens": 3,
+            "output_tokens": "invalid",
+            "total_tokens": 3,
+        },
+    }
+
+    with pytest.raises(OpenAIProtocolError, match="usage is malformed"):
+        provider.next_step("inspect", ())
+
+    assert provider.parallel_tool_call_violations == 1
+    assert provider.rejected_tool_call_violations == 1
 
 
 def test_responses_provider_reports_incomplete_output_reason() -> None:
@@ -791,7 +1066,14 @@ def test_responses_provider_reports_incomplete_output_reason() -> None:
             {
                 "status": "incomplete",
                 "incomplete_details": {"reason": "max_output_tokens"},
-                "output": [{"type": "reasoning", "content": []}],
+                "output": [
+                    {
+                        "type": "function_call",
+                        "call_id": "incomplete-call",
+                        "name": "git_status",
+                        "arguments": '{"unfinished":',
+                    }
+                ],
                 "usage": {
                     "input_tokens": 10,
                     "output_tokens": 20,
@@ -802,14 +1084,144 @@ def test_responses_provider_reports_incomplete_output_reason() -> None:
 
     with fake_openai_server(responder) as (base_url, _):
         provider = OpenAIProvider(config(base_url))
-        with pytest.raises(OpenAIProtocolError, match="max_output_tokens"):
+        with pytest.raises(OpenAIProtocolError, match="max_output_tokens") as raised:
             provider.next_step("inspect", ())
 
+    assert not isinstance(raised.value, OpenAIToolArgumentsError)
+    assert provider.usage.complete is True
     assert provider.usage.total_tokens == 30
+    assert provider.rejected_tool_call_violations == 0
+
+
+def test_responses_malformed_nested_tool_arguments_use_dedicated_error() -> None:
+    malformed = '{"path":"unterminated'
+
+    def responder(*_: object) -> ResponseSpec:
+        return json_response(
+            {
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "function_call",
+                        "call_id": "responses-malformed-arguments",
+                        "name": "git_status",
+                        "arguments": malformed,
+                    }
+                ],
+            }
+        )
+
+    with fake_openai_server(responder) as (base_url, _):
+        provider = OpenAIProvider(config(base_url))
+        with pytest.raises(
+            OpenAIToolArgumentsError, match="tool arguments is invalid JSON"
+        ) as raised:
+            provider.next_step("inspect", ())
+
+    assert malformed not in str(raised.value)
+    assert provider.rejected_tool_call_violations == 1
+    assert provider.recovered_tool_argument_violations == 0
+    provider.mark_malformed_tool_arguments_recovered()
+    assert provider.recovered_tool_argument_violations == 1
+    with pytest.raises(OpenAIProtocolError, match="awaiting recovery"):
+        provider.mark_malformed_tool_arguments_recovered()
+
+
+def test_chat_malformed_nested_tool_arguments_use_dedicated_error() -> None:
+    malformed = '{"path":"unterminated'
+
+    def responder(
+        path: str,
+        _headers: Mapping[str, str],
+        _raw: bytes,
+        _index: int,
+    ) -> ResponseSpec:
+        if path == "/responses":
+            return json_response({"error": {"code": "unknown_endpoint"}}, 404)
+        return json_response(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "chat-malformed-arguments",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "git_status",
+                                        "arguments": malformed,
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            }
+        )
+
+    with fake_openai_server(responder) as (base_url, _):
+        provider = OpenAIProvider(config(base_url))
+        with pytest.raises(
+            OpenAIToolArgumentsError, match="tool arguments is invalid JSON"
+        ) as raised:
+            provider.next_step("inspect", ())
+
+    assert malformed not in str(raised.value)
+    assert provider.api_kind == "chat_completions"
+    assert provider.rejected_tool_call_violations == 1
+
+
+def test_unknown_tool_uses_dedicated_error_and_tracks_recovery() -> None:
+    def responder(*_: object) -> ResponseSpec:
+        return json_response(
+            {
+                "output": [
+                    {
+                        "type": "function_call",
+                        "call_id": "unknown-tool-call",
+                        "name": "not_registered",
+                        "arguments": '{"unfinished":',
+                    }
+                ]
+            }
+        )
+
+    with fake_openai_server(responder) as (base_url, _):
+        provider = OpenAIProvider(config(base_url))
+        with pytest.raises(
+            OpenAIUnknownToolError, match="unknown or inactive tool"
+        ) as raised:
+            provider.next_step("inspect", ())
+
+    assert isinstance(raised.value, OpenAIProtocolError)
+    assert not isinstance(raised.value, OpenAIToolArgumentsError)
+    assert provider.rejected_tool_call_violations == 1
+    assert provider.unknown_tool_violations == 1
+    assert provider.recovered_unknown_tool_violations == 0
+    provider.mark_unknown_tool_recovered()
+    assert provider.recovered_unknown_tool_violations == 1
+    with pytest.raises(OpenAIProtocolError, match="awaiting recovery"):
+        provider.mark_unknown_tool_recovered()
+
+
+def test_outer_malformed_response_remains_a_general_protocol_error() -> None:
+    def responder(*_: object) -> ResponseSpec:
+        return 200, {"Content-Type": "application/json"}, b'{"output":'
+
+    with fake_openai_server(responder) as (base_url, _):
+        provider = OpenAIProvider(config(base_url))
+        with pytest.raises(
+            OpenAIProtocolError, match="model response is invalid JSON"
+        ) as raised:
+            provider.next_step("inspect", ())
+
+    assert not isinstance(raised.value, OpenAIToolArgumentsError)
 
 
 def test_responses_token_budget_is_recomputed_and_consumed_each_round() -> None:
-    budgets = (4_000, 3_000)
+    budgets = (6_000, 6_000)
     output_limits: list[int] = []
 
     def responder(
@@ -882,9 +1294,141 @@ def test_response_token_budget_can_be_exhausted_before_http() -> None:
             provider.next_step("inspect", ())
 
     assert requests == []
+    assert provider.request_count == 0
     assert provider.usage.response_count == 0
     assert provider.usage.total_tokens is None
     assert provider.last_response_usage is None
+
+
+def test_responses_input_estimate_override_allows_full_payload_once() -> None:
+    budget = 256
+    input_estimate = 64
+    task = "x" * 1_000
+
+    def responder(path, _headers, _raw, _index):
+        assert path == "/responses"
+        return json_response(
+            {
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "done"}],
+                    }
+                ]
+            }
+        )
+
+    with fake_openai_server(responder) as (base_url, requests):
+        provider = OpenAIProvider(
+            config(base_url),
+            tool_definitions=(TOOL_DEFINITIONS[0],),
+            system_prompt="Review the complete candidate.",
+        )
+        provider.set_response_token_budget(budget)
+        with pytest.raises(OpenAIRequestCapacityError):
+            provider.next_step(task, ())
+        assert requests == []
+
+        provider.set_next_response_input_token_estimate(input_estimate)
+        assert provider.next_step(task, ()) == FinalAnswer("done")
+
+        request = json.loads(requests[0]["body"])
+        assert _estimate_request_input_tokens(request) > budget
+        assert request["max_output_tokens"] == budget - input_estimate
+
+        provider.set_response_token_budget(budget)
+        with pytest.raises(OpenAIRequestCapacityError):
+            provider.next_step("y" * 1_000, ())
+
+    assert len(requests) == 1
+
+
+def test_input_estimate_override_applies_to_responses_and_chat_once() -> None:
+    budget = 256
+    input_estimate = 64
+    task = "x" * 1_000
+
+    def responder(path, _headers, _raw, _index):
+        if path == "/responses":
+            return json_response({"error": {"code": "unknown_endpoint"}}, 404)
+        assert path == "/chat/completions"
+        return json_response(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "done",
+                        }
+                    }
+                ]
+            }
+        )
+
+    with fake_openai_server(responder) as (base_url, requests):
+        blocked = OpenAIProvider(
+            config(base_url),
+            tool_definitions=(TOOL_DEFINITIONS[0],),
+            system_prompt="Review the complete candidate.",
+        )
+        blocked.set_response_token_budget(budget)
+        with pytest.raises(OpenAIRequestCapacityError):
+            blocked.next_step(task, ())
+        assert requests == []
+
+        provider = OpenAIProvider(
+            config(base_url),
+            tool_definitions=(TOOL_DEFINITIONS[0],),
+            system_prompt="Review the complete candidate.",
+        )
+        provider.set_response_token_budget(budget)
+        provider.set_next_response_input_token_estimate(input_estimate)
+        assert provider.next_step(task, ()) == FinalAnswer("done")
+
+        responses_request = json.loads(requests[0]["body"])
+        chat_request = json.loads(requests[1]["body"])
+        assert _estimate_request_input_tokens(responses_request) > budget
+        assert _estimate_request_input_tokens(chat_request) > budget
+        assert responses_request["max_output_tokens"] == budget - input_estimate
+        assert chat_request["max_completion_tokens"] == budget - input_estimate
+
+        provider.set_response_token_budget(budget)
+        with pytest.raises(OpenAIRequestCapacityError):
+            provider.next_step("y" * 1_000, ())
+
+    assert provider.api_kind == "chat_completions"
+    assert [request["path"] for request in requests] == [
+        "/responses",
+        "/chat/completions",
+    ]
+
+
+def test_chat_fallback_capacity_error_records_the_completed_responses_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def estimate(payload: Mapping[str, object]) -> int:
+        return 100 if "input" in payload else 200
+
+    monkeypatch.setattr(provider_module, "_estimate_request_input_tokens", estimate)
+
+    def responder(path, _headers, _raw, _index):
+        assert path == "/responses"
+        return json_response({"error": {"code": "unknown_endpoint"}}, 404)
+
+    with fake_openai_server(responder) as (base_url, requests):
+        provider = OpenAIProvider(config(base_url))
+        provider.set_response_token_budget(150)
+        with pytest.raises(OpenAIRequestCapacityError, match="minimum output"):
+            provider.next_step("inspect", ())
+
+    assert [request["path"] for request in requests] == ["/responses"]
+    assert provider.request_count == 1
+    assert provider.usage.response_count == 1
+    assert provider.usage.reported_response_count == 0
+    assert provider.usage.complete is False
+    assert provider.last_response_usage == provider_module.ProviderUsage(
+        1, 0, None, None, None, None
+    )
 
 
 def test_responses_budget_requires_sixteen_output_tokens_before_http(
@@ -940,6 +1484,40 @@ def test_responses_budget_requires_sixteen_output_tokens_before_http(
         }.issubset(payload)
         for payload in estimated_payloads
     )
+
+
+def test_phase_output_floor_is_enforced_before_http(monkeypatch) -> None:
+    monkeypatch.setattr(
+        provider_module, "_estimate_request_input_tokens", lambda _payload: 100
+    )
+
+    def responder(*_: object) -> ResponseSpec:
+        return json_response(
+            {
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "done"}],
+                    }
+                ]
+            }
+        )
+
+    with fake_openai_server(responder) as (base_url, requests):
+        blocked = OpenAIProvider(config(base_url))
+        blocked.set_response_token_budget(355)
+        blocked.set_minimum_response_output_tokens(256)
+        with pytest.raises(OpenAIRequestCapacityError, match="minimum output"):
+            blocked.next_step("inspect", ())
+        assert requests == []
+
+        allowed = OpenAIProvider(config(base_url))
+        allowed.set_response_token_budget(356)
+        allowed.set_minimum_response_output_tokens(256)
+        assert allowed.next_step("inspect", ()) == FinalAnswer("done")
+
+    request = json.loads(requests[0]["body"])
+    assert request["max_output_tokens"] == 256
 
 
 def test_chat_budget_can_retain_one_output_token(monkeypatch) -> None:
@@ -1069,19 +1647,29 @@ def test_response_token_budget_survives_a_protocol_error_retry() -> None:
         )
 
     with fake_openai_server(responder) as (base_url, requests):
-        provider = OpenAIProvider(config(base_url))
-        provider.set_response_token_budget(4_000)
+        provider = OpenAIProvider(
+            config(base_url),
+            idempotency_key="run-budget:implement:0",
+        )
+        provider.set_response_token_budget(6_000)
         with pytest.raises(OpenAIProtocolError):
             provider.next_step("inspect", ())
         final = provider.next_step("inspect", ())
 
     assert final == FinalAnswer("done")
     assert output_limits[0] == output_limits[1]
+    assert [
+        request["headers"]["idempotency-key"] for request in requests
+    ] == [
+        "run-budget:implement:0:responses:0",
+        "run-budget:implement:0:responses:1",
+    ]
     assert len(requests) == 2
 
 
 def test_forced_tool_choice_survives_a_protocol_error_retry() -> None:
     tool_choices: list[object] = []
+    exposed_tool_names: list[list[object]] = []
 
     def responder(
         _path: str,
@@ -1091,8 +1679,26 @@ def test_forced_tool_choice_survives_a_protocol_error_retry() -> None:
     ) -> ResponseSpec:
         request = json.loads(raw)
         tool_choices.append(request["tool_choice"])
+        exposed_tool_names.append([tool["name"] for tool in request["tools"]])
         if index == 0:
-            return (200, {"Content-Type": "application/json"}, b"not-json")
+            return json_response(
+                {
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "call_id": "unexposed-tool",
+                            "name": "search",
+                            "arguments": json.dumps(
+                                {
+                                    "pattern": "TODO",
+                                    "glob": None,
+                                    "fixed_strings": None,
+                                }
+                            ),
+                        }
+                    ]
+                }
+            )
         return json_response(
             {
                 "output": [
@@ -1107,18 +1713,339 @@ def test_forced_tool_choice_survives_a_protocol_error_retry() -> None:
         )
 
     with fake_openai_server(responder) as (base_url, requests):
-        provider = OpenAIProvider(config(base_url))
+        provider = OpenAIProvider(
+            config(base_url),
+            idempotency_key="run-forced:implement:0",
+        )
         provider.set_forced_tool_choice("git_status")
-        with pytest.raises(OpenAIProtocolError):
+        with pytest.raises(
+            OpenAIUnknownToolError, match="unknown or inactive tool"
+        ):
             provider.next_step("inspect", ())
         decision = provider.next_step("inspect", ())
+        provider.mark_unknown_tool_recovered()
 
     assert decision == ToolCall("forced-retry", "git_status", {})
     assert tool_choices == [
         {"type": "function", "name": "git_status"},
         {"type": "function", "name": "git_status"},
     ]
+    assert exposed_tool_names == [["git_status"], ["git_status"]]
+    assert provider.rejected_tool_call_violations == 1
+    assert provider.unknown_tool_violations == 1
+    assert provider.recovered_unknown_tool_violations == 1
+    assert provider.parallel_tool_call_violations == 0
+    assert [
+        request["headers"]["idempotency-key"] for request in requests
+    ] == [
+        "run-forced:implement:0:responses:0",
+        "run-forced:implement:0:responses:1",
+    ]
     assert len(requests) == 2
+
+
+def test_responses_forced_tool_choice_rejects_final_text_and_survives_retry() -> None:
+    def responder(
+        _path: str,
+        _headers: Mapping[str, str],
+        raw: bytes,
+        index: int,
+    ) -> ResponseSpec:
+        request = json.loads(raw)
+        assert request["tool_choice"] == {
+            "type": "function",
+            "name": "git_status",
+        }
+        if index == 0:
+            return json_response(
+                {
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [{"type": "output_text", "text": "done"}],
+                        }
+                    ]
+                }
+            )
+        return json_response(
+            {
+                "output": [
+                    {
+                        "type": "function_call",
+                        "call_id": "forced-after-text",
+                        "name": "git_status",
+                        "arguments": "{}",
+                    }
+                ]
+            }
+        )
+
+    with fake_openai_server(responder) as (base_url, requests):
+        provider = OpenAIProvider(
+            config(base_url),
+            idempotency_key="forced-text:responses",
+        )
+        provider.set_forced_tool_choice("git_status")
+        with pytest.raises(OpenAIProtocolError, match="forced tool"):
+            provider.next_step("inspect", ())
+        decision = provider.next_step("inspect", ())
+
+    assert decision == ToolCall("forced-after-text", "git_status", {})
+    assert provider.rejected_tool_call_violations == 1
+    assert [
+        request["headers"]["idempotency-key"] for request in requests
+    ] == [
+        "forced-text:responses:responses:0",
+        "forced-text:responses:responses:1",
+    ]
+
+
+def test_chat_forced_tool_choice_filters_one_round_and_survives_retry() -> None:
+    chat_attempt = 0
+
+    def responder(
+        path: str,
+        _headers: Mapping[str, str],
+        raw: bytes,
+        _index: int,
+    ) -> ResponseSpec:
+        nonlocal chat_attempt
+        request = json.loads(raw)
+        if path == "/responses":
+            assert request["tool_choice"] == {
+                "type": "function",
+                "name": "git_status",
+            }
+            assert [tool["name"] for tool in request["tools"]] == [
+                "git_status"
+            ]
+            return json_response({"error": {"code": "unknown_endpoint"}}, 404)
+
+        assert path == "/chat/completions"
+        chat_attempt += 1
+        if chat_attempt <= 2:
+            assert request["tool_choice"] == {
+                "type": "function",
+                "function": {"name": "git_status"},
+            }
+            assert [
+                tool["function"]["name"] for tool in request["tools"]
+            ] == ["git_status"]
+            name = "search" if chat_attempt == 1 else "git_status"
+            arguments = (
+                {
+                    "pattern": "TODO",
+                    "glob": None,
+                    "fixed_strings": None,
+                }
+                if name == "search"
+                else {}
+            )
+            return json_response(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": f"chat-forced-{chat_attempt}",
+                                        "type": "function",
+                                        "function": {
+                                            "name": name,
+                                            "arguments": json.dumps(arguments),
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+            )
+
+        assert "tool_choice" not in request
+        assert {
+            tool["function"]["name"] for tool in request["tools"]
+        } == {definition.name for definition in TOOL_DEFINITIONS}
+        return json_response(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "done",
+                        }
+                    }
+                ]
+            }
+        )
+
+    with fake_openai_server(responder) as (base_url, requests):
+        provider = OpenAIProvider(
+            config(base_url),
+            idempotency_key="run-chat-sticky:implement:0",
+        )
+        provider.set_forced_tool_choice("git_status")
+        with pytest.raises(
+            OpenAIUnknownToolError, match="unknown or inactive tool"
+        ):
+            provider.next_step("inspect", ())
+        assert provider.api_kind == "chat_completions"
+        call = provider.next_step("inspect", ())
+        assert call == ToolCall("chat-forced-2", "git_status", {})
+        provider.mark_unknown_tool_recovered()
+        final = provider.next_step(
+            "inspect", (ToolResult(call.id, call.name, True, "clean"),)
+        )
+
+    assert final == FinalAnswer("done")
+    assert [request["path"] for request in requests] == [
+        "/responses",
+        "/chat/completions",
+        "/chat/completions",
+        "/chat/completions",
+    ]
+    assert provider.rejected_tool_call_violations == 1
+    assert provider.unknown_tool_violations == 1
+    assert provider.recovered_unknown_tool_violations == 1
+    assert provider.parallel_tool_call_violations == 0
+    assert [
+        request["headers"]["idempotency-key"] for request in requests
+    ] == [
+        "run-chat-sticky:implement:0:responses:0",
+        "run-chat-sticky:implement:0:chat:0",
+        "run-chat-sticky:implement:0:chat:1",
+        "run-chat-sticky:implement:0:chat:2",
+    ]
+
+
+def test_chat_forced_tool_choice_rejects_final_text_and_survives_retry() -> None:
+    chat_attempt = 0
+
+    def responder(
+        path: str,
+        _headers: Mapping[str, str],
+        raw: bytes,
+        _index: int,
+    ) -> ResponseSpec:
+        nonlocal chat_attempt
+        if path == "/responses":
+            return json_response({"error": {"code": "unknown_endpoint"}}, 404)
+        chat_attempt += 1
+        request = json.loads(raw)
+        assert request["tool_choice"] == {
+            "type": "function",
+            "function": {"name": "git_status"},
+        }
+        if chat_attempt == 1:
+            return json_response(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "done",
+                            }
+                        }
+                    ]
+                }
+            )
+        return json_response(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "chat-forced-after-text",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "git_status",
+                                        "arguments": "{}",
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            }
+        )
+
+    with fake_openai_server(responder) as (base_url, requests):
+        provider = OpenAIProvider(
+            config(base_url),
+            idempotency_key="forced-text:chat",
+        )
+        provider.set_forced_tool_choice("git_status")
+        with pytest.raises(OpenAIProtocolError, match="forced tool"):
+            provider.next_step("inspect", ())
+        assert provider.api_kind == "chat_completions"
+        decision = provider.next_step("inspect", ())
+
+    assert decision == ToolCall("chat-forced-after-text", "git_status", {})
+    assert provider.rejected_tool_call_violations == 1
+    assert [request["path"] for request in requests] == [
+        "/responses",
+        "/chat/completions",
+        "/chat/completions",
+    ]
+    assert [
+        request["headers"]["idempotency-key"] for request in requests
+    ] == [
+        "forced-text:chat:responses:0",
+        "forced-text:chat:chat:0",
+        "forced-text:chat:chat:1",
+    ]
+
+
+def test_chat_malformed_usage_counts_unexecuted_tool_call() -> None:
+    def responder(
+        path: str,
+        _headers: Mapping[str, str],
+        _raw: bytes,
+        _index: int,
+    ) -> ResponseSpec:
+        if path == "/responses":
+            return json_response({"error": {"code": "unknown_endpoint"}}, 404)
+        return json_response(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "chat-usage-call",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "git_status",
+                                        "arguments": "{}",
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": "invalid",
+                    "completion_tokens": 2,
+                    "total_tokens": 2,
+                },
+            }
+        )
+
+    with fake_openai_server(responder) as (base_url, _):
+        provider = OpenAIProvider(config(base_url))
+        with pytest.raises(OpenAIProtocolError, match="usage is malformed"):
+            provider.next_step("inspect", ())
+
+    assert provider.api_kind == "chat_completions"
+    assert provider.rejected_tool_call_violations == 1
+    assert provider.parallel_tool_call_violations == 0
 
 
 def test_idempotency_key_rejects_header_injection_without_echoing_value() -> None:
@@ -1211,6 +2138,226 @@ def test_responses_provider_round_trips_reasoning_and_function_output() -> None:
     assert len(requests) == 2
 
 
+def test_rejected_apply_patch_arguments_are_compacted_in_responses_replay() -> None:
+    rejected_diff = "diff --git a/app.py b/app.py\n" + ("+large-change\n" * 2_000)
+
+    def responder(
+        path: str,
+        _headers: Mapping[str, str],
+        raw: bytes,
+        index: int,
+    ) -> ResponseSpec:
+        assert path == "/responses"
+        request = json.loads(raw)
+        if index == 0:
+            return json_response(
+                {
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "id": "responses-patch-item",
+                            "call_id": "responses-patch-call",
+                            "name": "apply_patch",
+                            "arguments": json.dumps(
+                                {"unified_diff": rejected_diff},
+                                separators=(",", ":"),
+                            ),
+                        }
+                    ]
+                }
+            )
+
+        assert index == 1
+        replayed = request["input"]
+        function_call = next(
+            item
+            for item in replayed
+            if item.get("type") == "function_call"
+        )
+        assert function_call["call_id"] == "responses-patch-call"
+        assert json.loads(function_call["arguments"]) == {
+            "unified_diff": "[rejected patch omitted from replay]"
+        }
+        assert rejected_diff not in json.dumps(replayed)
+        output = next(
+            item
+            for item in replayed
+            if item.get("type") == "function_call_output"
+        )
+        serialized_result = json.loads(output["output"])
+        assert serialized_result["ok"] is False
+        assert serialized_result["error"] == "patch rejected by test"
+        return json_response(
+            {
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "done"}],
+                    }
+                ]
+            }
+        )
+
+    with fake_openai_server(responder) as (base_url, _):
+        provider = OpenAIProvider(config(base_url))
+        call = provider.next_step("apply the change", ())
+        assert isinstance(call, ToolCall)
+        final = provider.next_step(
+            "apply the change",
+            (
+                ToolResult(
+                    call.id,
+                    call.name,
+                    False,
+                    "",
+                    error="patch rejected by test",
+                    exit_code=1,
+                ),
+            ),
+        )
+
+    assert final == FinalAnswer("done")
+
+
+def test_rejected_write_files_arguments_are_compacted_for_both_replays() -> None:
+    provider = OpenAIProvider(config("http://127.0.0.1:1"))
+    raw_arguments = json.dumps(
+        {"files": [{"path": "app.py", "content": "sensitive contents"}]}
+    )
+    provider._responses_input = [  # noqa: SLF001 - replay regression boundary
+        {
+            "type": "function_call",
+            "call_id": "write-call",
+            "name": "write_files",
+            "arguments": raw_arguments,
+        }
+    ]
+    provider._chat_messages = [  # noqa: SLF001 - replay regression boundary
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "write-call",
+                    "type": "function",
+                    "function": {
+                        "name": "write_files",
+                        "arguments": raw_arguments,
+                    },
+                }
+            ],
+        }
+    ]
+
+    provider._compact_rejected_mutation_call(  # noqa: SLF001
+        "write-call", "write_files"
+    )
+
+    placeholder = {
+        "files": [
+            {
+                "path": "__rejected_write_omitted__.txt",
+                "content": "[rejected file contents omitted from replay]",
+            }
+        ]
+    }
+    assert json.loads(provider._responses_input[0]["arguments"]) == placeholder  # type: ignore[index]  # noqa: SLF001
+    replayed = provider._chat_messages[0]["tool_calls"][0]["function"][  # type: ignore[index]  # noqa: SLF001
+        "arguments"
+    ]
+    assert json.loads(replayed) == placeholder
+    assert "sensitive contents" not in json.dumps(provider._responses_input)  # noqa: SLF001
+    assert "sensitive contents" not in json.dumps(provider._chat_messages)  # noqa: SLF001
+
+
+def test_rejected_apply_patch_arguments_are_compacted_in_chat_replay() -> None:
+    rejected_diff = "diff --git a/app.py b/app.py\n" + ("+large-change\n" * 2_000)
+
+    def responder(
+        path: str,
+        _headers: Mapping[str, str],
+        raw: bytes,
+        index: int,
+    ) -> ResponseSpec:
+        request = json.loads(raw)
+        if index == 0:
+            assert path == "/responses"
+            return json_response({"error": {"code": "unknown_endpoint"}}, 404)
+
+        assert path == "/chat/completions"
+        if index == 1:
+            return json_response(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "chat-patch-call",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "apply_patch",
+                                            "arguments": json.dumps(
+                                                {"unified_diff": rejected_diff},
+                                                separators=(",", ":"),
+                                            ),
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+            )
+
+        assert index == 2
+        assistant = request["messages"][-2]
+        assert assistant["role"] == "assistant"
+        tool_call = assistant["tool_calls"][0]
+        assert tool_call["id"] == "chat-patch-call"
+        assert json.loads(tool_call["function"]["arguments"]) == {
+            "unified_diff": "[rejected patch omitted from replay]"
+        }
+        assert rejected_diff not in json.dumps(assistant)
+        tool_result = request["messages"][-1]
+        serialized_result = json.loads(tool_result["content"])
+        assert serialized_result["ok"] is False
+        assert serialized_result["error"] == "patch rejected by test"
+        return json_response(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "done",
+                        }
+                    }
+                ]
+            }
+        )
+
+    with fake_openai_server(responder) as (base_url, _):
+        provider = OpenAIProvider(config(base_url))
+        call = provider.next_step("apply the change", ())
+        assert isinstance(call, ToolCall)
+        final = provider.next_step(
+            "apply the change",
+            (
+                ToolResult(
+                    call.id,
+                    call.name,
+                    False,
+                    "",
+                    error="patch rejected by test",
+                    exit_code=1,
+                ),
+            ),
+        )
+
+    assert final == FinalAnswer("done")
+
+
 def test_provider_rejects_a_result_for_a_different_call_id_before_http() -> None:
     def responder(*_: object) -> ResponseSpec:
         return json_response(
@@ -1260,7 +2407,7 @@ def test_provider_does_not_repeat_a_pending_call_without_its_result() -> None:
     assert len(requests) == 1
 
 
-def test_same_logical_round_reuses_derived_idempotency_key_on_retry() -> None:
+def test_successful_http_protocol_error_rotates_derived_idempotency_key() -> None:
     def responder(
         path: str,
         headers: Mapping[str, str],
@@ -1297,7 +2444,80 @@ def test_same_logical_round_reuses_derived_idempotency_key_on_retry() -> None:
         request["headers"]["idempotency-key"] for request in requests
     ] == [
         "run-retry:plan:2:responses:0",
-        "run-retry:plan:2:responses:0",
+        "run-retry:plan:2:responses:1",
+    ]
+
+
+def test_http_error_retry_reuses_derived_idempotency_key() -> None:
+    def responder(
+        _path: str,
+        _headers: Mapping[str, str],
+        _raw: bytes,
+        index: int,
+    ) -> ResponseSpec:
+        if index == 0:
+            return json_response({"error": {"code": "temporary_failure"}}, 503)
+        return json_response(
+            {
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "done"}],
+                    }
+                ]
+            }
+        )
+
+    with fake_openai_server(responder) as (base_url, requests):
+        provider = OpenAIProvider(
+            config(base_url),
+            idempotency_key="run-http-retry:plan:0",
+        )
+        with pytest.raises(OpenAIHTTPError):
+            provider.next_step("inspect", ())
+        assert provider.next_step("inspect", ()) == FinalAnswer("done")
+
+    assert [
+        request["headers"]["idempotency-key"] for request in requests
+    ] == [
+        "run-http-retry:plan:0:responses:0",
+        "run-http-retry:plan:0:responses:0",
+    ]
+
+
+def test_transport_error_retry_reuses_derived_idempotency_key() -> None:
+    provider = OpenAIProvider(
+        config("http://127.0.0.1:8123"),
+        idempotency_key="run-transport-retry:plan:0",
+    )
+    keys: list[str | None] = []
+
+    def responder(
+        _path: str,
+        _payload: Mapping[str, object],
+        *,
+        idempotency_key: str | None = None,
+    ) -> dict[str, object]:
+        keys.append(idempotency_key)
+        if len(keys) == 1:
+            raise OpenAITransportError("temporary transport failure")
+        return {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "done"}],
+                }
+            ]
+        }
+
+    provider._client.post_json = responder  # type: ignore[assignment]
+
+    with pytest.raises(OpenAITransportError):
+        provider.next_step("inspect", ())
+    assert provider.next_step("inspect", ()) == FinalAnswer("done")
+    assert keys == [
+        "run-transport-retry:plan:0:responses:0",
+        "run-transport-retry:plan:0:responses:0",
     ]
 
 
@@ -1359,7 +2579,7 @@ def test_responses_provider_extracts_final_message_text() -> None:
 
 
 def test_provider_falls_back_to_chat_only_for_unsupported_responses_endpoint() -> None:
-    total_budgets = (4_000, 4_000, 3_000)
+    total_budgets = (6_000, 6_000, 6_000)
 
     def responder(
         path: str,
@@ -1492,6 +2712,38 @@ def test_provider_falls_back_to_chat_only_for_unsupported_responses_endpoint() -
     ]
 
 
+def test_cancellation_check_prevents_chat_fallback_request() -> None:
+    class Cancelled(RuntimeError):
+        pass
+
+    def responder(
+        path: str,
+        _headers: Mapping[str, str],
+        _raw: bytes,
+        _index: int,
+    ) -> ResponseSpec:
+        assert path == "/responses"
+        return json_response({"error": {"code": "unknown_endpoint"}}, 404)
+
+    checks = 0
+
+    def check_cancelled() -> None:
+        nonlocal checks
+        checks += 1
+        raise Cancelled("cancelled before fallback")
+
+    with fake_openai_server(responder) as (base_url, requests):
+        provider = OpenAIProvider(config(base_url))
+        provider.set_cancellation_check(check_cancelled)
+        with pytest.raises(Cancelled, match="before fallback"):
+            provider.next_step("inspect", ())
+
+    assert checks == 1
+    assert provider.api_kind == "chat_completions"
+    assert provider.request_count == 1
+    assert [request["path"] for request in requests] == ["/responses"]
+
+
 @pytest.mark.parametrize("status", [400, 401, 403, 429, 500])
 def test_provider_does_not_fallback_for_non_capability_http_errors(status: int) -> None:
     def responder(*_: object) -> ResponseSpec:
@@ -1507,6 +2759,7 @@ def test_provider_does_not_fallback_for_non_capability_http_errors(status: int) 
 
     assert raised.value.status_code == status
     assert "fake-provider-key" not in str(raised.value)
+    assert provider.request_count == 1
     assert len(requests) == 1
 
 
@@ -1738,3 +2991,31 @@ def test_unknown_tool_and_multiple_calls_are_protocol_errors() -> None:
         provider = OpenAIProvider(config(base_url))
         with pytest.raises(OpenAIProtocolError, match="multiple tool calls"):
             provider.next_step("inspect", ())
+
+    assert provider.rejected_tool_call_violations == 2
+    assert provider.parallel_tool_call_violations == 0
+
+
+def test_malformed_tool_call_is_counted_as_rejected() -> None:
+    def responder(*_: object) -> ResponseSpec:
+        return json_response(
+            {
+                "output": [
+                    {
+                        "type": "function_call",
+                        "call_id": "malformed-call",
+                        "name": "git_status",
+                        "arguments": {},
+                    }
+                ]
+            }
+        )
+
+    with fake_openai_server(responder) as (base_url, _):
+        provider = OpenAIProvider(config(base_url))
+        with pytest.raises(OpenAIProtocolError, match="JSON string") as raised:
+            provider.next_step("inspect", ())
+
+    assert not isinstance(raised.value, OpenAIToolArgumentsError)
+    assert provider.rejected_tool_call_violations == 1
+    assert provider.parallel_tool_call_violations == 0

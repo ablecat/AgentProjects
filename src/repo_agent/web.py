@@ -15,17 +15,23 @@ import re
 import threading
 import time
 from typing import Any, Callable, Mapping
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 import webbrowser
 
 from . import __version__
 from .api import _add_check_artifact_hrefs
 from .artifacts import ArtifactError
 from .checks import MAX_PHASE_TIMEOUT_SECONDS, MAX_RUN_TIMEOUT_SECONDS
+from .event_safety import (
+    public_event_name,
+    public_event_node,
+    public_event_phase,
+    public_event_timestamp,
+)
 from .models import RunResult
-from .persistence import RunNotFoundError
+from .persistence import MAX_EVENT_SEQUENCE, EventPage, RunNotFoundError
 from .processes import run_isolated_capture
-from .run_models import ARTIFACT_FILENAMES, RunRecord
+from .run_models import ARTIFACT_FILENAMES, TERMINAL_STATUSES, RunRecord
 from .sandbox import (
     DEFAULT_POLICY,
     SandboxError,
@@ -37,6 +43,7 @@ from .service import (
     QueueFullError,
     RepositoryNotAllowedError,
     RunService,
+    ServiceSnapshot,
     run_agent,
 )
 
@@ -45,9 +52,13 @@ HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 MAX_REQUEST_BYTES = 16 * 1024
 MAX_TASK_LENGTH = 4000
+MAX_EVENT_STREAMS = 4
+EVENT_PAGE_SIZE = 64
+EVENT_HEARTBEAT_SECONDS = 10.0
+EVENT_WAIT_SECONDS = 1.0
+EVENT_RETRY_MILLISECONDS = 1500
 ALLOWED_IMAGES: Mapping[str, str] = {
     "repo-agent-python:0.1": "Python 3.11",
-    "repo-agent-maven:0.1": "Maven 3.9 / Java 21",
 }
 _STATIC_FILES = {
     "/": ("index.html", "text/html; charset=utf-8"),
@@ -55,6 +66,7 @@ _STATIC_FILES = {
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
 }
 _AGENT_RUN_RE = re.compile(r"^/api/agent/runs/([a-f0-9]{32})$")
+_AGENT_EVENTS_RE = re.compile(r"^/api/agent/runs/([a-f0-9]{32})/events$")
 _AGENT_ACTION_RE = re.compile(
     r"^/api/agent/runs/([a-f0-9]{32})/(decision|resume|cancel)$"
 )
@@ -99,7 +111,13 @@ class RepoAgentHTTPServer(ThreadingHTTPServer):
         self.run_function = run_function
         self.durable_service = durable_service
         self.run_slot = threading.BoundedSemaphore(1)
+        self.event_stream_slots = threading.BoundedSemaphore(MAX_EVENT_STREAMS)
+        self.event_stream_shutdown = threading.Event()
         super().__init__(server_address, RepoAgentRequestHandler)
+
+    def shutdown(self) -> None:
+        self.event_stream_shutdown.set()
+        super().shutdown()
 
 
 class RepoAgentRequestHandler(BaseHTTPRequestHandler):
@@ -118,7 +136,8 @@ class RepoAgentRequestHandler(BaseHTTPRequestHandler):
             self._send_api_error(HTTPStatus.FORBIDDEN, "forbidden", "Request rejected")
             return
 
-        path = urlsplit(self.path).path
+        parsed = urlsplit(self.path)
+        path = parsed.path
         if path == "/api/state":
             state = _application_state(self.server.repo_path)
             state["service"] = _durable_service_state(self.server.durable_service)
@@ -126,6 +145,10 @@ class RepoAgentRequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/agent/runs":
             self._handle_agent_list()
+            return
+        events_match = _AGENT_EVENTS_RE.fullmatch(path)
+        if events_match is not None:
+            self._handle_agent_events(events_match.group(1), parsed.query)
             return
         run_match = _AGENT_RUN_RE.fullmatch(path)
         if run_match is not None:
@@ -295,6 +318,7 @@ class RepoAgentRequestHandler(BaseHTTPRequestHandler):
             return
         try:
             records = service.list_runs()
+            snapshot = service.scheduler_snapshot()
         except Exception:
             self._send_api_error(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -303,11 +327,22 @@ class RepoAgentRequestHandler(BaseHTTPRequestHandler):
             )
             return
         recent = tuple(reversed(records[-50:]))
+        positions = {
+            queued_run_id: position
+            for position, queued_run_id in enumerate(
+                snapshot.queued_run_ids, start=1
+            )
+        }
         self._send_json(
             {
-                "runs": [_agent_record_payload(record) for record in recent],
-                "queue_depth": service.queue_depth,
-                "ready": service.ready(),
+                "runs": [
+                    _agent_record_payload(
+                        record,
+                        queue_position=positions.get(record.run_id),
+                    )
+                    for record in recent
+                ],
+                **_scheduler_snapshot_payload(snapshot),
             }
         )
 
@@ -325,7 +360,239 @@ class RepoAgentRequestHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._send_agent_service_error(exc)
             return
-        self._send_json(_agent_record_payload(record))
+        self._send_json(
+            _agent_record_payload(
+                record,
+                queue_position=service.queue_position(record.run_id),
+            )
+        )
+
+    def _handle_agent_events(self, run_id: str, query: str) -> None:
+        service = self.server.durable_service
+        if service is None:
+            self._send_api_error(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                "The durable maintenance service is not enabled",
+            )
+            return
+        try:
+            requested_cursor = self._validated_event_cursor(query)
+        except _WebRequestError as exc:
+            self._send_api_error(exc.status, exc.code, exc.message)
+            return
+        if not self.server.event_stream_slots.acquire(blocking=False):
+            self._send_json(
+                {
+                    "error": {
+                        "code": "too_many_streams",
+                        "message": "Too many live event streams",
+                    }
+                },
+                status=HTTPStatus.TOO_MANY_REQUESTS,
+                extra_headers={"Retry-After": "2"},
+            )
+            return
+
+        started = False
+        try:
+            page = _validated_event_page(
+                service.event_page(
+                    run_id,
+                    after_sequence=requested_cursor or 0,
+                    limit=EVENT_PAGE_SIZE,
+                ),
+                after_sequence=requested_cursor or 0,
+            )
+            record = service.get_run(run_id)
+            reset = (
+                requested_cursor is not None
+                and requested_cursor > page.latest_sequence
+            )
+            cursor = (
+                page.latest_sequence
+                if requested_cursor is None or reset
+                else requested_cursor
+            )
+
+            self._start_event_stream()
+            started = True
+            if not self._write_event(
+                "snapshot",
+                _event_state(record, cursor=page.latest_sequence, reset=reset),
+                event_id=(
+                    page.latest_sequence
+                    if requested_cursor is None or reset
+                    else None
+                ),
+                retry=EVENT_RETRY_MILLISECONDS,
+            ):
+                return
+
+            heartbeat_at = time.monotonic() + EVENT_HEARTBEAT_SECONDS
+            while not self.server.event_stream_shutdown.is_set():
+                for event in page.events:
+                    sequence = event["sequence"]
+                    if sequence <= cursor:
+                        continue
+                    if not self._write_event(
+                        "progress",
+                        _public_event(run_id, event),
+                        event_id=sequence,
+                    ):
+                        return
+                    cursor = sequence
+
+                if cursor < page.latest_sequence:
+                    page = _validated_event_page(
+                        service.event_page(
+                            run_id,
+                            after_sequence=cursor,
+                            limit=EVENT_PAGE_SIZE,
+                        ),
+                        after_sequence=cursor,
+                    )
+                    continue
+
+                record = service.get_run(run_id)
+                if _event_stream_stopped(record):
+                    final_page = _validated_event_page(
+                        service.event_page(
+                            run_id,
+                            after_sequence=cursor,
+                            limit=EVENT_PAGE_SIZE,
+                        ),
+                        after_sequence=cursor,
+                    )
+                    if final_page.events:
+                        page = final_page
+                        continue
+                    self._write_event(
+                        "done",
+                        _event_state(record, cursor=cursor),
+                        event_id=cursor,
+                    )
+                    return
+
+                page = _validated_event_page(
+                    service.wait_for_events(
+                        run_id,
+                        after_sequence=cursor,
+                        timeout=EVENT_WAIT_SECONDS,
+                        limit=EVENT_PAGE_SIZE,
+                    ),
+                    after_sequence=cursor,
+                )
+                now = time.monotonic()
+                if not page.events and now >= heartbeat_at:
+                    if not self._write_event_comment("heartbeat"):
+                        return
+                    heartbeat_at = now + EVENT_HEARTBEAT_SECONDS
+        except Exception as exc:
+            if not started:
+                self._send_agent_service_error(exc)
+        finally:
+            self.close_connection = True
+            self.server.event_stream_slots.release()
+
+    def _validated_event_cursor(self, query: str) -> int | None:
+        try:
+            parameters = parse_qsl(
+                query,
+                keep_blank_values=True,
+                strict_parsing=True,
+            )
+        except ValueError as exc:
+            raise _WebRequestError(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_cursor",
+                "Event cursor is invalid",
+            ) from exc
+        if any(name != "after" for name, _value in parameters):
+            raise _WebRequestError(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_cursor",
+                "Only the after event cursor is supported",
+            )
+        query_values = [value for name, value in parameters if name == "after"]
+        if len(query_values) > 1:
+            raise _WebRequestError(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_cursor",
+                "Event cursor must be supplied at most once",
+            )
+        header_values = self.headers.get_all("Last-Event-ID") or []
+        if len(header_values) > 1:
+            raise _WebRequestError(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_cursor",
+                "Last-Event-ID must be supplied at most once",
+            )
+        raw = header_values[0] if header_values else query_values[0] if query_values else None
+        if raw is None:
+            return None
+        if re.fullmatch(r"[0-9]{1,19}", raw) is None:
+            raise _WebRequestError(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_cursor",
+                "Event cursor must be a decimal integer",
+            )
+        cursor = int(raw)
+        if cursor > MAX_EVENT_SEQUENCE:
+            raise _WebRequestError(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_cursor",
+                "Event cursor is outside the supported range",
+            )
+        return cursor
+
+    def _start_event_stream(self) -> None:
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    def _write_event(
+        self,
+        event: str,
+        payload: Mapping[str, object],
+        *,
+        event_id: int | None = None,
+        retry: int | None = None,
+    ) -> bool:
+        fields: list[str] = []
+        if retry is not None:
+            fields.append(f"retry: {retry}")
+        if event_id is not None:
+            fields.append(f"id: {event_id}")
+        fields.append(f"event: {event}")
+        fields.append(
+            "data: "
+            + json.dumps(
+                payload,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            )
+        )
+        return self._write_event_bytes(("\n".join(fields) + "\n\n").encode("utf-8"))
+
+    def _write_event_comment(self, value: str) -> bool:
+        return self._write_event_bytes(f": {value}\n\n".encode("ascii"))
+
+    def _write_event_bytes(self, payload: bytes) -> bool:
+        try:
+            self.wfile.write(payload)
+            self.wfile.flush()
+            return True
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, OSError):
+            self.close_connection = True
+            return False
 
     def _handle_agent_post(self, path: str) -> None:
         service = self.server.durable_service
@@ -348,7 +615,11 @@ class RepoAgentRequestHandler(BaseHTTPRequestHandler):
                     allow_remote_model=request["allow_remote_model"],
                 )
                 self._send_json(
-                    _agent_record_payload(record), status=HTTPStatus.ACCEPTED
+                    _agent_record_payload(
+                        record,
+                        queue_position=service.queue_position(record.run_id),
+                    ),
+                    status=HTTPStatus.ACCEPTED,
                 )
                 return
 
@@ -373,7 +644,12 @@ class RepoAgentRequestHandler(BaseHTTPRequestHandler):
                     if action == "resume"
                     else service.cancel(run_id)
                 )
-            self._send_json(_agent_record_payload(record))
+            self._send_json(
+                _agent_record_payload(
+                    record,
+                    queue_position=service.queue_position(record.run_id),
+                )
+            )
         except _WebRequestError as exc:
             self._send_api_error(exc.status, exc.code, exc.message)
         except Exception as exc:
@@ -586,7 +862,11 @@ class RepoAgentRequestHandler(BaseHTTPRequestHandler):
         )
 
     def _send_json(
-        self, payload: object, *, status: HTTPStatus = HTTPStatus.OK
+        self,
+        payload: object,
+        *,
+        status: HTTPStatus = HTTPStatus.OK,
+        extra_headers: Mapping[str, str] | None = None,
     ) -> None:
         body = json.dumps(
             payload,
@@ -594,7 +874,12 @@ class RepoAgentRequestHandler(BaseHTTPRequestHandler):
             allow_nan=False,
             separators=(",", ":"),
         ).encode("utf-8")
-        self._send_bytes(status, body, "application/json; charset=utf-8")
+        self._send_bytes(
+            status,
+            body,
+            "application/json; charset=utf-8",
+            extra_headers=extra_headers,
+        )
 
     def _send_bytes(
         self,
@@ -626,6 +911,127 @@ class RepoAgentRequestHandler(BaseHTTPRequestHandler):
             self.close_connection = True
 
 
+def _validated_event_page(value: object, *, after_sequence: int) -> EventPage:
+    if isinstance(value, EventPage):
+        events_value: object = value.events
+        latest_value: object = value.latest_sequence
+    elif isinstance(value, Mapping):
+        events_value = value.get("events")
+        latest_value = value.get("latest_sequence")
+    else:
+        events_value = getattr(value, "events", None)
+        latest_value = getattr(value, "latest_sequence", None)
+    if (
+        type(latest_value) is not int
+        or not 0 <= latest_value <= MAX_EVENT_SEQUENCE
+        or not isinstance(events_value, (tuple, list))
+        or len(events_value) > EVENT_PAGE_SIZE
+    ):
+        raise RuntimeError("event service returned an invalid page")
+
+    events: list[dict[str, Any]] = []
+    previous = after_sequence
+    for raw_event in events_value:
+        if not isinstance(raw_event, Mapping):
+            raise RuntimeError("event service returned an invalid event")
+        sequence = raw_event.get("sequence")
+        if (
+            type(sequence) is not int
+            or not 1 <= sequence <= latest_value
+            or sequence <= previous
+        ):
+            raise RuntimeError("event service returned an invalid sequence")
+        event = dict(raw_event)
+        event["sequence"] = sequence
+        events.append(event)
+        previous = sequence
+    if not events and latest_value > after_sequence:
+        raise RuntimeError("event service returned an invalid page")
+    return EventPage(tuple(events), latest_value)
+
+
+def _public_event(run_id: str, event: Mapping[str, Any]) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "run_id": run_id,
+        "sequence": event["sequence"],
+        "event": public_event_name(event.get("event")),
+    }
+    for name, public_value in (
+        ("node", public_event_node(event.get("node"))),
+        ("phase", public_event_phase(event.get("phase"))),
+        ("timestamp", public_event_timestamp(event.get("timestamp"))),
+    ):
+        if public_value is not None:
+            payload[name] = public_value
+    for name in (
+        "executed_tool_calls",
+        "tool_calls",
+        "tool_errors",
+        "parallel_tool_call_violations",
+        "rejected_tool_call_violations",
+        "recovered_protocol_errors",
+    ):
+        value = event.get(name)
+        if type(value) is int and value >= 0:
+            payload[name] = value
+    request_not_started = event.get("request_not_started")
+    if type(request_not_started) is bool:
+        payload["request_not_started"] = request_not_started
+    model_usage = _public_model_usage(event.get("model_usage"))
+    if model_usage:
+        payload["model_usage"] = model_usage
+    return payload
+
+
+def _public_model_usage(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        return {}
+    payload: dict[str, object] = {}
+    for name in (
+        "response_count",
+        "reported_response_count",
+        "input_tokens",
+        "cached_input_tokens",
+        "output_tokens",
+        "total_tokens",
+    ):
+        item = value.get(name)
+        if type(item) is int and item >= 0:
+            payload[name] = item
+    complete = value.get("complete")
+    if type(complete) is bool:
+        payload["complete"] = complete
+    return payload
+
+
+def _event_state(
+    record: RunRecord,
+    *,
+    cursor: int,
+    reset: bool = False,
+) -> dict[str, object]:
+    state: dict[str, object] = {
+        "run_id": record.run_id,
+        "status": record.status,
+        "cursor": cursor,
+        "reset": reset,
+    }
+    node = public_event_node(record.current_node)
+    if node is not None:
+        state["node"] = node
+    updated_at = public_event_timestamp(record.updated_at)
+    if updated_at is not None:
+        state["updated_at"] = updated_at
+    return state
+
+
+def _event_stream_stopped(record: RunRecord) -> bool:
+    return record.status in TERMINAL_STATUSES or record.status in {
+        "awaiting_approval",
+        "interrupted",
+    }
+
+
 def _durable_service_state(service: RunService | None) -> dict[str, object]:
     configured = all(
         isinstance(os.environ.get(name), str) and bool(os.environ[name].strip())
@@ -640,20 +1046,40 @@ def _durable_service_state(service: RunService | None) -> dict[str, object]:
             "enabled": False,
             "ready": False,
             "queue_depth": 0,
+            "queue_capacity": 0,
+            "active_count": 0,
+            "max_concurrency": 0,
             "model_configured": configured,
             "model": os.environ["REPO_AGENT_MODEL"].strip() if configured else None,
         }
+    snapshot = service.scheduler_snapshot()
     return {
         "enabled": True,
-        "ready": service.ready(),
-        "queue_depth": service.queue_depth,
+        **_scheduler_snapshot_payload(snapshot),
         "model_configured": configured,
         "model": os.environ["REPO_AGENT_MODEL"].strip() if configured else None,
     }
 
 
-def _agent_record_payload(record: RunRecord) -> dict[str, object]:
+def _scheduler_snapshot_payload(snapshot: ServiceSnapshot) -> dict[str, object]:
+    if not isinstance(snapshot, ServiceSnapshot):
+        raise TypeError("scheduler returned an unsupported snapshot")
+    return {
+        "ready": snapshot.ready,
+        "queue_depth": snapshot.queue_depth,
+        "queue_capacity": snapshot.queue_capacity,
+        "active_count": snapshot.active_count,
+        "max_concurrency": snapshot.max_concurrency,
+    }
+
+
+def _agent_record_payload(
+    record: RunRecord,
+    *,
+    queue_position: int | None = None,
+) -> dict[str, object]:
     payload = record.model_dump(mode="json")
+    payload["queue_position"] = queue_position
     base = f"/api/agent/runs/{record.run_id}/artifacts"
     _add_check_artifact_hrefs(payload, runs_path="/api/agent/runs")
     payload["artifacts"] = {
@@ -913,11 +1339,6 @@ def _application_state(repo_path: Path) -> dict[str, object]:
                     "id": "python-pytest",
                     "label": "Python 3.11 / pytest",
                     "image": "repo-agent-python:0.1",
-                },
-                {
-                    "id": "maven-test",
-                    "label": "Java 17/21 / Maven + JUnit 5",
-                    "image": "repo-agent-maven:0.1",
                 },
             ],
         },

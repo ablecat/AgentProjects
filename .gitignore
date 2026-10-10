@@ -17,3 +17,8 @@ evaluation-report/
 .env
 .env.*
 !.env.example
+credentials.json
+**/credentials.json
+relay.json
+**/relay.json
+target/

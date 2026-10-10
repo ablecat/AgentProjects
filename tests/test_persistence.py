@@ -4,7 +4,13 @@ from pathlib import Path
 
 import pytest
 
-from repo_agent.persistence import RunConflictError, RunDatabase, RunNotFoundError
+from repo_agent.persistence import (
+    MAX_EVENT_PAGE_SIZE,
+    MAX_EVENT_SEQUENCE,
+    RunConflictError,
+    RunDatabase,
+    RunNotFoundError,
+)
 from repo_agent.run_models import RunRecord, utc_now
 
 
@@ -52,6 +58,65 @@ def test_database_round_trips_record_state_events_and_effects(tmp_path: Path) ->
     )
     assert inserted is False
     assert result == {"patch_sha256": "abc"}
+
+
+def test_database_event_page_uses_an_exclusive_durable_cursor(tmp_path: Path) -> None:
+    database = RunDatabase(tmp_path / "runs.sqlite3")
+    record = _record()
+    database.create(record, tmp_path / "artifacts")
+    database.append_event(record.run_id, {"event": "first", "sequence": 999})
+    database.append_event(
+        record.run_id,
+        {"event": "second", "timestamp": "2026-09-11T00:00:00.000Z"},
+    )
+    database.append_event(record.run_id, {"event": "third"})
+
+    first = database.event_page(record.run_id, after_sequence=0, limit=2)
+    assert first.latest_sequence == 3
+    assert [event["sequence"] for event in first.events] == [1, 2]
+    assert first.events[0]["event"] == "first"
+    assert first.events[0]["timestamp"].endswith("Z")
+
+    second = database.event_page(record.run_id, after_sequence=2, limit=2)
+    assert second.latest_sequence == 3
+    assert len(second.events) == 1
+    assert second.events[0]["event"] == "third"
+    assert second.events[0]["sequence"] == 3
+    assert second.events[0]["timestamp"].endswith("Z")
+    assert database.event_page(record.run_id, after_sequence=3).events == ()
+
+
+@pytest.mark.parametrize(
+    ("after_sequence", "limit"),
+    [
+        (-1, 1),
+        (True, 1),
+        (MAX_EVENT_SEQUENCE + 1, 1),
+        (0, 0),
+        (0, True),
+        (0, MAX_EVENT_PAGE_SIZE + 1),
+    ],
+)
+def test_database_event_page_rejects_invalid_bounds(
+    tmp_path: Path, after_sequence: object, limit: object
+) -> None:
+    database = RunDatabase(tmp_path / "runs.sqlite3")
+    record = _record()
+    database.create(record, tmp_path / "artifacts")
+
+    with pytest.raises(ValueError):
+        database.event_page(
+            record.run_id,
+            after_sequence=after_sequence,  # type: ignore[arg-type]
+            limit=limit,  # type: ignore[arg-type]
+        )
+
+
+def test_database_event_page_rejects_unknown_run(tmp_path: Path) -> None:
+    database = RunDatabase(tmp_path / "runs.sqlite3")
+
+    with pytest.raises(RunNotFoundError, match="not found"):
+        database.event_page("b" * 32, after_sequence=0)
 
 
 def test_database_rejects_duplicate_and_unknown_runs(tmp_path: Path) -> None:

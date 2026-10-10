@@ -1,7 +1,11 @@
 benchmarks/**/*.json text eol=lf
 benchmarks/**/*.jsonl text eol=lf
+benchmarks/**/*.ini text eol=lf
 benchmarks/**/*.md text eol=lf
 benchmarks/**/*.patch text eol=lf whitespace=-blank-at-eol
 benchmarks/**/*.py text eol=lf
 benchmarks/**/*.java text eol=lf
 benchmarks/**/*.xml text eol=lf
+benchmarks/**/LICENSE text eol=lf
+benchmarks/**/LICENSE.* text eol=lf
+benchmarks/tasks/python/oss/**/baseline/** whitespace=-blank-at-eof

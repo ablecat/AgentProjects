@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "suite_id": "repo-agent-python-oss-v1",
+  "formal_evaluation": false,
+  "languages": ["python"],
+  "tasks": [
+    {
+      "id": "py-oss-001",
+      "path": "pysnooper-output-path",
+      "sha256": "27de0d9e6a65472b903f9c01d328f0c327df988cf46f93cdceeaa5db2c4a1c85"
+    },
+    {
+      "id": "py-oss-002",
+      "path": "httpie-case-insensitive-host",
+      "sha256": "9bbdf975fc9315b3f99c0183d147cc2b17ae83760b820e1a283da61e46fc704d"
+    },
+    {
+      "id": "py-oss-003",
+      "path": "thefuck-ls-prefix",
+      "sha256": "52b1b26c0e028a12ffa9f082448cc38073d6b370e2938f66832d38b8b1982341"
+    }
+  ]
+}

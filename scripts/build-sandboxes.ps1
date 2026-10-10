@@ -1,7 +1,9 @@
 #requires -Version 5.1
 
 [CmdletBinding()]
-param()
+param(
+    [switch]$IncludeLegacyMaven
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -40,34 +42,40 @@ Invoke-DockerChecked -CommandArgs @(
     $projectRoot
 )
 
-Invoke-DockerChecked -CommandArgs @(
-    "build",
-    "--pull=false",
-    "--file", (Join-Path $projectRoot "docker/maven/Dockerfile"),
-    "--tag", "repo-agent-maven:0.1",
-    $projectRoot
-)
+if ($IncludeLegacyMaven) {
+    Invoke-DockerChecked -CommandArgs @(
+        "build",
+        "--pull=false",
+        "--file", (Join-Path $projectRoot "docker/maven/Dockerfile"),
+        "--tag", "repo-agent-maven:0.1",
+        $projectRoot
+    )
+}
 
 $pythonImageId = Get-DockerValue -CommandArgs @("image", "inspect", "--format", "{{.Id}}", "repo-agent-python:0.1")
-$mavenImageId = Get-DockerValue -CommandArgs @("image", "inspect", "--format", "{{.Id}}", "repo-agent-maven:0.1")
 $dockerServerVersion = Get-DockerValue -CommandArgs @("version", "--format", "{{.Server.Version}}")
+
+$images = [ordered]@{
+    python = [ordered]@{
+        tag = "repo-agent-python:0.1"
+        imageId = $pythonImageId
+        base = $pythonBase
+    }
+}
+if ($IncludeLegacyMaven) {
+    $mavenImageId = Get-DockerValue -CommandArgs @("image", "inspect", "--format", "{{.Id}}", "repo-agent-maven:0.1")
+    $images["maven"] = [ordered]@{
+        tag = "repo-agent-maven:0.1"
+        imageId = $mavenImageId
+        base = $mavenBase
+    }
+}
 
 $lock = [ordered]@{
     schemaVersion = 1
     generatedAtUtc = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
     dockerServerVersion = $dockerServerVersion
-    images = [ordered]@{
-        python = [ordered]@{
-            tag = "repo-agent-python:0.1"
-            imageId = $pythonImageId
-            base = $pythonBase
-        }
-        maven = [ordered]@{
-            tag = "repo-agent-maven:0.1"
-            imageId = $mavenImageId
-            base = $mavenBase
-        }
-    }
+    images = $images
 }
 
 $lockPath = Join-Path $projectRoot "docker/image-lock.json"
@@ -79,5 +87,12 @@ Write-Host "Built sandbox images:"
 Invoke-DockerChecked -CommandArgs @(
     "image", "ls", "--no-trunc",
     "--format", "{{.Repository}}:{{.Tag}} {{.ID}} {{.Size}}",
-    "repo-agent-*"
+    "repo-agent-python:0.1"
 )
+if ($IncludeLegacyMaven) {
+    Invoke-DockerChecked -CommandArgs @(
+        "image", "ls", "--no-trunc",
+        "--format", "{{.Repository}}:{{.Tag}} {{.ID}} {{.Size}}",
+        "repo-agent-maven:0.1"
+    )
+}

@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "repository": "https://github.com/cool-RR/PySnooper",
+  "issue": {
+    "url": "https://github.com/cool-RR/PySnooper/issues/2",
+    "title": "NameError: global name 'output_path' is not defined"
+  },
+  "fix_url": "https://github.com/cool-RR/PySnooper/commit/15555ed760000b049aff8fecc79d29339c1224c3",
+  "commits": {
+    "base": "6e3d797be3fa0a746fb5b1b7c7fea78eb926c208",
+    "fix": "15555ed760000b049aff8fecc79d29339c1224c3"
+  },
+  "source_files": {
+    "base": {
+      "url": "https://raw.githubusercontent.com/cool-RR/PySnooper/6e3d797be3fa0a746fb5b1b7c7fea78eb926c208/pysnooper/pysnooper.py",
+      "sha256": "dfcdc4d446cd61a10721dc7691821c24cdf029af4b4ee7aff59a7fc07fd94d77"
+    },
+    "fix": {
+      "url": "https://raw.githubusercontent.com/cool-RR/PySnooper/15555ed760000b049aff8fecc79d29339c1224c3/pysnooper/pysnooper.py",
+      "sha256": "188d29b6ae6c9971e80d1935b65a376ab351daa286c597f1b6e6bccb6e8b0c4b"
+    },
+    "license": {
+      "url": "https://raw.githubusercontent.com/cool-RR/PySnooper/15555ed760000b049aff8fecc79d29339c1224c3/LICENSE",
+      "sha256": "0c4250d2a9f0e39d024593ede44eb5044e5fbd1175a8962ec9659d8ace34de9e"
+    }
+  },
+  "target": {
+    "path": "pysnooper/pysnooper.py",
+    "base_sha256": "dfcdc4d446cd61a10721dc7691821c24cdf029af4b4ee7aff59a7fc07fd94d77",
+    "fix_sha256": "188d29b6ae6c9971e80d1935b65a376ab351daa286c597f1b6e6bccb6e8b0c4b"
+  },
+  "license": {
+    "path": "LICENSE",
+    "sha256": "0c4250d2a9f0e39d024593ede44eb5044e5fbd1175a8962ec9659d8ace34de9e"
+  },
+  "curation": {
+    "complete_upstream_repository": false,
+    "snapshot": "Exact fixed production target and upstream license only",
+    "public_tests": "Dependency-free smoke tests authored for this suite",
+    "hidden_tests": "Independent regression test authored from the public issue"
+  }
+}

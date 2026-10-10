@@ -50,6 +50,9 @@ const elements = {
   toolList: document.querySelector("#tool-list"),
   artifactSection: document.querySelector("#artifact-section"),
   artifactLinks: document.querySelector("#artifact-links"),
+  activitySection: document.querySelector("#activity-section"),
+  activityState: document.querySelector("#activity-state"),
+  activityList: document.querySelector("#activity-list"),
   runList: document.querySelector("#run-list"),
   queueSummary: document.querySelector("#queue-summary"),
   refreshState: document.querySelector("#refresh-state"),
@@ -100,6 +103,11 @@ let currentResult = null;
 let currentMode = "agent";
 let currentRunId = null;
 let pollTimer = null;
+let runEventSource = null;
+let eventRefreshTimer = null;
+let eventRefreshInFlight = false;
+let eventRefreshRequested = false;
+let lastActivitySequence = 0;
 let configuredModel = "Model API";
 
 async function fetchJson(url, options = {}) {
@@ -146,7 +154,7 @@ function renderState(state) {
 
   const service = state.service || {};
   elements.serviceStatus.textContent = service.ready ? "Ready" : service.enabled ? "Unavailable" : "Disabled";
-  elements.serviceQueue.textContent = Number.isInteger(service.queue_depth) ? String(service.queue_depth) : "-";
+  elements.serviceQueue.textContent = Number.isInteger(service.queue_depth) && Number.isInteger(service.queue_capacity) ? `${service.queue_depth}/${service.queue_capacity}` : Number.isInteger(service.queue_depth) ? String(service.queue_depth) : "-";
   configuredModel = service.model_configured && typeof service.model === "string" && service.model ? service.model : "Model API";
   elements.serviceModel.textContent = service.model_configured ? configuredModel : "Not configured";
   if (currentMode === "agent") elements.providerBadge.textContent = configuredModel;
@@ -202,6 +210,7 @@ function renderCheckContract(checks, images) {
 
 function switchMode(mode) {
   currentMode = mode;
+  if (mode !== "agent") stopRunUpdates();
   elements.agentSettings.hidden = mode !== "agent";
   elements.demoSettings.hidden = mode !== "demo";
   elements.providerBadge.textContent = mode === "agent" ? configuredModel : "Demo provider";
@@ -224,19 +233,20 @@ async function submitRun(event) {
 
 async function createAgentRun(task) {
   setSubmitting(true);
+  selectTab("summary");
   const baseRef = elements.baseRef.value.trim();
   const payload = { task, auto_approve: elements.autoApprove.checked, allow_remote_model: elements.allowRemoteModel.checked };
   if (baseRef) payload.base_ref = baseRef;
   try {
     const { response, payload: result } = await fetchJson("/api/agent/runs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
     if (!response.ok) throw new Error(apiErrorMessage(result, `Run creation failed (${response.status})`));
-    currentRunId = result.run_id; renderAgentRun(result); await loadRuns(); schedulePoll(result);
+    currentRunId = result.run_id; resetActivity(); renderAgentRun(result); await loadRuns(); startRunUpdates(result);
   } catch (error) { showFormError(errorMessage(error)); }
   finally { setSubmitting(false); }
 }
 
 async function runInspection(task) {
-  setSubmitting(true); renderPendingDemo(task);
+  setSubmitting(true); stopRunUpdates(); selectTab("summary"); renderPendingDemo(task);
   const payload = { task, image: selectedImage(), max_steps: Number(elements.maxSteps.value), timeout_seconds: Number(elements.timeoutSeconds.value), max_output_bytes: Number(elements.maxOutputBytes.value) };
   try {
     const { response, payload: result } = await fetchJson("/api/runs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
@@ -265,8 +275,9 @@ async function loadRuns() {
     if (!response.ok) throw new Error(apiErrorMessage(payload, `Run list failed (${response.status})`));
     const runs = Array.isArray(payload.runs) ? payload.runs : [];
     renderRunList(runs);
-    elements.queueSummary.textContent = `Queue ${Number.isInteger(payload.queue_depth) ? payload.queue_depth : 0}`;
-    elements.serviceQueue.textContent = Number.isInteger(payload.queue_depth) ? String(payload.queue_depth) : "-";
+    const queueDepth = Number.isInteger(payload.queue_depth) ? payload.queue_depth : 0; const queueCapacity = Number.isInteger(payload.queue_capacity) ? payload.queue_capacity : null;
+    elements.queueSummary.textContent = queueCapacity === null ? `Queue ${queueDepth}` : `Queue ${queueDepth}/${queueCapacity}`;
+    elements.serviceQueue.textContent = queueCapacity === null ? String(queueDepth) : `${queueDepth}/${queueCapacity}`;
     if (!currentRunId && currentMode === "agent" && runs.length) await selectAgentRun(runs[0].run_id);
   } catch (error) {
     elements.runList.replaceChildren(); const message = document.createElement("p"); message.className = "tool-meta"; message.textContent = errorMessage(error); elements.runList.append(message);
@@ -279,7 +290,7 @@ function renderRunList(runs) {
   for (const run of runs) {
     const button = document.createElement("button"); button.type = "button"; button.className = "run-list-item"; button.dataset.selected = String(run.run_id === currentRunId);
     const row = document.createElement("span"); row.className = "run-list-heading";
-    const status = document.createElement("strong"); status.textContent = (statusPresentation[run.status] || { label: run.status }).label;
+    const status = document.createElement("strong"); const statusLabel = (statusPresentation[run.status] || { label: run.status }).label; status.textContent = Number.isInteger(run.queue_position) ? `${statusLabel} #${run.queue_position}` : statusLabel;
     const id = document.createElement("code"); id.textContent = String(run.run_id || "").slice(0, 8); row.append(status, id);
     const task = document.createElement("span"); task.className = "run-list-task"; task.textContent = run.task || "";
     button.append(row, task); button.addEventListener("click", () => selectAgentRun(run.run_id)); elements.runList.append(button);
@@ -287,21 +298,151 @@ function renderRunList(runs) {
 }
 
 async function selectAgentRun(runId) {
-  clearPoll(); currentMode = "agent"; currentRunId = runId;
+  stopRunUpdates(); selectTab("summary"); currentMode = "agent"; currentRunId = runId; resetActivity();
   try {
     const { response, payload } = await fetchJson(`/api/agent/runs/${runId}`);
     if (!response.ok) throw new Error(apiErrorMessage(payload, `Run request failed (${response.status})`));
-    renderAgentRun(payload); await loadRuns(); schedulePoll(payload);
+    renderAgentRun(payload); await loadRuns(); startRunUpdates(payload);
   } catch (error) { showFormError(errorMessage(error)); }
+}
+
+function startRunUpdates(run) {
+  stopRunUpdates();
+  if (!run || terminalStatuses.has(run.status) || run.status === "awaiting_approval" || run.status === "interrupted") {
+    setActivityState(run && terminalStatuses.has(run.status) ? "Complete" : "Paused");
+    return;
+  }
+  if (typeof window.EventSource === "function") connectRunEvents(run.run_id);
+  else schedulePoll(run);
+}
+
+function connectRunEvents(runId) {
+  setActivityState("Connecting");
+  const source = new window.EventSource(`/api/agent/runs/${runId}/events`);
+  runEventSource = source;
+  source.onopen = () => { if (source === runEventSource) setActivityState("Live"); };
+  source.addEventListener("snapshot", (event) => {
+    if (source !== runEventSource || runId !== currentRunId) return;
+    const payload = eventPayload(event);
+    if (payload) scheduleEventRefresh(runId);
+  });
+  source.addEventListener("progress", (event) => {
+    if (source !== runEventSource || runId !== currentRunId) return;
+    const payload = eventPayload(event);
+    if (!payload || !Number.isInteger(payload.sequence) || payload.sequence <= lastActivitySequence) return;
+    lastActivitySequence = payload.sequence;
+    appendActivity(payload);
+    scheduleEventRefresh(runId);
+  });
+  source.addEventListener("done", (event) => {
+    if (source !== runEventSource || runId !== currentRunId) return;
+    const payload = eventPayload(event);
+    source.close(); runEventSource = null;
+    setActivityState(payload && terminalStatuses.has(payload.status) ? "Complete" : "Paused");
+    scheduleEventRefresh(runId, true);
+  });
+  source.onerror = () => {
+    if (source === runEventSource) setActivityState("Reconnecting");
+  };
 }
 
 function schedulePoll(run) {
   clearPoll();
-  if (!run || terminalStatuses.has(run.status) || run.status === "awaiting_approval") return;
-  pollTimer = window.setTimeout(async () => { await selectAgentRun(run.run_id); }, 900);
+  setActivityState("Polling fallback");
+  if (!run || terminalStatuses.has(run.status) || run.status === "awaiting_approval" || run.status === "interrupted") return;
+  pollTimer = window.setTimeout(async () => { await pollAgentRun(run.run_id); }, 900);
 }
 
 function clearPoll() { if (pollTimer !== null) { window.clearTimeout(pollTimer); pollTimer = null; } }
+
+function currentRunIsActive(runId) {
+  return runId === currentRunId && currentResult && currentResult.run_id === runId
+    && !terminalStatuses.has(currentResult.status)
+    && currentResult.status !== "awaiting_approval" && currentResult.status !== "interrupted";
+}
+
+function stopRunUpdates() {
+  clearPoll();
+  if (runEventSource !== null) { runEventSource.close(); runEventSource = null; }
+  if (eventRefreshTimer !== null) { window.clearTimeout(eventRefreshTimer); eventRefreshTimer = null; }
+  eventRefreshRequested = false;
+}
+
+async function pollAgentRun(runId) {
+  if (runId !== currentRunId) return;
+  try {
+    const { response, payload } = await fetchJson(`/api/agent/runs/${runId}`);
+    if (!response.ok) throw new Error(apiErrorMessage(payload, `Run request failed (${response.status})`));
+    if (runId !== currentRunId) return;
+    renderAgentRun(payload); await loadRuns(); schedulePoll(payload);
+  } catch (error) {
+    showFormError(errorMessage(error));
+    if (currentRunIsActive(runId)) schedulePoll(currentResult);
+  }
+}
+
+function scheduleEventRefresh(runId, immediate = false) {
+  if (runId !== currentRunId) return;
+  eventRefreshRequested = true;
+  if (eventRefreshInFlight || eventRefreshTimer !== null) return;
+  eventRefreshTimer = window.setTimeout(() => {
+    eventRefreshTimer = null;
+    refreshAgentRun(runId);
+  }, immediate ? 0 : 200);
+}
+
+async function refreshAgentRun(runId) {
+  if (runId !== currentRunId || eventRefreshInFlight) return;
+  eventRefreshInFlight = true; eventRefreshRequested = false;
+  try {
+    const { response, payload } = await fetchJson(`/api/agent/runs/${runId}`);
+    if (!response.ok) throw new Error(apiErrorMessage(payload, `Run request failed (${response.status})`));
+    if (runId === currentRunId) {
+      renderAgentRun(payload);
+      if (terminalStatuses.has(payload.status) || payload.status === "awaiting_approval" || payload.status === "interrupted") {
+        if (runEventSource !== null) { runEventSource.close(); runEventSource = null; }
+        setActivityState(terminalStatuses.has(payload.status) ? "Complete" : "Paused");
+        await loadRuns();
+      }
+    }
+  } catch (error) { showFormError(errorMessage(error)); }
+  finally {
+    eventRefreshInFlight = false;
+    if (eventRefreshRequested && runId === currentRunId) scheduleEventRefresh(runId);
+  }
+}
+
+function eventPayload(event) {
+  try {
+    const payload = JSON.parse(event.data);
+    return payload && typeof payload === "object" && !Array.isArray(payload) ? payload : null;
+  } catch (error) { return null; }
+}
+
+function resetActivity() {
+  lastActivitySequence = 0;
+  elements.activityList.replaceChildren();
+  elements.activitySection.hidden = false;
+  setActivityState("Idle");
+}
+
+function setActivityState(value) { elements.activityState.textContent = value; }
+
+function appendActivity(event) {
+  const item = document.createElement("li");
+  const heading = document.createElement("span"); heading.className = "activity-event"; heading.textContent = String(event.event || "workflow_event").replaceAll("_", " ");
+  const detail = document.createElement("span"); detail.className = "activity-meta";
+  const location = event.node || event.phase || "workflow";
+  const metadata = [`#${event.sequence}`, location];
+  if (Number.isInteger(event.tool_calls)) metadata.push(`${event.tool_calls} tools`);
+  if (Number.isInteger(event.tool_errors) && event.tool_errors > 0) metadata.push(`${event.tool_errors} errors`);
+  const usage = event.model_usage;
+  if (usage && typeof usage === "object" && Number.isInteger(usage.total_tokens)) metadata.push(`${usage.total_tokens} tokens`);
+  detail.textContent = metadata.join(" / ");
+  item.append(heading, detail); elements.activityList.append(item);
+  while (elements.activityList.childElementCount > 200) elements.activityList.firstElementChild.remove();
+  elements.activityList.scrollTop = elements.activityList.scrollHeight;
+}
 
 function renderAgentRun(run) {
   currentMode = "agent"; currentRunId = run.run_id; currentResult = run; showResultShell();
@@ -311,6 +452,7 @@ function renderAgentRun(run) {
   elements.metricNode.textContent = run.current_node || "-"; elements.metricTools.textContent = String(metrics.tool_calls ?? 0);
   elements.metricDuration.textContent = Number.isFinite(metrics.duration_ms) ? formatDuration(metrics.duration_ms) : "-"; elements.metricTokens.textContent = String(metrics.tokens ?? 0);
   elements.answerText.textContent = run.summary || statusMessage(run.status); elements.runError.hidden = !run.error; elements.runError.textContent = run.error || "";
+  elements.activitySection.hidden = false;
   renderPlan(run.plan); renderVerification(Array.isArray(run.checks) ? run.checks : [], run.run_id); renderArtifacts(run.artifacts || {}); renderWorkflowActions(run);
   finishResultRender(run);
 }
@@ -321,12 +463,16 @@ function renderDemoResult(result) {
   elements.runStatus.dataset.tone = presentation.tone; elements.runStatusLabel.textContent = presentation.label; elements.runStatusTask.textContent = result.task || "";
   elements.metricNode.textContent = "demo"; elements.metricTools.textContent = String(tools.length); elements.metricDuration.textContent = Number.isFinite(metadata.duration_ms) ? formatDuration(metadata.duration_ms) : "-"; elements.metricTokens.textContent = "0";
   elements.answerText.textContent = result.answer || "No final answer."; elements.runError.hidden = !result.error; elements.runError.textContent = result.error || "";
-  elements.planSection.hidden = true; elements.artifactSection.hidden = true; elements.workflowActions.hidden = true; renderDemoTools(tools); finishResultRender(result);
+  elements.planSection.hidden = true; elements.activitySection.hidden = true; elements.artifactSection.hidden = true; elements.workflowActions.hidden = true; renderDemoTools(tools); finishResultRender(result);
 }
 
-function showResultShell() { elements.emptyState.hidden = true; elements.summaryView.hidden = false; elements.copyJson.disabled = false; elements.downloadJson.disabled = false; elements.jsonTab.disabled = false; selectTab("summary"); }
+function showResultShell() {
+  const jsonSelected = elements.jsonTab.getAttribute("aria-selected") === "true";
+  elements.emptyState.hidden = true; elements.summaryView.hidden = jsonSelected; elements.jsonView.hidden = !jsonSelected;
+  elements.copyJson.disabled = false; elements.downloadJson.disabled = false; elements.jsonTab.disabled = false;
+}
 
-function finishResultRender(result) { elements.jsonOutput.textContent = JSON.stringify(result, null, 2); elements.copyJson.disabled = false; elements.downloadJson.disabled = false; elements.jsonTab.disabled = false; selectTab("summary"); }
+function finishResultRender(result) { elements.jsonOutput.textContent = JSON.stringify(result, null, 2); elements.copyJson.disabled = false; elements.downloadJson.disabled = false; elements.jsonTab.disabled = false; }
 
 function renderPlan(plan) {
   elements.planSection.hidden = !plan;
@@ -384,7 +530,7 @@ async function runAction(action, payload = {}) {
   try {
     const { response, payload: result } = await fetchJson(`/api/agent/runs/${currentRunId}/${action}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
     if (!response.ok) throw new Error(apiErrorMessage(result, `${action} failed (${response.status})`));
-    renderAgentRun(result); await loadRuns(); schedulePoll(result);
+    renderAgentRun(result); await loadRuns(); startRunUpdates(result);
   } catch (error) { showFormError(errorMessage(error)); }
   finally { disableActions(false); }
 }
@@ -426,5 +572,5 @@ elements.approveRun.addEventListener("click", () => runAction("decision", { appr
 elements.resumeRun.addEventListener("click", () => runAction("resume")); elements.cancelRun.addEventListener("click", () => runAction("cancel"));
 for (const input of document.querySelectorAll('input[name="mode"]')) input.addEventListener("change", () => switchMode(input.value));
 elements.task.addEventListener("keydown", (event) => { if ((event.ctrlKey || event.metaKey) && event.key === "Enter") elements.form.requestSubmit(); });
-window.addEventListener("beforeunload", clearPoll);
+window.addEventListener("beforeunload", stopRunUpdates);
 loadState();

@@ -6,9 +6,9 @@
 
 Repo Maintainer Agent 接收本地 Git 仓库和自然语言 Bug 描述，使用
 OpenAI-compatible 模型分析代码并生成修改计划；计划经批准后，它只在临时候选
-clone 中修改代码、补充回归测试，并在隔离 Docker 容器中运行 Python pytest 或
-Java Maven 验证。最终交付 patch、报告、运行记录、trace 和测试日志，不会把修改
-自动应用、提交或推送到原仓库。
+clone 中修改代码、补充回归测试，并在隔离 Docker 容器中运行 Python pytest
+验证。最终交付 patch、报告、运行记录、trace 和测试日志，不会把修改自动应用、
+提交或推送到原仓库。当前 v1 只支持 Python/pytest 仓库。
 
 当前仓库已经接通仓库工具、安全补丁、Docker 检查、LangGraph 状态机、SQLite
 checkpoint、CLI、FastAPI 队列、可视化工作台、独立评测执行器和离线安全验收。
@@ -19,7 +19,7 @@ checkpoint、CLI、FastAPI 队列、可视化工作台、独立评测执行器�
 ## 2. 使用前准备
 
 - Docker Desktop 已启动，并使用 `desktop-linux` context。
-- 已构建 `repo-agent-python:0.1` 和 `repo-agent-maven:0.1`。
+- 已构建 `repo-agent-python:0.1`。
 - 待维护目录是至少包含一次提交的 clean Git 仓库。
 - 宿主安装了 Python 3.11 或更高版本和 Git。
 
@@ -30,10 +30,30 @@ checkpoint、CLI、FastAPI 队列、可视化工作台、独立评测执行器�
 ./scripts/build-sandboxes.ps1
 ./scripts/verify-docker.ps1
 python -m pip install -e ".[dev]"
+python ./scripts/smoke-day2.py
 ```
 
 Agent 不会读取当前仓库的未提交内容。真实维护任务发现 dirty worktree 时会返回
 `policy_denied`；请先自行审核并提交目标仓库的修改。
+
+当前 v1 采用完整文件读取和替换：已有文件必须能被完整读取为仅使用 LF 换行的
+UTF-8 文本，且单文件不超过 200 个逻辑行和 16 KiB。`read_files` 每次只能读取
+1-4 个互不重复的已有路径，完整批次输出不得超过 16 KiB；任何超限都会拒绝整个
+读取，不会把截断前缀交给模型继续编辑。新建或替换内容也受每文件 200 行、16 KiB
+限制。因此仓库虽可包含更大、CRLF 或二进制文件，当前版本不能修改这些文件；请在
+创建任务前确认目标实现文件及所需测试文件符合限制。
+
+`build-sandboxes.ps1` 和 `verify-docker.ps1` 默认只处理 Python 镜像。旧 Maven
+镜像和相应验收只用于复现早期 Python/Java 混合证据；需要这一历史兼容路径时必须
+显式选择：
+
+```powershell
+./scripts/build-sandboxes.ps1 -IncludeLegacyMaven
+./scripts/verify-docker.ps1 -IncludeLegacyMaven
+```
+
+前者会刷新 `docker/image-lock.json` 中与本机相关的 image ID，且仅在指定开关时
+包含 Maven 条目。Maven 开关不是 Python-only 正常使用的前置条件。
 
 ## 3. 配置并验证模型
 
@@ -81,14 +101,13 @@ Base URL 和模型才会作为一个整体由 Windows DPAPI 加密并原子保�
 .\scripts\start-relay.ps1 -FormalEvaluate
 ```
 
-该入口只运行冻结正式套件的 `full` trial 1 共 12 题，不接受仓库、端口、模型、
-任务、variant 或输出路径参数，也不能和启动、配置、复验或 `-Evaluate` 组合。
-每次运行都创建新的
-`evaluation-results/formal-v1-regression-acceptance/` 子目录，并从真实的
-`repo-agent-python-java-day3-v1/full/trial-1/summary.json` 验收：总计至少 8/12、
-Python 与 Java 各至少 4/6、所有任务都在 30,000 token 内且无超时、p95 不超过
-480 秒。此结果必须称为 v1 regression acceptance；该模式不运行 baseline、
-no-review、重复 trial、matrix 或 merge，也不会改写 `benchmarks/results/v1`。
+该入口固定使用 `repo-agent-python-bugfix-v1`，只运行
+`py-bugfix-001` 至 `py-bugfix-006` 六题的 `full` trial 1；不接受仓库、端口、
+模型、任务、variant 或输出路径参数，也不能和启动、配置、复验或 `-Evaluate`
+组合。只有固定 6/6 任务全部完成、至少解决 4/6、每题 usage 完整且不超过
+30,000 token、无超时或预算失败且 p95 不超过 480 秒时才通过。结果必须称为
+Python v1 regression acceptance；该模式不运行或改写早期 Python/Java 混合
+44-job 矩阵与 `benchmarks/results/v1`。
 
 DPAPI 防止其他普通账户或离线复制者直接读取配置，但不防同一已登录账户中的恶意
 程序、管理员读取进程内存、配置文件删除或旧密文回放。若怀疑 Key 泄露，应先在
@@ -148,7 +167,7 @@ repo-agent run `
   --format json
 ```
 
-若仓库声明了需要下载的 Python 或 Maven 依赖，增加 `--allow-bootstrap`。该选项只
+若仓库声明了需要下载的 Python 依赖，增加 `--allow-bootstrap`。该选项只
 授权预注册依赖命令的 bootstrap 容器使用 `bridge` 网络，后续 verify 仍强制
 `network=none`。
 
@@ -208,7 +227,10 @@ Authorization: Bearer choose-a-local-token
 | 接口 | 用途 |
 |---|---|
 | `POST /v1/runs` | 创建异步任务，返回 `202` 和 `run_id` |
+| `GET /v1/runs?status=&limit=` | 按状态查询近期任务、排队位置和调度摘要 |
+| `GET /v1/service/status` | 查询队列深度、容量、活跃任务和并发上限 |
 | `GET /v1/runs/{id}` | 查询状态、计划、检查和指标 |
+| `GET /v1/runs/{id}/events` | 订阅支持 `Last-Event-ID` 续传的 SSE 活动流 |
 | `POST /v1/runs/{id}/decision` | 批准或拒绝计划 |
 | `POST /v1/runs/{id}/resume` | 恢复中断任务 |
 | `POST /v1/runs/{id}/cancel` | 请求取消任务 |
@@ -216,6 +238,14 @@ Authorization: Bearer choose-a-local-token
 
 REST 提交的 `repo_path` 必须是绝对路径，并位于服务启动时声明的
 `allowed_repo_roots` 内。历史任务的读取和 artifact 查询也应用同一边界。
+
+服务固定为单 worker，最多允许四个任务等待；正在运行的任务不占等待槽位。队列满
+时创建任务返回 `429`，取消等待任务会立即释放容量。SSE 同时最多四条连接，客户端
+断线后可使用最后收到的事件序号重连；游标来自 SQLite 持久化事件，而不是进程内
+计数。事件流只包含白名单化的结构化活动摘要，不包含原始 detail、工具错误文本或
+凭据。需要完整检查输出时下载 `checks/*.log`。原生浏览器 `EventSource` 不支持自定义
+Authorization 请求头，因此 Bearer API 的 SSE 应由可设置请求头的客户端消费；内置
+可视化工作台使用同源、仅回环地址的 `/api/agent/.../events` 接口。
 
 ## 8. 状态与产物
 
@@ -245,13 +275,15 @@ REST 提交的 `repo_path` 必须是绝对路径，并位于服务启动时声�
 
 - 原仓库永不以读写方式挂载，不会自动 apply、commit 或 push。
 - Agent 只修改无 hardlink 的临时候选 clone；每次验证使用新的副本。
-- 模型只获得七个受限工具：`list_files`、`read_file`、`read_files`、
-  `search_code`、`apply_patch`、`get_diff` 和 `finish`；不提供 shell、网络、
-  Git push 或 Docker socket。检查由工作流在独立 Docker 阶段执行，模型不能直接
-  调用检查命令。
+- 工具按阶段最小化暴露：持久化修改阶段先仅允许 `read_files`，读取成功后仅允许
+  提交完整文件内容的 `write_files`；不提供 shell、网络、Git push 或 Docker
+  socket。检查由工作流在独立 Docker 阶段执行，模型不能直接调用检查命令。
 - 每次任务的模型预算固定为规划 4,000 token、实现与最多一次修复合计 23,500、
   独立审查 2,500；阶段间不可借用，总量硬上限为 30,000 token。审查只有一次
   响应，拒绝后任务失败但候选 patch 和证据会保留。
+  该硬上限适用于当前 DeepSeek durable 工作流：provider usage 不完整时任务会
+  fail closed。不返回 usage 的 loopback provider 与归档 baseline 仅用于开发或
+  历史复现，不属于 Python-only v1 正式路径。
 - 路径策略拒绝绝对路径、`..`、`.git`、敏感文件、symlink、submodule、LFS、
   二进制、rename、mode change 和越界路径。
 - verify 容器使用非 root UID/GID `10001`、只读 rootfs、`network=none`、2 CPU、
@@ -262,8 +294,7 @@ REST 提交的 `repo_path` 必须是绝对路径，并位于服务启动时声�
 ## 10. 验收与评测复现
 
 以下命令覆盖代码质量、CLI/FastAPI、队列、审批、checkpoint、artifact、fake-model
-集成、冻结任务结构以及真实 Docker 安全合同。Docker smoke 前应先构建两个沙箱
-镜像：
+集成、冻结任务结构以及默认 Python Docker 路径：
 
 ```powershell
 python -m pytest
@@ -271,52 +302,35 @@ python ./scripts/smoke-day1.py
 python ./scripts/smoke-day2.py
 python ./scripts/smoke-day3.py
 python ./scripts/smoke-day6.py
+python ./benchmarks/tasks/python/bugfix/validate.py
+python ./benchmarks/tasks/python/oss/validate.py
 python ./benchmarks/validate.py --structure-only
-$projectParent = Split-Path -Parent (Get-Location).Path
-$evaluationRoot = Join-Path $projectParent ".repo-agent-eval-day7-v1"
-repo-agent eval --matrix-only `
-  --output-dir $evaluationRoot `
-  --format json
 ```
 
-`--matrix-only` 返回精确 44 个 job 和 5 个 shard，不调用模型，并在正式执行前
-原子写入 `$evaluationRoot\matrix.json`。`$evaluationRoot` 必须位于 Git 仓库外，
-因为其中保存 canary 状态、候选 workspace、trace、patch 和 scorer evidence。
-随后先用同一题运行三种 variant 的 canary：
+其中 Python-only validator 默认执行六题完整生命周期；根目录 validator 的
+`--structure-only` 仅审计旧混合套件锁。Day 1/3/6 默认同样只运行 Python case。
+OSS validator 只验证三个公开 issue 的裁剪快照、内容锁和独立回归生命周期，不会
+调用模型。模型修复率、耗时和 token 必须来自后续 executed single-mode 结果；
+`run.json` 中的首次 `checks` 结果和 `metrics.repair_attempts` 可区分首验与 repair。
+若需追加旧 Maven 兼容 case，再显式执行：
 
 ```powershell
-repo-agent eval --canary --execute `
-  --workers 2 --allow-remote-model --allow-bootstrap `
-  --output-dir $evaluationRoot --format json
+./scripts/build-sandboxes.ps1 -IncludeLegacyMaven
+./scripts/verify-docker.ps1 -IncludeLegacyMaven
+python ./scripts/smoke-day1.py --include-legacy-maven
+python ./scripts/smoke-day3.py --include-legacy-maven
+python ./scripts/smoke-day6.py --include-legacy-maven
 ```
 
-canary 不计入正式结果。通过后顺序运行 5 个 shard，保证总模型并发不超过 2：
+这些 Maven case 只验证历史证据兼容性，不表示当前 Agent 支持 Java 仓库。
+
+在线门禁依次使用固定 development 和正式 Python 验收入口：
 
 ```powershell
-0..4 | ForEach-Object {
-  repo-agent eval --matrix --execute `
-    --shard-index $_ --shard-count 5 --workers 2 `
-    --allow-remote-model --allow-bootstrap `
-    --output-dir $evaluationRoot --format json
-  if ($LASTEXITCODE -ne 0) { throw "Evaluation shard $_ failed." }
-}
-
-repo-agent eval --merge `
-  --output-dir $evaluationRoot `
-  --report-dir .\benchmarks\results\v1 `
-  --format json
+./scripts/start-relay.ps1 -Evaluate
+./scripts/start-relay.ps1 -FormalEvaluate
 ```
 
-相同 shard 与 output directory 重跑会恢复已完成题目。merge 会拒绝缺失、重复、
-越位或元数据不一致的 job；成功后生成严格 44 行 `results.jsonl`，再从该文件重算
-`report.json` 和 `failure-analysis.json`。仓库内的 `benchmarks/results/v1` 只能
-提交这三个脱敏发布文件；私有 state、workspace、trace 和本机绝对路径不得进入
-Git。不能以工作流状态 `succeeded` 直接判定
-题目通过；独立 scorer 还会检查 hidden tests、原测试和构建描述符未削弱、新增
-回归测试以及安全与预算边界。
-
-44 次正式矩阵、重复题锁定规则和输出说明见
-[benchmarks/README.md](../benchmarks/README.md)，完整可视化演示见
-[DEMO.md](DEMO.md)。没有可核实的价格来源时不要传入 token 单价；结果仍记录
-input、cached-input、output 和 total token，`cost_usd` 保持 `null`，
-`price_source` 为 `unavailable`。
+早期 44 次 Python/Java 混合矩阵、重复题规则和固定结果仅作为只读审计资料保留，
+见 [benchmarks/README.md](../benchmarks/README.md)。不要将它作为当前发布门禁重跑，
+也不要覆盖 `benchmarks/results/v1`。完整可视化演示见 [DEMO.md](DEMO.md)。

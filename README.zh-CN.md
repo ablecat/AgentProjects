@@ -8,21 +8,25 @@ clone 中修改代码，再用加固的 Docker 容器验证结果，最后交付
 检查。它不会把补丁自动应用、提交或推送到原仓库。
 
 项目包含 Typer CLI、本机可视化工作台、带认证的 FastAPI 服务、可恢复的
-LangGraph 工作流、Python/Maven 沙箱和冻结评测集。锁定的 v1 模型实测结果见下文
-及 `benchmarks/results/v1`；脱敏后的 `results.jsonl` 是唯一数据源。
+LangGraph 工作流、加固的 Python/pytest 沙箱和冻结的 Python 验收集。早期
+Python/Java 混合实验仅作为只读历史证据保留在 `benchmarks/results/v1`；其中脱敏
+后的 `results.jsonl` 仍是该历史实验的唯一数据源。
 
 ## 核心能力
 
 - 接收一个 clean、已有提交的 Git 仓库和自然语言维护任务。
-- 构建有界仓库地图，并只向模型提供七个类型化工具：`list_files`、
-  `read_file`、`read_files`、`search_code`、`apply_patch`、`get_diff` 和
-  `finish`。
+- 构建有界仓库地图，并按阶段提供最小类型化工具面；持久化修改阶段只先提供
+  `read_files`，读取成功后仅提供写入完整文件内容的 `write_files`，不暴露 shell
+  或直接检查命令。
 - 生成结构化修改计划；除非显式选择自动批准，否则等待人工审批。
 - 只在当前运行拥有的候选 clone 中应用模型补丁，并在 Docker 中运行确定性的
-  `pytest` 或 Maven 检查。
+  `pytest` 检查。
 - 验证失败最多修复一次；独立审查固定为一次模型响应，拒绝后保留候选并终止。
 - 模型预算按阶段固定且不可借用：规划 4,000 token，实现与修复合计 23,500，
   审查 2,500，总上限 30,000。
+  当前 DeepSeek durable 工作流要求 provider 返回完整 usage，缺失时 fail closed；
+  不返回 usage 的 loopback provider 与归档 baseline 评测器仅属开发/历史入口，
+  不在此 v1 硬上限承诺范围内。
 - 在 SQLite 中记录每个工作流边界；中断后可恢复，且不会主动重复已完成并已记录
   的副作用。
 - 生成 `patch.diff`、`report.md`、`run.json`、`trace.jsonl` 和有界测试日志。
@@ -43,7 +47,7 @@ flowchart LR
     T --> C
     T --> D[加固 Docker 沙箱]
     C --> D
-    D --> V[确定性 pytest / Maven 检查]
+    D --> V[确定性 pytest 检查]
     W --> A[脱敏运行产物]
     DB --> A
     A --> H[人工审阅]
@@ -68,11 +72,17 @@ prepare -> baseline_check -> inspect_and_plan -> approval -> implement
 | Profile | 支持范围 |
 |---|---|
 | Python | Python 3.11、`pytest`、单个根项目；可从根目录 `requirements.txt` 或 PEP 621 元数据执行需显式授权的依赖 bootstrap |
-| Maven | 单个根 `jar` 模块、Java 17 或 21、Maven 3.9、固定的 Surefire/JUnit 配置 |
 
-混合 Python/Maven 布局、Gradle、嵌套 Maven 模块、Git submodule、Git LFS、仓库
-symlink/reparse point、自定义 Maven 仓库、构建扩展以及 dirty worktree 会被拒绝。
-仓库超出范围时，以 policy 错误和 check 产物中的具体原因作为诊断依据。
+当前 v1 产品只接受这一 Python/pytest profile。Java/Maven fixture 与镜像元数据仅为
+复现早期混合评测证据而保留，不在 UI 中提供。混合语言布局、Git submodule、Git
+LFS、仓库 symlink/reparse point 以及 dirty worktree 会被拒绝。仓库超出范围时，
+以 policy 错误和 check 产物中的具体原因作为诊断依据。
+
+当前 v1 的完整文件编辑合同有意保持窄范围：已有文件只有在完整内容为 UTF-8、仅用
+LF 换行、不超过 200 个逻辑行且不超过 16 KiB 时才能编辑。`read_files` 每次接受
+1-4 个互不重复的已有路径，完整批次输出也不得超过 16 KiB；超限时会 fail closed，
+不会返回可继续编辑的截断前缀。新建或替换内容同样受每文件 200 行、16 KiB 限制。
+仓库可以包含更大、CRLF 或非文本文件，但当前 v1 工作流不能修改它们。
 
 ## 环境要求
 
@@ -97,21 +107,31 @@ Docker 清理。
 ./scripts/verify-docker.ps1
 py -3.11 -m pip install -e ".[dev]"
 python -m pytest
+python ./scripts/smoke-day2.py
 ```
 
-项目使用两个沙箱镜像：
-
-- `repo-agent-python:0.1`：Python 3.11、pytest、Git、ripgrep
-- `repo-agent-maven:0.1`：Eclipse Temurin JDK 21、Maven 3.9、Git、ripgrep
+当前产品使用 `repo-agent-python:0.1` 沙箱镜像，其中包含 Python 3.11、pytest、
+Git 和 ripgrep。
 
 | 沙箱 | 固定基础镜像 |
 |---|---|
 | Python | `python:3.11.16-slim-bookworm@sha256:528257d48c1da0dcecc2e725d1ae34498d60c965f1241e39cd6a85a8859bdf84` |
-| Maven | `maven:3.9.16-eclipse-temurin-21-noble@sha256:8f6ac126f7810bb5549c4cd122d2bf0e9cda5bdeb0838aa928f09e779fd8bef8` |
 
-两个 Dockerfile 都固定了基础镜像 digest。本机构建元数据记录在
+该 Dockerfile 固定了基础镜像 digest。本机构建元数据记录在
 `docker/image-lock.json`；CI 验证 Dockerfile 与运行时安全合同，不依赖某台机器
-特有的最终 image ID。
+特有的最终 image ID。旧 Maven Dockerfile 仅为历史 fixture 验证保留，其 lock
+条目只由下方显式 opt-in 路径生成。
+
+两个脚本默认都只构建、验收 Python 镜像。只有复现早期混合套件证据时，才显式启用
+保留的 Maven 镜像：
+
+```powershell
+./scripts/build-sandboxes.ps1 -IncludeLegacyMaven
+./scripts/verify-docker.ps1 -IncludeLegacyMaven
+```
+
+`build-sandboxes.ps1` 会刷新 `docker/image-lock.json` 中与本机相关的 image ID；
+只有指定开关时才包含 Maven 条目。提交由此产生的变更前应单独审查。
 
 ## 无 Key 快速体验
 
@@ -214,7 +234,7 @@ repo-agent cancel RUN_ID
 ## 可视化工作台与 REST API
 
 本机工作台展示环境就绪状态、仓库身份、安全策略、计划审批、检查结果、metrics、
-trace 以及可下载产物：
+实时活动日志以及可下载产物：
 
 ```powershell
 repo-agent serve --repo D:\path\to\clean-repository --port 8765 --open
@@ -239,13 +259,23 @@ repo-agent serve --api `
 | 方法与路径 | 用途 |
 |---|---|
 | `POST /v1/runs` | 将任务加入队列并返回 ID |
+| `GET /v1/runs?status=&limit=` | 查询近期任务及排队位置 |
+| `GET /v1/service/status` | 查询队列深度、容量和活跃 worker |
 | `GET /v1/runs/{id}` | 查询状态、计划、检查、metrics 和产物链接 |
+| `GET /v1/runs/{id}/events` | 通过 `Last-Event-ID` 可续传的 SSE 获取实时进度 |
 | `POST /v1/runs/{id}/decision` | 批准或拒绝计划 |
 | `POST /v1/runs/{id}/resume` | 恢复中断任务 |
 | `POST /v1/runs/{id}/cancel` | 请求取消并回收活跃沙箱 |
 | `GET /v1/runs/{id}/artifacts/{kind}` | 下载固定运行产物 |
 
 API 中的仓库路径必须是绝对路径，并位于配置的 `--allowed-root` 之下。
+
+调度器固定一次只运行一个工作流，最多保留四个等待任务；取消等待任务会立即释放
+队列容量。两套 HTTP 服务都把实时 SSE 连接限制为四个。可视化 UI 使用 SQLite
+事件序号作为重连游标；浏览器不支持 `EventSource` 时自动降级为 900 ms 轮询。
+SSE 只发送有界、白名单化的阶段、节点、工具计数和模型 usage 等活动摘要，不发送
+原始事件 detail 或检查输出；完整日志仍通过已脱敏的产物下载。REST API 客户端必须
+在请求头中携带 Bearer token，不能把 token 放进 URL。
 
 ## 运行状态与产物
 
@@ -290,7 +320,10 @@ Windows 默认把持久化数据保存到 `%LOCALAPPDATA%\repo-agent`，可用 `
 模型服务本身仍是外部信任边界。只有当仓库允许把相关代码和任务文本发送给该服务
 时，才应授权远程模型。
 
-## v1 实测结果
+## 旧版混合评测实测结果（只读）
+
+以下数字属于已退役的 Python/Java 混合实验，不是当前 Python-only 发布门禁。其
+fixture、矩阵和已发布文件均作为不可变审计证据保留，当前验收不会改写这些数字。
 
 锁定的 44-job 评测已于 2026-09-12（UTC+8）使用 `gpt-5.6-sol` 完成。下列已发布
 v1 表格和汇总统计均可从 [`results.jsonl`](benchmarks/results/v1/results.jsonl)
@@ -334,11 +367,12 @@ p95 641.8 秒，未达到 p95 不超过 8 分钟的目标。30 个失败包括 2
 [`failure-analysis.json`](benchmarks/results/v1/failure-analysis.json)。这些实测
 只描述当前模型、预算和锁定评测集，不能外推到其他仓库。
 
-## 评测与复现
+## 当前 Python 验收
 
-冻结评测集包含 6 个 Python 和 6 个 Java bug-fix 任务。候选 Agent 只能看到带 Bug
-的 setup、公开测试和 `issue.md`；独立 scorer 不向 Agent 暴露 `hidden_tests`、
-`gold.patch` 或预期失败签名。不能直接用工作流 `succeeded` 判断题目通过。
+当前冻结套件 ID 为 `repo-agent-python-bugfix-v1`，精确选择
+`py-bugfix-001` 至 `py-bugfix-006` 六题。候选 Agent 只能看到带 Bug 的 setup、
+公开测试和 `issue.md`；独立 scorer 不向 Agent 暴露 `hidden_tests`、`gold.patch`
+或预期失败签名。不能直接用工作流 `succeeded` 判断题目通过。
 
 正式运行前只使用 4 个非正式 development fixture 调优。已保存 Windows 中转站
 配置时，以下受限入口会运行固定的四题 `full` 命令，并写入新的忽略目录：
@@ -350,87 +384,54 @@ p95 641.8 秒，未达到 p95 不超过 8 分钟的目标。30 个失败包括 2
 仅当至少解决 3/4、四项任务均未超预算且
 `actionable_tool_error_rate <= 5%` 时，该入口才以成功状态退出。
 
-冻结代码、prompt、模型和预算后，使用另一个受限入口只运行正式 12 题的 `full`
+为补充可用于简历复核的真实项目证据，非正式套件
+`repo-agent-python-oss-v1` 冻结了 PySnooper #2、HTTPie #235 和 The Fuck #271
+三个公开回归。每题保留精确上游生产文件、许可证与独立编写的回归测试。这是经过
+裁剪的 source snapshot，不等同于完整上游仓库，也不宣称是无污染 holdout。先在
+不调用模型的情况下验证三题生命周期并检查 single 模式合同：
+
+```powershell
+python ./benchmarks/tasks/python/oss/validate.py
+repo-agent eval --benchmark-dir ./benchmarks/tasks/python/oss --variant full --format json
+```
+
+在真正执行模型评测前，不报告修复成功率。后续 executed run 可从评测报告读取最终
+solved 数、耗时和 token；对应的 durable `run.json` 用 `checks[0].ok` 标识首次
+verify，用 `metrics.repair_attempts` 标识有界 repair，从而区分首验通过与修复后通过。
+
+冻结代码、prompt、模型和预算后，受限入口只运行这 6 个 Python 任务的 `full`
 trial 1：
 
 ```powershell
 ./scripts/start-relay.ps1 -FormalEvaluate
 ```
 
-每次结果写入新的
-`evaluation-results/formal-v1-regression-acceptance/` 子目录。只有总计至少
-8/12、Python 与 Java 各至少 4/6、每题 usage 完整且不超过 30,000 token、无超时
-或预算失败、p95 不超过 480 秒时才成功。该结果只能标记为 v1 regression
-acceptance，不是新的 holdout，也不会运行 44-job matrix 或写入
+只有固定 6/6 任务全部完成、至少解决 4/6、每题 usage 完整且不超过 30,000
+token、无超时或预算失败且 p95 不超过 480 秒时才成功。该结果标记为 Python v1
+regression acceptance，不是新的 holdout，也不会运行或改写旧 44-job matrix 与
 `benchmarks/results/v1`。
 
-通用 CLI 仅允许在 single-variant 模式使用该 development suite；matrix、canary、
-shard 和 merge 仍只接受正式套件。
-
-不使用 Docker 检查结构和内容锁：
+先验证当前 6 个 Python fixture 的完整生命周期，再仅审计旧混合 fixture 的结构与
+内容锁：
 
 ```powershell
+python ./benchmarks/tasks/python/bugfix/validate.py
 python ./benchmarks/validate.py --structure-only
-$projectParent = Split-Path -Parent (Get-Location).Path
-$evaluationRoot = Join-Path $projectParent ".repo-agent-eval-day7-v1"
-repo-agent eval `
-  --matrix-only `
-  --output-dir $evaluationRoot `
-  --format json
 ```
 
-`--matrix-only` 不调用模型，并在正式执行前把审核过的 44-job 合同原子写入
-`$evaluationRoot\matrix.json`。这个持久化 state 目录必须位于 Git 仓库外：其中包含
-canary 状态、候选 workspace、trace、patch 和 scorer evidence，不得提交。
-
-验证完整 fixture 生命周期，再运行离线 Docker 与安全验收：
+使用保留的 Day 6 探针运行默认 Python-only 离线 Docker/安全验收：
 
 ```powershell
-python ./benchmarks/validate.py --allow-bootstrap-network
 python ./scripts/smoke-day6.py
 ```
 
-真实模型评测需要与普通任务相同的远程模型和 bootstrap 显式授权。先运行不计入
-正式结果的三 variant canary：
+若要追加旧 Maven 兼容 case，先构建旧镜像，再运行
+`python ./scripts/smoke-day6.py --include-legacy-maven`。这些 case 不会把当前发布的
+Agent 或 UI 扩展到 Python 以外。
 
-```powershell
-repo-agent eval `
-  --canary --execute `
-  --allow-remote-model `
-  --allow-bootstrap `
-  --workers 2 `
-  --output-dir $evaluationRoot `
-  --format json
-```
-
-再顺序执行 5 个稳定 shard。每个 shard 内部最多使用 2 个 worker；同一 shard 重跑
-会恢复已完成 job：
-
-```powershell
-0..4 | ForEach-Object {
-  repo-agent eval `
-    --matrix --execute `
-    --shard-index $_ --shard-count 5 --workers 2 `
-    --allow-remote-model --allow-bootstrap `
-    --output-dir $evaluationRoot `
-    --format json
-  if ($LASTEXITCODE -ne 0) { throw "Evaluation shard $_ failed." }
-}
-
-repo-agent eval `
-  --merge `
-  --output-dir $evaluationRoot `
-  --report-dir .\benchmarks\results\v1 `
-  --format json
-```
-
-merge 会拒绝缺失、重复、位置错误或元数据不一致的 job。成功后，publish directory
-`benchmarks/results/v1` 只应包含脱敏后的 `results.jsonl`、`report.json` 和
-`failure-analysis.json` 三个文件；不得把私有 state、workspace、trace 或本机绝对
-路径复制进 Git。报告会在重新读取严格 44 行的 JSONL 后计算。没有可核实价格来源时
-不要传 token 单价：系统仍记录 input、cached-input、output 和 total token，
-`cost_usd` 保持 `null`，`price_source` 为 `unavailable`。独立 scorer 边界、锁定
-矩阵、恢复规则和结论门槛见 [benchmarks/README.md](benchmarks/README.md)。
+已退役的混合套件 matrix、canary、shard 与 merge 协议仅在
+[benchmarks/README.md](benchmarks/README.md) 中作为审计资料保留。不要将其作为
+当前发布门禁重跑，也不要覆盖其中三个已发布的 v1 文件。
 
 ## 开发与 CI 检查
 
@@ -441,15 +442,28 @@ ruff check src tests scripts benchmarks
 mypy src/repo_agent
 python -m pytest --cov=repo_agent --cov-report=term-missing --cov-fail-under=80
 python ./benchmarks/validate.py --structure-only
+python ./benchmarks/tasks/python/development/validate.py --structure-only
+python ./benchmarks/tasks/python/bugfix/validate.py
+python ./benchmarks/tasks/python/oss/validate.py
 ```
 
-真实容器 smoke 需要先构建两个沙箱镜像：
+以下真实容器 smoke 默认都只运行 Python case，只依赖当前 Python 镜像：
 
 ```powershell
 python ./scripts/smoke-day1.py
 python ./scripts/smoke-day2.py
 python ./scripts/smoke-day3.py
 python ./scripts/smoke-day6.py
+```
+
+如需复现旧 Maven 兼容 case，应显式构建、验收该镜像，并为适用探针增加开关：
+
+```powershell
+./scripts/build-sandboxes.ps1 -IncludeLegacyMaven
+./scripts/verify-docker.ps1 -IncludeLegacyMaven
+python ./scripts/smoke-day1.py --include-legacy-maven
+python ./scripts/smoke-day3.py --include-legacy-maven
+python ./scripts/smoke-day6.py --include-legacy-maven
 ```
 
 完整演示流程见 [docs/DEMO.md](docs/DEMO.md)，更细的操作说明见

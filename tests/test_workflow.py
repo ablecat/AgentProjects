@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from repo_agent.checkpoints import SQLiteCheckpointStore
+from repo_agent.openai_provider import OpenAIRequestCapacityError
 from repo_agent.run_models import ChangePlan
 from repo_agent.workflow import (
     ConcurrentUpdateError,
@@ -330,6 +331,97 @@ def test_verify_can_repair_once_then_succeed(tmp_path: Path) -> None:
         "finalize",
     ]
     assert operations.keys_by_node["repair"] == [f"{RUN_ID}:repair:1"]
+
+
+def test_repair_capacity_exception_remains_the_terminal_workflow_error(
+    tmp_path: Path,
+) -> None:
+    class CapacityRepairOperations(RecordingOperations):
+        def repair(self, context: OperationContext) -> NodeOutcome:
+            self._record(context)
+            raise OpenAIRequestCapacityError("repair follow-up cannot fit")
+
+    operations = CapacityRepairOperations(verify=[False])
+    with SQLiteCheckpointStore(tmp_path / "runs.sqlite3") as store:
+        result = WorkflowEngine(store, operations).start(
+            repo_path=str(tmp_path),
+            task="Fix greeting",
+            run_id=RUN_ID,
+            auto_approve=True,
+        )
+        failed = store.list_checkpoints(RUN_ID)[-1]
+
+    assert result.status == "failed"
+    assert result.current_node is None
+    assert result.error is not None
+    assert "OpenAIRequestCapacityError: repair follow-up cannot fit" in result.error
+    assert "repair did not change the candidate patch" not in result.error
+    assert result.metrics.repair_attempts == 1
+    assert failed.node == "repair"
+    assert failed.phase == "failed"
+    assert failed.result["error"] == result.error
+
+
+def test_empty_implement_candidate_uses_one_bounded_recovery_repair(
+    tmp_path: Path,
+) -> None:
+    class EmptyImplementOperations(RecordingOperations):
+        def implement(self, context: OperationContext) -> NodeOutcome:
+            self._record(context)
+            return NodeOutcome(
+                ok=False,
+                error="model finished without producing a candidate patch",
+            )
+
+    operations = EmptyImplementOperations()
+    with SQLiteCheckpointStore(tmp_path / "runs.sqlite3") as store:
+        result = WorkflowEngine(store, operations).start(
+            repo_path=str(tmp_path),
+            task="Fix greeting",
+            run_id=RUN_ID,
+            auto_approve=True,
+        )
+
+    assert result.status == "succeeded"
+    assert result.metrics.repair_attempts == 1
+    assert _names(operations)[3:] == [
+        "implement",
+        "repair",
+        "verify",
+        "review",
+        "finalize",
+    ]
+
+
+def test_missing_regression_contract_uses_one_bounded_recovery_repair(
+    tmp_path: Path,
+) -> None:
+    class MissingRegressionOperations(RecordingOperations):
+        def implement(self, context: OperationContext) -> NodeOutcome:
+            self._record(context)
+            return NodeOutcome(
+                ok=False,
+                error="candidate patch does not add the required regression test",
+            )
+
+    operations = MissingRegressionOperations()
+    with SQLiteCheckpointStore(tmp_path / "runs.sqlite3") as store:
+        result = WorkflowEngine(store, operations).start(
+            repo_path=str(tmp_path),
+            task="Fix greeting",
+            run_id=RUN_ID,
+            auto_approve=True,
+        )
+
+    assert result.status == "succeeded"
+    assert result.metrics.repair_attempts == 1
+    assert _names(operations)[3:] == [
+        "implement",
+        "repair",
+        "verify",
+        "review",
+        "finalize",
+    ]
 
 
 def test_verify_stops_unverified_after_one_repair(tmp_path: Path) -> None:

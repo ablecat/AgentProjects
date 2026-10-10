@@ -11,9 +11,14 @@ from types import ModuleType
 import pytest
 
 from repo_agent.checks import detect_check_profile
+from repo_agent.evaluation import load_benchmark_suite
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PYTHON_BUGFIX_BENCHMARKS = (
+    PROJECT_ROOT / "benchmarks" / "tasks" / "python" / "bugfix"
+)
+PYTHON_BUGFIX_IDS = tuple(f"py-bugfix-{index:03d}" for index in range(1, 7))
 
 
 def _load_validator() -> ModuleType:
@@ -44,6 +49,71 @@ def test_day3_python_java_benchmark_contracts_and_content_locks() -> None:
 
     assert completed.returncode == 0, completed.stdout
     assert "[ok] benchmark structure, contracts, and locks" in completed.stdout
+
+
+def test_python_only_benchmark_contracts_and_content_locks() -> None:
+    completed = subprocess.run(
+        (
+            sys.executable,
+            str(PYTHON_BUGFIX_BENCHMARKS / "validate.py"),
+            "--structure-only",
+        ),
+        cwd=PROJECT_ROOT,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        timeout=30,
+        shell=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout
+    assert "[ok] Python-only formal suite structure and locks" in completed.stdout
+
+
+def test_python_only_benchmark_full_lifecycle() -> None:
+    completed = subprocess.run(
+        (sys.executable, str(PYTHON_BUGFIX_BENCHMARKS / "validate.py")),
+        cwd=PROJECT_ROOT,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        timeout=60,
+        shell=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout
+    for task_id in PYTHON_BUGFIX_IDS:
+        assert f"[ok] {task_id} " in completed.stdout
+    assert "[ok] validated 6 frozen Python bug-fix tasks" in completed.stdout
+
+
+def test_python_only_suite_loads_without_changing_legacy_suite_or_results() -> None:
+    legacy_root = PROJECT_ROOT / "benchmarks"
+    legacy_files = (
+        legacy_root / "manifest.json",
+        legacy_root / "results" / "v1" / "results.jsonl",
+        legacy_root / "results" / "v1" / "report.json",
+        legacy_root / "results" / "v1" / "failure-analysis.json",
+    )
+    before = {path: path.read_bytes() for path in legacy_files}
+
+    python_suite = load_benchmark_suite(PYTHON_BUGFIX_BENCHMARKS)
+    legacy_suite = load_benchmark_suite(legacy_root)
+
+    assert python_suite.suite_id == "repo-agent-python-bugfix-v1"
+    assert python_suite.formal_evaluation is True
+    assert tuple(task.id for task in python_suite.tasks) == PYTHON_BUGFIX_IDS
+    assert {task.language for task in python_suite.tasks} == {"python"}
+    assert legacy_suite.suite_id == "repo-agent-python-java-day3-v1"
+    assert legacy_suite.formal_evaluation is True
+    assert len(legacy_suite.tasks) == 12
+    assert tuple(task.id for task in legacy_suite.tasks[:6]) == PYTHON_BUGFIX_IDS
+    assert {task.language for task in legacy_suite.tasks} == {"python", "java"}
+    assert {path: path.read_bytes() for path in legacy_files} == before
 
 
 def test_task_digest_is_stable_across_line_endings_and_generated_caches(
@@ -121,9 +191,14 @@ def test_maven_bootstrap_and_checks_have_separate_network_phases(
         command[command.index("--network") + 1] == "bridge"
         for command in bootstrap_creates
     )
+    assert bootstrap_commands[0][-3:] == (
+        "-DskipTests",
+        "process-test-classes",
+        "org.apache.maven.plugins:maven-surefire-plugin:3.5.2:help",
+    )
     assert (
         "org.apache.maven.plugins:maven-dependency-plugin:3.8.1:go-offline"
-        in bootstrap_commands[0]
+        not in bootstrap_commands[0]
     )
     assert "-Prepo-agent-bootstrap" not in bootstrap_commands[0]
     assert "-DskipTests" in bootstrap_commands[0]

@@ -3,18 +3,20 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from dataclasses import asdict, is_dataclass
 import inspect
+import json
 import os
 from pathlib import Path
 import re
 import secrets
+import threading
 from typing import Protocol, TypeVar, cast
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -24,15 +26,28 @@ from pydantic import (
     field_validator,
 )
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.background import BackgroundTask
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .artifacts import ArtifactError
-from .persistence import RunNotFoundError
-from .run_models import ARTIFACT_FILENAMES, ArtifactKind, RunRecord
+from .event_safety import (
+    public_event_name,
+    public_event_node,
+    public_event_phase,
+    public_event_timestamp,
+)
+from .persistence import MAX_EVENT_SEQUENCE, EventPage, RunNotFoundError
+from .run_models import (
+    ARTIFACT_FILENAMES,
+    TERMINAL_STATUSES,
+    ArtifactKind,
+    RunRecord,
+)
 from .service import (
     InvalidRunTransitionError,
     QueueFullError,
     RepositoryNotAllowedError,
+    ServiceSnapshot,
 )
 
 
@@ -44,7 +59,31 @@ MAX_TASK_LENGTH = 4000
 MAX_REASON_LENGTH = 2000
 MAX_BASE_REF_LENGTH = 255
 MAX_CHECK_ARTIFACTS = 256
+MAX_RUN_LIST_LIMIT = 100
+DEFAULT_RUN_LIST_LIMIT = 50
+EVENT_PAGE_SIZE = 64
+EVENT_HEARTBEAT_SECONDS = 10.0
+EVENT_WAIT_SECONDS = 1.0
+EVENT_RETRY_MILLISECONDS = 1500
+MAX_EVENT_STREAMS = 4
+_EVENT_HEARTBEAT = b": heartbeat\n\n"
 _RUN_ID_RE = re.compile(r"^[a-f0-9]{32}$")
+_RUN_LIST_LIMIT_RE = re.compile(r"^[1-9][0-9]{0,2}$")
+_PUBLIC_RUN_STATUSES = frozenset(
+    {
+        "queued",
+        "planning",
+        "awaiting_approval",
+        "running",
+        "interrupted",
+        "succeeded",
+        "unverified",
+        "failed",
+        "cancelled",
+        "policy_denied",
+        "rejected",
+    }
+)
 _CHECK_ARTIFACT_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}\.log$")
 _CHECK_ARTIFACT_PATH_RE = re.compile(
     r"^checks/([a-zA-Z0-9][a-zA-Z0-9._-]{0,127}\.log)$"
@@ -53,13 +92,58 @@ _HEALTH_PATHS = frozenset({"/healthz", "/readyz"})
 _SERVICE_METHODS = (
     "create_run",
     "get_run",
+    "list_runs",
     "decide",
     "resume",
     "cancel",
     "artifact_path",
     "ready",
+    "scheduler_snapshot",
+    "queue_position",
+    "event_page",
+    "wait_for_events",
 )
 _RUN_FIELDS = tuple(RunRecord.model_fields)
+
+
+class _EventStreamLease:
+    """Hold one stream slot until the stream and its thread calls are finished."""
+
+    def __init__(self, slots: threading.BoundedSemaphore) -> None:
+        self._slots = slots
+        self._lock = threading.Lock()
+        self._stream_released = False
+        self._slot_released = False
+        self._thread_calls = 0
+
+    def retain_thread_call(self) -> None:
+        with self._lock:
+            if self._slot_released:
+                raise RuntimeError("event stream lease is already released")
+            self._thread_calls += 1
+
+    def finish_thread_call(self) -> None:
+        with self._lock:
+            if self._thread_calls <= 0:  # pragma: no cover - invariant guard
+                raise RuntimeError("event stream thread lease underflow")
+            self._thread_calls -= 1
+            self._release_slot_if_idle()
+
+    def release(self) -> None:
+        with self._lock:
+            if self._stream_released:
+                return
+            self._stream_released = True
+            self._release_slot_if_idle()
+
+    def _release_slot_if_idle(self) -> None:
+        if (
+            self._stream_released
+            and self._thread_calls == 0
+            and not self._slot_released
+        ):
+            self._slot_released = True
+            self._slots.release()
 
 
 class RunServiceLike(Protocol):
@@ -76,6 +160,8 @@ class RunServiceLike(Protocol):
     ) -> object: ...
 
     def get_run(self, run_id: str) -> object: ...
+
+    def list_runs(self) -> tuple[object, ...]: ...
 
     def decide(
         self,
@@ -94,6 +180,27 @@ class RunServiceLike(Protocol):
     ) -> str | os.PathLike[str]: ...
 
     def ready(self) -> bool: ...
+
+    def scheduler_snapshot(self) -> ServiceSnapshot: ...
+
+    def queue_position(self, run_id: str) -> int | None: ...
+
+    def event_page(
+        self,
+        run_id: str,
+        *,
+        after_sequence: int,
+        limit: int = EVENT_PAGE_SIZE,
+    ) -> EventPage: ...
+
+    def wait_for_events(
+        self,
+        run_id: str,
+        *,
+        after_sequence: int,
+        timeout: float | None,
+        limit: int = EVENT_PAGE_SIZE,
+    ) -> EventPage: ...
 
 
 class CreateRunRequest(BaseModel):
@@ -350,7 +457,7 @@ class _RequestBodyLimitMiddleware:
         async def replay() -> Message:
             nonlocal index
             if index >= len(messages):
-                return {"type": "http.disconnect"}
+                return await receive()
             message = messages[index]
             index += 1
             return message
@@ -417,6 +524,7 @@ def create_app(
     )
     app.state.run_service = service
     app.state.allowed_roots = roots
+    app.state.event_stream_slots = threading.BoundedSemaphore(MAX_EVENT_STREAMS)
     app.add_middleware(_RequestBodyLimitMiddleware)
     app.add_middleware(_BearerAuthMiddleware, token=token)
     app.add_middleware(_SecurityHeadersMiddleware)
@@ -477,6 +585,44 @@ def create_app(
             headers=_response_headers(),
         )
 
+    @app.get("/v1/service/status")
+    def service_status() -> dict[str, object]:
+        snapshot = _service_call("status", service.scheduler_snapshot)
+        return _service_snapshot_payload(snapshot)
+
+    @app.get("/v1/runs")
+    def list_runs(
+        status: str | None = None,
+        limit: str = str(DEFAULT_RUN_LIST_LIMIT),
+    ) -> dict[str, object]:
+        normalized_status = _validated_list_status(status)
+        normalized_limit = _validated_list_limit(limit)
+        records = _service_call("list", service.list_runs)
+        snapshot = _validated_service_snapshot(
+            _service_call("status", service.scheduler_snapshot)
+        )
+        scheduler = _service_snapshot_payload(snapshot)
+        if not isinstance(records, (tuple, list)):
+            raise ApiError(
+                502,
+                "invalid_service_response",
+                "The run service returned an invalid run list",
+            )
+        positions = {
+            run_id: position
+            for position, run_id in enumerate(snapshot.queued_run_ids, start=1)
+        }
+        selected: list[dict[str, object]] = []
+        for value in reversed(records):
+            payload = _run_payload(value)
+            if normalized_status is not None and payload["status"] != normalized_status:
+                continue
+            payload["queue_position"] = positions.get(cast(str, payload["run_id"]))
+            selected.append(payload)
+            if len(selected) == normalized_limit:
+                break
+        return {"runs": selected, "service": scheduler}
+
     @app.post("/v1/runs", status_code=202)
     def create_run(request: CreateRunRequest) -> JSONResponse:
         repo_path = _validated_repository_path(request.repo_path, roots)
@@ -490,7 +636,7 @@ def create_app(
                 allow_remote_model=bool(request.allow_remote_model),
             ),
         )
-        payload = _run_payload(result)
+        payload = _run_payload_with_position(service, result)
         return JSONResponse(
             payload,
             status_code=202,
@@ -507,7 +653,164 @@ def create_app(
             "get",
             lambda: service.get_run(normalized),
         )
-        return _run_payload(result)
+        return _run_payload_with_position(service, result)
+
+    @app.get("/v1/runs/{run_id}/events")
+    async def run_events(run_id: str, request: Request) -> StreamingResponse:
+        normalized = _validated_run_id(run_id)
+        requested_cursor = _validated_event_cursor(request)
+        slots = cast(threading.BoundedSemaphore, app.state.event_stream_slots)
+        if not slots.acquire(blocking=False):
+            raise ApiError(
+                429,
+                "too_many_streams",
+                "Too many live event streams",
+                headers={"Retry-After": "2"},
+            )
+        lease = _EventStreamLease(slots)
+        try:
+            initial_after = requested_cursor or 0
+            page = _validated_event_page(
+                await _async_service_call(
+                    "events",
+                    lambda: service.event_page(
+                        normalized,
+                        after_sequence=initial_after,
+                        limit=EVENT_PAGE_SIZE,
+                    ),
+                    lease=lease,
+                ),
+                after_sequence=initial_after,
+            )
+            record = _validated_event_record(
+                await _async_service_call(
+                    "get",
+                    lambda: service.get_run(normalized),
+                    lease=lease,
+                ),
+                run_id=normalized,
+            )
+        except BaseException:
+            lease.release()
+            raise
+        reset = (
+            requested_cursor is not None
+            and requested_cursor > page.latest_sequence
+        )
+        cursor = (
+            page.latest_sequence
+            if requested_cursor is None or reset
+            else requested_cursor
+        )
+
+        async def stream() -> AsyncIterator[bytes]:
+            current_page = page
+            current_record = record
+            current_cursor = cursor
+            loop = asyncio.get_running_loop()
+            heartbeat_at = loop.time() + EVENT_HEARTBEAT_SECONDS
+            try:
+                yield _sse_event(
+                    "snapshot",
+                    _event_state(
+                        current_record,
+                        cursor=page.latest_sequence,
+                        reset=reset,
+                    ),
+                    event_id=(
+                        page.latest_sequence
+                        if requested_cursor is None or reset
+                        else None
+                    ),
+                    retry=EVENT_RETRY_MILLISECONDS,
+                )
+                while True:
+                    for event in current_page.events:
+                        sequence = cast(int, event["sequence"])
+                        if sequence <= current_cursor:
+                            continue
+                        yield _sse_event(
+                            "progress",
+                            _public_event(normalized, event),
+                            event_id=sequence,
+                        )
+                        current_cursor = sequence
+
+                    if current_cursor < current_page.latest_sequence:
+                        current_page = _validated_event_page(
+                            await _thread_call(
+                                lambda: service.event_page(
+                                    normalized,
+                                    after_sequence=current_cursor,
+                                    limit=EVENT_PAGE_SIZE,
+                                ),
+                                lease=lease,
+                            ),
+                            after_sequence=current_cursor,
+                        )
+                        continue
+
+                    current_record = _validated_event_record(
+                        await _thread_call(
+                            lambda: service.get_run(normalized),
+                            lease=lease,
+                        ),
+                        run_id=normalized,
+                    )
+                    if _event_stream_stopped(current_record):
+                        final_page = _validated_event_page(
+                            await _thread_call(
+                                lambda: service.event_page(
+                                    normalized,
+                                    after_sequence=current_cursor,
+                                    limit=EVENT_PAGE_SIZE,
+                                ),
+                                lease=lease,
+                            ),
+                            after_sequence=current_cursor,
+                        )
+                        if final_page.events:
+                            current_page = final_page
+                            continue
+                        yield _sse_event(
+                            "done",
+                            _event_state(current_record, cursor=current_cursor),
+                            event_id=current_cursor,
+                        )
+                        return
+
+                    current_page = _validated_event_page(
+                        await _thread_call(
+                            lambda: service.wait_for_events(
+                                normalized,
+                                after_sequence=current_cursor,
+                                timeout=EVENT_WAIT_SECONDS,
+                                limit=EVENT_PAGE_SIZE,
+                            ),
+                            lease=lease,
+                        ),
+                        after_sequence=current_cursor,
+                    )
+                    now = loop.time()
+                    if not current_page.events and now >= heartbeat_at:
+                        yield _EVENT_HEARTBEAT
+                        heartbeat_at = now + EVENT_HEARTBEAT_SECONDS
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return
+            finally:
+                lease.release()
+
+        return StreamingResponse(
+            stream(),
+            media_type="text/event-stream",
+            headers={
+                **_response_headers(),
+                "X-Accel-Buffering": "no",
+            },
+            background=BackgroundTask(lease.release),
+        )
 
     @app.post("/v1/runs/{run_id}/decision")
     def decide(run_id: str, request: DecisionRequest) -> dict[str, object]:
@@ -520,7 +823,7 @@ def create_app(
                 reason=request.reason,
             ),
         )
-        return _run_payload(result)
+        return _run_payload_with_position(service, result)
 
     @app.post("/v1/runs/{run_id}/resume")
     def resume(run_id: str) -> dict[str, object]:
@@ -529,7 +832,7 @@ def create_app(
             "resume",
             lambda: service.resume(normalized),
         )
-        return _run_payload(result)
+        return _run_payload_with_position(service, result)
 
     @app.post("/v1/runs/{run_id}/cancel")
     def cancel(run_id: str) -> dict[str, object]:
@@ -538,7 +841,7 @@ def create_app(
             "cancel",
             lambda: service.cancel(normalized),
         )
-        return _run_payload(result)
+        return _run_payload_with_position(service, result)
 
     @app.get("/v1/runs/{run_id}/artifacts/{kind}")
     def artifact(run_id: str, kind: str) -> Response:
@@ -863,6 +1166,39 @@ def _service_call(
         raise ApiError(500, "service_error", "The run service failed") from exc
 
 
+async def _async_service_call(
+    operation: str,
+    invoke: Callable[[], _ResultT],
+    *,
+    lease: _EventStreamLease | None = None,
+) -> _ResultT:
+    return await _thread_call(
+        lambda: _service_call(operation, invoke),
+        lease=lease,
+    )
+
+
+async def _thread_call(
+    invoke: Callable[[], _ResultT],
+    *,
+    lease: _EventStreamLease | None = None,
+) -> _ResultT:
+    if lease is not None:
+        lease.retain_thread_call()
+    try:
+        pending = asyncio.create_task(asyncio.to_thread(invoke))
+    except BaseException:
+        if lease is not None:
+            lease.finish_thread_call()
+        raise
+    if lease is not None:
+        pending.add_done_callback(lambda _pending: lease.finish_thread_call())
+    try:
+        return await asyncio.shield(pending)
+    except asyncio.CancelledError:
+        raise
+
+
 def _run_payload(value: object) -> dict[str, object]:
     try:
         raw = _object_mapping(value)
@@ -879,6 +1215,354 @@ def _run_payload(value: object) -> dict[str, object]:
             "invalid_service_response",
             "The run service returned an invalid record",
         ) from exc
+
+
+def _validated_event_cursor(request: Request) -> int | None:
+    parameters = list(request.query_params.multi_items())
+    if any(name != "after" for name, _value in parameters):
+        raise ApiError(
+            400,
+            "invalid_cursor",
+            "Only the after event cursor is supported",
+        )
+    query_values = [value for name, value in parameters if name == "after"]
+    if len(query_values) > 1:
+        raise ApiError(
+            400,
+            "invalid_cursor",
+            "Event cursor must be supplied at most once",
+        )
+
+    raw_header_values = [
+        value
+        for name, value in request.scope.get("headers", ())
+        if name.lower() == b"last-event-id"
+    ]
+    if len(raw_header_values) > 1:
+        raise ApiError(
+            400,
+            "invalid_cursor",
+            "Last-Event-ID must be supplied at most once",
+        )
+    try:
+        header_values = [value.decode("ascii") for value in raw_header_values]
+    except UnicodeDecodeError as exc:
+        raise ApiError(
+            400,
+            "invalid_cursor",
+            "Event cursor must be a decimal integer",
+        ) from exc
+
+    raw = (
+        header_values[0]
+        if header_values
+        else query_values[0]
+        if query_values
+        else None
+    )
+    if raw is None:
+        return None
+    if re.fullmatch(r"[0-9]{1,19}", raw) is None:
+        raise ApiError(
+            400,
+            "invalid_cursor",
+            "Event cursor must be a decimal integer",
+        )
+    cursor = int(raw)
+    if cursor > MAX_EVENT_SEQUENCE:
+        raise ApiError(
+            400,
+            "invalid_cursor",
+            "Event cursor is outside the supported range",
+        )
+    return cursor
+
+
+def _validated_event_page(
+    value: object,
+    *,
+    after_sequence: int,
+) -> EventPage:
+    if isinstance(value, EventPage):
+        events_value: object = value.events
+        latest_value: object = value.latest_sequence
+    elif isinstance(value, Mapping):
+        events_value = value.get("events")
+        latest_value = value.get("latest_sequence")
+    else:
+        events_value = getattr(value, "events", None)
+        latest_value = getattr(value, "latest_sequence", None)
+    if (
+        type(latest_value) is not int
+        or not 0 <= latest_value <= MAX_EVENT_SEQUENCE
+        or not isinstance(events_value, (tuple, list))
+        or len(events_value) > EVENT_PAGE_SIZE
+    ):
+        raise ApiError(
+            502,
+            "invalid_service_response",
+            "The run service returned an invalid event page",
+        )
+
+    events: list[dict[str, object]] = []
+    previous = after_sequence
+    for raw_event in events_value:
+        if not isinstance(raw_event, Mapping):
+            raise ApiError(
+                502,
+                "invalid_service_response",
+                "The run service returned an invalid event page",
+            )
+        sequence = raw_event.get("sequence")
+        if (
+            type(sequence) is not int
+            or not 1 <= sequence <= latest_value
+            or sequence <= previous
+        ):
+            raise ApiError(
+                502,
+                "invalid_service_response",
+                "The run service returned an invalid event page",
+            )
+        event = {str(name): item for name, item in raw_event.items()}
+        event["sequence"] = sequence
+        events.append(event)
+        previous = sequence
+    if not events and latest_value > after_sequence:
+        raise ApiError(
+            502,
+            "invalid_service_response",
+            "The run service returned an invalid event page",
+        )
+    return EventPage(tuple(events), latest_value)
+
+
+def _validated_event_record(value: object, *, run_id: str) -> dict[str, object]:
+    payload = _run_payload(value)
+    if payload["run_id"] != run_id:
+        raise ApiError(
+            502,
+            "invalid_service_response",
+            "The run service returned an invalid record",
+        )
+    return payload
+
+
+def _public_event(
+    run_id: str,
+    event: Mapping[str, object],
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "run_id": run_id,
+        "sequence": event["sequence"],
+        "event": public_event_name(event.get("event")),
+    }
+    for name, public_value in (
+        ("node", public_event_node(event.get("node"))),
+        ("phase", public_event_phase(event.get("phase"))),
+        ("timestamp", public_event_timestamp(event.get("timestamp"))),
+    ):
+        if public_value is not None:
+            payload[name] = public_value
+    for name in (
+        "executed_tool_calls",
+        "tool_calls",
+        "tool_errors",
+        "parallel_tool_call_violations",
+        "rejected_tool_call_violations",
+        "recovered_protocol_errors",
+    ):
+        value = event.get(name)
+        if type(value) is int and value >= 0:
+            payload[name] = value
+    request_not_started = event.get("request_not_started")
+    if type(request_not_started) is bool:
+        payload["request_not_started"] = request_not_started
+    model_usage = _public_model_usage(event.get("model_usage"))
+    if model_usage:
+        payload["model_usage"] = model_usage
+    return payload
+
+
+def _public_model_usage(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        return {}
+    payload: dict[str, object] = {}
+    for name in (
+        "response_count",
+        "reported_response_count",
+        "input_tokens",
+        "cached_input_tokens",
+        "output_tokens",
+        "total_tokens",
+    ):
+        item = value.get(name)
+        if type(item) is int and item >= 0:
+            payload[name] = item
+    complete = value.get("complete")
+    if type(complete) is bool:
+        payload["complete"] = complete
+    return payload
+
+
+def _event_state(
+    payload: Mapping[str, object],
+    *,
+    cursor: int,
+    reset: bool = False,
+) -> dict[str, object]:
+    state: dict[str, object] = {
+        "run_id": payload["run_id"],
+        "status": payload["status"],
+        "cursor": cursor,
+        "reset": reset,
+    }
+    node = public_event_node(payload.get("current_node"))
+    if node is not None:
+        state["node"] = node
+    updated_at = public_event_timestamp(payload.get("updated_at"))
+    if updated_at is not None:
+        state["updated_at"] = updated_at
+    return state
+
+
+def _event_stream_stopped(payload: Mapping[str, object]) -> bool:
+    return payload["status"] in TERMINAL_STATUSES or payload["status"] in {
+        "awaiting_approval",
+        "interrupted",
+    }
+
+
+def _sse_event(
+    event: str,
+    payload: Mapping[str, object],
+    *,
+    event_id: int | None = None,
+    retry: int | None = None,
+) -> bytes:
+    fields: list[str] = []
+    if retry is not None:
+        fields.append(f"retry: {retry}")
+    if event_id is not None:
+        fields.append(f"id: {event_id}")
+    fields.append(f"event: {event}")
+    fields.append(
+        "data: "
+        + json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+    )
+    return ("\n".join(fields) + "\n\n").encode("utf-8")
+
+
+def _run_payload_with_position(
+    service: RunServiceLike,
+    value: object,
+) -> dict[str, object]:
+    payload = _run_payload(value)
+    run_id = cast(str, payload["run_id"])
+    raw_position = _service_call(
+        "get",
+        lambda: service.queue_position(run_id),
+    )
+    if raw_position is not None and (
+        type(raw_position) is not int or raw_position < 1
+    ):
+        raise ApiError(
+            502,
+            "invalid_service_response",
+            "The run service returned an invalid queue position",
+        )
+    payload["queue_position"] = raw_position
+    return payload
+
+
+def _validated_list_status(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or value not in _PUBLIC_RUN_STATUSES:
+        raise ApiError(
+            422,
+            "invalid_request",
+            "status must be a supported run status",
+        )
+    return value
+
+
+def _validated_list_limit(value: object) -> int:
+    if not isinstance(value, str) or _RUN_LIST_LIMIT_RE.fullmatch(value) is None:
+        raise ApiError(
+            422,
+            "invalid_request",
+            f"limit must be an integer from 1 to {MAX_RUN_LIST_LIMIT}",
+        )
+    converted = int(value)
+    if converted > MAX_RUN_LIST_LIMIT:
+        raise ApiError(
+            422,
+            "invalid_request",
+            f"limit must be an integer from 1 to {MAX_RUN_LIST_LIMIT}",
+        )
+    return converted
+
+
+def _validated_service_snapshot(value: object) -> ServiceSnapshot:
+    if not isinstance(value, ServiceSnapshot):
+        raise ApiError(
+            502,
+            "invalid_service_response",
+            "The run service returned an invalid scheduler snapshot",
+        )
+    if not isinstance(value.queued_run_ids, tuple) or not isinstance(
+        value.active_run_ids, tuple
+    ):
+        raise ApiError(
+            502,
+            "invalid_service_response",
+            "The run service returned an invalid scheduler snapshot",
+        )
+    integer_fields = (
+        value.queue_depth,
+        value.queue_capacity,
+        value.active_count,
+        value.max_concurrency,
+    )
+    run_ids = value.queued_run_ids + value.active_run_ids
+    if (
+        type(value.ready) is not bool
+        or any(type(item) is not int for item in integer_fields)
+        or not 1 <= value.queue_capacity <= 64
+        or not 0 <= value.queue_depth <= value.queue_capacity
+        or value.max_concurrency != 1
+        or not 0 <= value.active_count <= value.max_concurrency
+        or value.queue_depth != len(value.queued_run_ids)
+        or value.active_count != len(value.active_run_ids)
+        or any(not isinstance(run_id, str) for run_id in run_ids)
+        or len(set(run_ids)) != len(run_ids)
+        or any(_RUN_ID_RE.fullmatch(run_id) is None for run_id in run_ids)
+    ):
+        raise ApiError(
+            502,
+            "invalid_service_response",
+            "The run service returned an invalid scheduler snapshot",
+        )
+    return value
+
+
+def _service_snapshot_payload(value: object) -> dict[str, object]:
+    snapshot = _validated_service_snapshot(value)
+    return {
+        "ready": snapshot.ready,
+        "queue_depth": snapshot.queue_depth,
+        "queue_capacity": snapshot.queue_capacity,
+        "active_count": snapshot.active_count,
+        "max_concurrency": snapshot.max_concurrency,
+        "queued_run_ids": list(snapshot.queued_run_ids),
+        "active_run_ids": list(snapshot.active_run_ids),
+    }
 
 
 def _add_check_artifact_hrefs(

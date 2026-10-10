@@ -7,7 +7,7 @@ are not followed, and errors never include response bodies or credentials.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 import ipaddress
@@ -38,6 +38,23 @@ MIN_API_KEY_LENGTH = 8
 MAX_RESPONSE_TOKEN_BUDGET = 30_000
 ESTIMATED_UTF8_BYTES_PER_TOKEN = 3
 REQUEST_PROTOCOL_TOKEN_MARGIN = 256
+_REJECTED_PATCH_REPLAY_ARGUMENTS = json.dumps(
+    {"unified_diff": "[rejected patch omitted from replay]"},
+    ensure_ascii=True,
+    separators=(",", ":"),
+)
+_REJECTED_WRITE_REPLAY_ARGUMENTS = json.dumps(
+    {
+        "files": [
+            {
+                "path": "__rejected_write_omitted__.txt",
+                "content": "[rejected file contents omitted from replay]",
+            }
+        ]
+    },
+    ensure_ascii=True,
+    separators=(",", ":"),
+)
 DEEPSEEK_OFFICIAL_BASE_URL = "https://api.deepseek.com"
 
 _ENV_API_KEY = "REPO_AGENT_API_KEY"
@@ -103,6 +120,18 @@ class OpenAIHTTPError(OpenAITransportError):
 
 class OpenAIProtocolError(OpenAIProviderError):
     """The peer returned JSON that does not satisfy the API contract."""
+
+
+class OpenAIToolArgumentsError(OpenAIProtocolError):
+    """A tool argument string could not be decoded as strict JSON."""
+
+
+class OpenAIUnknownToolError(OpenAIProtocolError):
+    """The peer requested a tool that is unknown or inactive for this turn."""
+
+
+class _OpenAIResponseProtocolError(OpenAIProtocolError):
+    """A successful HTTP response could not be decoded safely."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -274,7 +303,10 @@ class OpenAIHTTPClient:
                 request,
                 timeout=self._config.timeout_seconds,
             ) as response:
-                raw = self._read_bounded(response)
+                try:
+                    raw = self._read_bounded(response)
+                except OpenAIProtocolError as exc:
+                    raise _OpenAIResponseProtocolError(str(exc)) from exc
         except HTTPError as exc:
             try:
                 raw_error = self._read_bounded(exc)
@@ -294,7 +326,10 @@ class OpenAIHTTPClient:
         except OSError as exc:
             raise OpenAITransportError("model transport failed") from exc
 
-        return _decode_json_object(raw)
+        try:
+            return _decode_json_object(raw)
+        except OpenAIProtocolError as exc:
+            raise _OpenAIResponseProtocolError(str(exc)) from exc
 
     def _read_bounded(self, response: Any) -> bytes:
         headers = response.headers
@@ -388,6 +423,7 @@ class OpenAIProvider:
             "responses": 0,
             "chat_completions": 0,
         }
+        self._request_count = 0
         self._conversation_task: str | None = None
         self._responses_input: list[object] = []
         self._chat_messages: list[dict[str, object]] = []
@@ -403,8 +439,16 @@ class OpenAIProvider:
         self._total_tokens = 0
         self._last_response_usage: ProviderUsage | None = None
         self._response_token_budget: int | None = None
+        self._next_response_input_token_estimate: int | None = None
+        self._minimum_response_output_tokens: int | None = None
         self._forced_tool_choice: str | None = None
         self._parallel_tool_call_violations = 0
+        self._rejected_tool_call_violations = 0
+        self._malformed_tool_argument_violations = 0
+        self._recovered_tool_argument_violations = 0
+        self._unknown_tool_violations = 0
+        self._recovered_unknown_tool_violations = 0
+        self._cancellation_check: Callable[[], None] | None = None
 
     @classmethod
     def from_env(
@@ -432,7 +476,7 @@ class OpenAIProvider:
 
     @property
     def api_kind(self) -> APIKind | None:
-        """The API selected after the first successful request."""
+        """The selected API after capability detection."""
 
         return self._api_kind
 
@@ -457,6 +501,12 @@ class OpenAIProvider:
         return self._last_response_usage
 
     @property
+    def request_count(self) -> int:
+        """Return transport requests attempted, including failed capability probes."""
+
+        return self._request_count
+
+    @property
     def pending_internal_tool_result_bytes(self) -> int:
         """Return bounded replay bytes that will accompany the next tool result."""
 
@@ -476,6 +526,51 @@ class OpenAIProvider:
 
         return self._parallel_tool_call_violations
 
+    @property
+    def rejected_tool_call_violations(self) -> int:
+        """Return rejected tool calls not covered by the parallel-call counter."""
+
+        return self._rejected_tool_call_violations
+
+    @property
+    def recovered_tool_argument_violations(self) -> int:
+        """Return malformed argument responses recovered before tool execution."""
+
+        return self._recovered_tool_argument_violations
+
+    @property
+    def unknown_tool_violations(self) -> int:
+        """Return unknown or inactive tool responses rejected before execution."""
+
+        return self._unknown_tool_violations
+
+    @property
+    def recovered_unknown_tool_violations(self) -> int:
+        """Return unknown or inactive tool responses recovered by a retry."""
+
+        return self._recovered_unknown_tool_violations
+
+    def mark_malformed_tool_arguments_recovered(self) -> None:
+        """Acknowledge one successful retry of a malformed argument response."""
+
+        if (
+            self._recovered_tool_argument_violations
+            >= self._malformed_tool_argument_violations
+        ):
+            raise OpenAIProtocolError(
+                "no malformed tool argument response is awaiting recovery"
+            )
+        self._recovered_tool_argument_violations += 1
+
+    def mark_unknown_tool_recovered(self) -> None:
+        """Acknowledge one successful retry of an unknown or inactive tool response."""
+
+        if self._recovered_unknown_tool_violations >= self._unknown_tool_violations:
+            raise OpenAIProtocolError(
+                "no unknown or inactive tool response is awaiting recovery"
+            )
+        self._recovered_unknown_tool_violations += 1
+
     def set_request_timeout(self, timeout_seconds: float) -> None:
         """Tighten the transport deadline without resetting conversation state."""
 
@@ -484,6 +579,13 @@ class OpenAIProvider:
             timeout_seconds=min(self._client.config.timeout_seconds, timeout_seconds),
         )
         self._client = OpenAIHTTPClient(config)
+
+    def set_cancellation_check(self, check: Callable[[], None]) -> None:
+        """Install a cancellation check for multi-endpoint request sequences."""
+
+        if not callable(check):
+            raise TypeError("cancellation check must be callable")
+        self._cancellation_check = check
 
     def set_response_token_budget(self, total_tokens: int) -> None:
         """Set the total token allowance for the next logical model response."""
@@ -499,12 +601,98 @@ class OpenAIProvider:
             )
         self._response_token_budget = total_tokens
 
+    def set_next_response_input_token_estimate(self, input_tokens: int) -> None:
+        """Set a conservative input bound for one continued conversation turn."""
+
+        if (
+            type(input_tokens) is not int
+            or input_tokens < 0
+            or input_tokens > MAX_RESPONSE_TOKEN_BUDGET
+        ):
+            raise OpenAIConfigurationError(
+                "response input token estimate must be an integer between 0 and "
+                f"{MAX_RESPONSE_TOKEN_BUDGET}"
+            )
+        self._next_response_input_token_estimate = input_tokens
+
+    def set_minimum_response_output_tokens(self, minimum_tokens: int) -> None:
+        """Require a phase-specific output floor before any HTTP request."""
+
+        if (
+            type(minimum_tokens) is not int
+            or minimum_tokens < 1
+            or minimum_tokens > MAX_RESPONSE_TOKEN_BUDGET
+        ):
+            raise OpenAIConfigurationError(
+                "minimum response output tokens must be an integer between 1 and "
+                f"{MAX_RESPONSE_TOKEN_BUDGET}"
+            )
+        self._minimum_response_output_tokens = minimum_tokens
+
     def set_forced_tool_choice(self, tool_name: str) -> None:
         """Require one registered function on the next model response."""
 
         if tool_name not in self._tool_by_name:
             raise OpenAIConfigurationError("forced tool choice is not registered")
         self._forced_tool_choice = tool_name
+
+    def prepare_next_request_payload_bytes(
+        self,
+        task: str,
+        results: Sequence[ToolResult],
+    ) -> int:
+        """Prepare conversation state and return the largest next-request wire size."""
+
+        self._prepare_conversation(task, results)
+        active_definitions = self._active_tool_definitions()
+        responses_payload: dict[str, object] = {
+            "model": self._client.config.model,
+            "instructions": self._system_prompt,
+            "input": deepcopy(self._responses_input),
+            "tools": [
+                deepcopy(tool)
+                for tool in self._responses_tools
+                if tool.get("name") in active_definitions
+            ],
+            "parallel_tool_calls": False,
+            "store": False,
+            "max_output_tokens": MAX_RESPONSE_TOKEN_BUDGET,
+        }
+        if self._reasoning_effort is not None:
+            responses_payload["reasoning"] = {"effort": self._reasoning_effort}
+        if self._forced_tool_choice is not None:
+            responses_payload["tool_choice"] = {
+                "type": "function",
+                "name": self._forced_tool_choice,
+            }
+
+        chat_payload: dict[str, object] = {
+            "model": self._client.config.model,
+            "messages": deepcopy(self._chat_messages),
+            "tools": [
+                deepcopy(chat_tool)
+                for response_tool, chat_tool in zip(
+                    self._responses_tools, self._chat_tools, strict=True
+                )
+                if response_tool.get("name") in active_definitions
+            ],
+            "parallel_tool_calls": False,
+            "store": False,
+            "max_completion_tokens": MAX_RESPONSE_TOKEN_BUDGET,
+        }
+        if self._forced_tool_choice is not None:
+            chat_payload["tool_choice"] = {
+                "type": "function",
+                "function": {"name": self._forced_tool_choice},
+            }
+
+        sizes = {
+            "responses": len(_encode_request_payload(responses_payload)),
+            "chat_completions": len(_encode_request_payload(chat_payload)),
+        }
+        if self._api_kind is not None:
+            return sizes[self._api_kind]
+        return max(sizes.values())
 
     def next_step(
         self,
@@ -522,11 +710,21 @@ class OpenAIProvider:
             except OpenAIHTTPError as exc:
                 if not exc.endpoint_unsupported:
                     raise
-                decision = self._chat_step()
                 self._api_kind = "chat_completions"
+                if self._cancellation_check is not None:
+                    self._cancellation_check()
+                try:
+                    decision = self._chat_step()
+                except OpenAIRequestCapacityError:
+                    # The Responses capability probe reached the server even
+                    # though the fallback was rejected locally before HTTP.
+                    self._record_unreported_response()
+                    raise
             else:
                 self._api_kind = "responses"
         self._response_token_budget = None
+        self._next_response_input_token_estimate = None
+        self._minimum_response_output_tokens = None
         self._forced_tool_choice = None
         return decision
 
@@ -565,6 +763,8 @@ class OpenAIProvider:
         expected_id, expected_name = self._pending_call
         if result.call_id != expected_id or result.name != expected_name:
             raise OpenAIProtocolError("tool result does not match the pending call")
+        if not result.ok and expected_name in {"apply_patch", "write_files"}:
+            self._compact_rejected_mutation_call(expected_id, expected_name)
         serialized_result = _serialize_tool_result(result)
         self._responses_input.append(
             {
@@ -587,6 +787,50 @@ class OpenAIProvider:
         self._pending_call = None
         self._deferred_response_calls = ()
 
+    def _compact_rejected_mutation_call(self, call_id: str, tool_name: str) -> None:
+        """Bound replay growth after candidate contents are rejected."""
+
+        replacement = (
+            _REJECTED_PATCH_REPLAY_ARGUMENTS
+            if tool_name == "apply_patch"
+            else _REJECTED_WRITE_REPLAY_ARGUMENTS
+        )
+        for index in range(len(self._responses_input) - 1, -1, -1):
+            item = self._responses_input[index]
+            if not isinstance(item, Mapping) or item.get("type") != "function_call":
+                continue
+            if item.get("call_id") != call_id and item.get("id") != call_id:
+                continue
+            compacted = dict(item)
+            compacted["arguments"] = replacement
+            self._responses_input[index] = compacted
+            break
+
+        for index in range(len(self._chat_messages) - 1, -1, -1):
+            message = self._chat_messages[index]
+            if message.get("role") != "assistant":
+                continue
+            raw_calls = message.get("tool_calls")
+            if not isinstance(raw_calls, list):
+                continue
+            for call_index in range(len(raw_calls) - 1, -1, -1):
+                raw_call = raw_calls[call_index]
+                if not isinstance(raw_call, Mapping) or raw_call.get("id") != call_id:
+                    continue
+                raw_function = raw_call.get("function")
+                if not isinstance(raw_function, Mapping):
+                    continue
+                compacted_message = dict(message)
+                compacted_calls = list(raw_calls)
+                compacted_call = dict(raw_call)
+                compacted_function = dict(raw_function)
+                compacted_function["arguments"] = replacement
+                compacted_call["function"] = compacted_function
+                compacted_calls[call_index] = compacted_call
+                compacted_message["tool_calls"] = compacted_calls
+                self._chat_messages[index] = compacted_message
+                return
+
     def _reset_conversation(self, task: str) -> None:
         prompt = _build_user_prompt(task, ())
         self._conversation_task = task
@@ -607,11 +851,17 @@ class OpenAIProvider:
 
     def _responses_step(self) -> ToolCall | FinalAnswer:
         idempotency_key = self._round_idempotency_key("responses")
+        active_definitions = self._active_tool_definitions()
+        active_tools = [
+            tool
+            for tool in self._responses_tools
+            if tool.get("name") in active_definitions
+        ]
         request_payload: dict[str, object] = {
             "model": self._client.config.model,
             "instructions": self._system_prompt,
             "input": deepcopy(self._responses_input),
-            "tools": deepcopy(self._responses_tools),
+            "tools": deepcopy(active_tools),
             "parallel_tool_calls": False,
             "store": False,
         }
@@ -626,43 +876,87 @@ class OpenAIProvider:
             request_payload,
             field_name="max_output_tokens",
             total_tokens=self._response_token_budget,
+            minimum_output_tokens=self._minimum_response_output_tokens,
+            estimated_input_tokens=self._next_response_input_token_estimate,
         )
-        payload = self._client.post_json(
+        payload = self._post_step_request(
+            "responses",
             "/responses",
             request_payload,
             idempotency_key=idempotency_key,
         )
-        self._record_usage(payload, "responses")
-        _raise_for_incomplete_response(payload)
-        output = payload.get("output")
-        if not isinstance(output, list) or not all(
-            isinstance(item, Mapping) for item in output
-        ):
-            raise OpenAIProtocolError("Responses payload output items are malformed")
+        parallel_violations_before = self._parallel_tool_call_violations
         if is_official_deepseek_base_url(self._client.config.base_url):
             self._parallel_tool_call_violations += max(
                 0,
-                sum(item.get("type") == "function_call" for item in output) - 1,
+                _responses_tool_call_count(payload) - 1,
             )
-        decision_output, deferred_calls = _responses_decision_output(
-            output,
-            self._client.config,
-            self._tool_by_name,
-        )
-        decision_payload = {**payload, "output": decision_output}
-        decision = parse_responses_decision(decision_payload, self._tool_by_name)
+        missing_forced_tool = False
+        try:
+            self._record_usage(payload, "responses")
+        except OpenAIProtocolError:
+            self._record_rejected_tool_calls(
+                payload,
+                "responses",
+                parallel_violations_before=parallel_violations_before,
+            )
+            raise
+
+        # An incomplete response can expose a partial function-call item, but
+        # no call was accepted or executed. Keep it as a protocol failure
+        # without misclassifying the partial item as invalid tool usage.
+        _raise_for_incomplete_response(payload)
+        try:
+            output = payload.get("output")
+            if not isinstance(output, list) or not all(
+                isinstance(item, Mapping) for item in output
+            ):
+                raise OpenAIProtocolError(
+                    "Responses payload output items are malformed"
+                )
+            decision_output, deferred_calls = _responses_decision_output(
+                output,
+                self._client.config,
+                active_definitions,
+            )
+            decision_payload = {**payload, "output": decision_output}
+            decision = parse_responses_decision(decision_payload, active_definitions)
+            if self._forced_tool_choice is not None and isinstance(
+                decision, FinalAnswer
+            ):
+                missing_forced_tool = True
+                raise OpenAIProtocolError("model did not call the forced tool")
+        except OpenAIProtocolError as exc:
+            self._record_rejected_tool_calls(
+                payload,
+                "responses",
+                parallel_violations_before=parallel_violations_before,
+                missing_forced_tool=missing_forced_tool,
+            )
+            if isinstance(exc, OpenAIToolArgumentsError):
+                self._malformed_tool_argument_violations += 1
+            if isinstance(exc, OpenAIUnknownToolError):
+                self._unknown_tool_violations += 1
+            raise
         self._responses_input.extend(deepcopy(output))
         self._deferred_response_calls = deferred_calls
         self._record_decision(decision)
-        self._request_rounds["responses"] += 1
         return decision
 
     def _chat_step(self) -> ToolCall | FinalAnswer:
         idempotency_key = self._round_idempotency_key("chat_completions")
+        active_definitions = self._active_tool_definitions()
+        active_tools = [
+            chat_tool
+            for response_tool, chat_tool in zip(
+                self._responses_tools, self._chat_tools, strict=True
+            )
+            if response_tool.get("name") in active_definitions
+        ]
         request_payload: dict[str, object] = {
             "model": self._client.config.model,
             "messages": deepcopy(self._chat_messages),
-            "tools": deepcopy(self._chat_tools),
+            "tools": deepcopy(active_tools),
             "parallel_tool_calls": False,
             "store": False,
         }
@@ -675,19 +969,89 @@ class OpenAIProvider:
             request_payload,
             field_name="max_completion_tokens",
             total_tokens=self._response_token_budget,
+            minimum_output_tokens=self._minimum_response_output_tokens,
+            estimated_input_tokens=self._next_response_input_token_estimate,
         )
-        payload = self._client.post_json(
+        payload = self._post_step_request(
+            "chat_completions",
             "/chat/completions",
             request_payload,
             idempotency_key=idempotency_key,
         )
-        self._record_usage(payload, "chat_completions")
-        message = _first_chat_response_message(payload)
-        decision = parse_chat_decision(payload, self._tool_by_name)
+        missing_forced_tool = False
+        try:
+            self._record_usage(payload, "chat_completions")
+            message = _first_chat_response_message(payload)
+            decision = parse_chat_decision(payload, active_definitions)
+            if self._forced_tool_choice is not None and isinstance(
+                decision, FinalAnswer
+            ):
+                missing_forced_tool = True
+                raise OpenAIProtocolError("model did not call the forced tool")
+        except OpenAIProtocolError as exc:
+            self._record_rejected_tool_calls(
+                payload,
+                "chat_completions",
+                missing_forced_tool=missing_forced_tool,
+            )
+            if isinstance(exc, OpenAIToolArgumentsError):
+                self._malformed_tool_argument_violations += 1
+            if isinstance(exc, OpenAIUnknownToolError):
+                self._unknown_tool_violations += 1
+            raise
         self._chat_messages.append(deepcopy(dict(message)))
         self._record_decision(decision)
-        self._request_rounds["chat_completions"] += 1
         return decision
+
+    def _post_step_request(
+        self,
+        api_kind: APIKind,
+        endpoint: str,
+        payload: Mapping[str, object],
+        *,
+        idempotency_key: str | None,
+    ) -> dict[str, Any]:
+        self._request_count += 1
+        try:
+            response = self._client.post_json(
+                endpoint,
+                payload,
+                idempotency_key=idempotency_key,
+            )
+        except _OpenAIResponseProtocolError:
+            self._request_rounds[api_kind] += 1
+            raise
+        self._request_rounds[api_kind] += 1
+        return response
+
+    def _active_tool_definitions(self) -> Mapping[str, ToolDefinition]:
+        if self._forced_tool_choice is None:
+            return self._tool_by_name
+        return {self._forced_tool_choice: self._tool_by_name[self._forced_tool_choice]}
+
+    def _record_rejected_tool_calls(
+        self,
+        payload: Mapping[str, object],
+        api_kind: APIKind,
+        *,
+        parallel_violations_before: int | None = None,
+        missing_forced_tool: bool = False,
+    ) -> None:
+        call_count = (
+            _responses_tool_call_count(payload)
+            if api_kind == "responses"
+            else _chat_tool_call_count(payload)
+        )
+        covered_parallel_calls = 0
+        if parallel_violations_before is not None:
+            covered_parallel_calls = max(
+                0,
+                self._parallel_tool_call_violations - parallel_violations_before,
+            )
+        self._rejected_tool_call_violations += max(
+            int(missing_forced_tool),
+            call_count - covered_parallel_calls,
+        )
 
     def _record_usage(self, payload: Mapping[str, object], api_kind: APIKind) -> None:
         raw_usage = payload.get("usage")
@@ -754,6 +1118,12 @@ class OpenAIProvider:
             self._total_tokens += values[2]
         self._last_response_usage = latest
 
+    def _record_unreported_response(self) -> None:
+        """Record a completed HTTP response that supplied no token usage."""
+
+        self._usage_response_count += 1
+        self._last_response_usage = ProviderUsage(1, 0, None, None, None, None)
+
     def _record_decision(self, decision: ToolCall | FinalAnswer) -> None:
         if isinstance(decision, ToolCall):
             self._pending_call = (decision.id, decision.name)
@@ -804,6 +1174,36 @@ def response_tools_to_chat_tools(
         }
         chat_tools.append({"type": "function", "function": function})
     return chat_tools
+
+
+def _responses_tool_call_count(payload: Mapping[str, object]) -> int:
+    output = payload.get("output")
+    if isinstance(output, Mapping):
+        return int(output.get("type") == "function_call")
+    if not isinstance(output, list):
+        return 0
+    return sum(
+        isinstance(item, Mapping) and item.get("type") == "function_call"
+        for item in output
+    )
+
+
+def _chat_tool_call_count(payload: Mapping[str, object]) -> int:
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return 0
+    first = choices[0]
+    if not isinstance(first, Mapping):
+        return 0
+    message = first.get("message")
+    if not isinstance(message, Mapping):
+        return 0
+    raw_calls = message.get("tool_calls")
+    if raw_calls is None:
+        return 0
+    if isinstance(raw_calls, list):
+        return len(raw_calls)
+    return 1
 
 
 def parse_responses_decision(
@@ -905,12 +1305,17 @@ def _parse_tool_call(
     valid_name = _protocol_identifier(name, "tool name")
     definition = definitions.get(valid_name)
     if definition is None:
-        raise OpenAIProtocolError("model requested an unknown tool")
+        raise OpenAIUnknownToolError(
+            "model requested an unknown or inactive tool"
+        )
     if not isinstance(raw_arguments, str):
         raise OpenAIProtocolError("tool arguments must be a JSON string")
     if len(raw_arguments.encode("utf-8")) > MAX_TOOL_ARGUMENT_BYTES:
         raise OpenAIProtocolError("tool arguments exceed the size limit")
-    arguments = _decode_json_value(raw_arguments, "tool arguments")
+    try:
+        arguments = _decode_json_value(raw_arguments, "tool arguments")
+    except OpenAIProtocolError as exc:
+        raise OpenAIToolArgumentsError("tool arguments is invalid JSON") from exc
     if not isinstance(arguments, dict) or not all(
         isinstance(key, str) for key in arguments
     ):
@@ -930,6 +1335,11 @@ def _build_user_prompt(task: str, results: Sequence[ToolResult]) -> str:
     valid_task = _validated_text(task, "task", limit=MAX_TASK_CHARACTERS)
     if len(results) > MAX_RESULT_COUNT:
         raise OpenAIProtocolError("too many tool results were supplied")
+    # The first request has no untrusted tool output to frame. Avoid spending
+    # input budget on the evidence warning and an empty JSON array; retain the
+    # full warning for every follow-up that actually contains tool output.
+    if not results:
+        return f"Task:\n{valid_task}"
     evidence: list[dict[str, object]] = []
     for result in results:
         if not isinstance(result, ToolResult):
@@ -966,6 +1376,36 @@ def _serialize_tool_result(result: ToolResult) -> str:
         ensure_ascii=True,
         allow_nan=False,
         separators=(",", ":"),
+    )
+
+
+def tool_result_replay_bytes(result: ToolResult) -> int:
+    """Return a wire-byte upper bound for replaying one tool result."""
+
+    if not isinstance(result, ToolResult):
+        raise TypeError("tool result must be a ToolResult")
+    serialized = _serialize_tool_result(result)
+    responses_envelope = {
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": result.call_id,
+                "output": serialized,
+            }
+        ]
+    }
+    chat_envelope = {
+        "messages": [
+            {
+                "role": "tool",
+                "tool_call_id": result.call_id,
+                "content": serialized,
+            }
+        ]
+    }
+    return max(
+        len(_encode_request_payload(responses_envelope)),
+        len(_encode_request_payload(chat_envelope)),
     )
 
 
@@ -1067,9 +1507,7 @@ def _estimate_request_input_tokens(payload: Mapping[str, object]) -> int:
     """Conservatively estimate request input tokens without a model tokenizer."""
 
     payload_bytes = len(_encode_request_payload(payload))
-    return (
-        payload_bytes + ESTIMATED_UTF8_BYTES_PER_TOKEN - 1
-    ) // ESTIMATED_UTF8_BYTES_PER_TOKEN + REQUEST_PROTOCOL_TOKEN_MARGIN
+    return payload_bytes + REQUEST_PROTOCOL_TOKEN_MARGIN
 
 
 def _apply_response_token_budget(
@@ -1077,15 +1515,39 @@ def _apply_response_token_budget(
     *,
     field_name: Literal["max_output_tokens", "max_completion_tokens"],
     total_tokens: int | None,
+    minimum_output_tokens: int | None = None,
+    estimated_input_tokens: int | None = None,
 ) -> None:
+    if (
+        estimated_input_tokens is not None
+        and (
+            type(estimated_input_tokens) is not int
+            or estimated_input_tokens < 0
+            or estimated_input_tokens > MAX_RESPONSE_TOKEN_BUDGET
+        )
+    ):
+        raise OpenAIConfigurationError(
+            "response input token estimate must be an integer between 0 and "
+            f"{MAX_RESPONSE_TOKEN_BUDGET}"
+        )
     if total_tokens is None:
         return
 
-    minimum_output_tokens = 16 if field_name == "max_output_tokens" else 1
+    protocol_minimum = 16 if field_name == "max_output_tokens" else 1
+    if minimum_output_tokens is None:
+        minimum_output_tokens = protocol_minimum
+    elif type(minimum_output_tokens) is not int or minimum_output_tokens < protocol_minimum:
+        raise OpenAIConfigurationError(
+            f"minimum output tokens must be at least {protocol_minimum}"
+        )
     candidate = total_tokens
     while True:
         payload[field_name] = candidate
-        input_tokens = _estimate_request_input_tokens(payload)
+        input_tokens = (
+            estimated_input_tokens
+            if estimated_input_tokens is not None
+            else _estimate_request_input_tokens(payload)
+        )
         available_output = total_tokens - input_tokens
         if available_output < minimum_output_tokens:
             if candidate != minimum_output_tokens:
@@ -1365,6 +1827,8 @@ __all__ = [
     "ReasoningEffort",
     "OpenAIResponseTooLargeError",
     "OpenAITimeoutError",
+    "OpenAIToolArgumentsError",
+    "OpenAIUnknownToolError",
     "OpenAITransportError",
     "RemoteModelNotAllowedError",
     "load_openai_config",
@@ -1373,4 +1837,5 @@ __all__ = [
     "parse_responses_decision",
     "response_tools_to_chat_tools",
     "strict_response_tools",
+    "tool_result_replay_bytes",
 ]

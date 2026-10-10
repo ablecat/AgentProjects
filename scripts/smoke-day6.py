@@ -8,6 +8,7 @@ object so the probe can be used by a person or by CI.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -170,7 +171,9 @@ class ContainerRegistry:
         return tuple(_parse_container_id(line) for line in lines)
 
 
-def main() -> int:
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parse_args(argv)
+    include_legacy_maven = args.include_legacy_maven
     run_id = uuid.uuid4().hex
     docker = DockerCli()
     containers = ContainerRegistry(docker, run_id)
@@ -180,6 +183,7 @@ def main() -> int:
         "status": "failed",
         "exit_code": EXIT_RUNTIME_ERROR,
         "offline": True,
+        "include_legacy_maven": include_legacy_maven,
         "images": {},
         "checks": [],
         "e2e": {},
@@ -211,7 +215,9 @@ def main() -> int:
 
     try:
         _verify_engine(docker, checks)
-        image_records = _verify_images(docker, checks)
+        image_records = _verify_images(
+            docker, checks, include_legacy_maven=include_legacy_maven
+        )
         report["images"] = image_records
 
         TEMP_PARENT.mkdir(parents=True, exist_ok=True)
@@ -219,13 +225,17 @@ def main() -> int:
             tempfile.mkdtemp(prefix="day6-smoke-", dir=TEMP_PARENT)
         ).resolve(strict=True)
         python_workspace = temp_root / "python-workspace"
-        maven_workspace = temp_root / "maven-workspace"
+        workspaces = [python_workspace]
         host_canary = temp_root / "host-boundary-canary.txt"
         canary_value = f"day6-host-only-{uuid.uuid4().hex}"
         host_canary.write_text(canary_value, encoding="utf-8", newline="")
         canary_digest = _sha256_file(host_canary)
         _create_python_fixture(python_workspace)
-        _create_maven_fixture(maven_workspace)
+        maven_workspace: Path | None = None
+        if include_legacy_maven:
+            maven_workspace = temp_root / "maven-workspace"
+            workspaces.append(maven_workspace)
+            _create_maven_fixture(maven_workspace)
         artifact_leaks = _run_local_security_probes(
             temp_root,
             python_workspace,
@@ -236,7 +246,8 @@ def main() -> int:
         assert isinstance(security, dict)
         security["canary_leaks"] = artifact_leaks
         _prepare_container_writable_workspace(temp_root, python_workspace)
-        _prepare_container_writable_workspace(temp_root, maven_workspace)
+        if maven_workspace is not None:
+            _prepare_container_writable_workspace(temp_root, maven_workspace)
 
         python_id = _create_container(
             docker,
@@ -246,41 +257,46 @@ def main() -> int:
             image=PYTHON_IMAGE,
             workspace=python_workspace,
         )
-        maven_id = _create_container(
-            docker,
-            containers,
-            name=f"repo-agent-day6-maven-{run_id}",
-            case="maven-e2e",
-            image=MAVEN_IMAGE,
-            workspace=maven_workspace,
-        )
         _start_container(docker, python_id)
-        _start_container(docker, maven_id)
 
         _verify_container_contract(
             docker, checks, "python", python_id, python_workspace
-        )
-        _verify_container_contract(
-            docker, checks, "maven", maven_id, maven_workspace
         )
         _verify_runtime_isolation(
             docker, checks, "python", python_id, python_workspace
         )
         _verify_init_process_reaping(docker, checks, python_id)
-        _verify_runtime_isolation(
-            docker, checks, "maven", maven_id, maven_workspace
-        )
-        _verify_network_isolation(docker, checks, python_id, maven_id)
+        runtime_ids = [python_id]
+        maven_id: str | None = None
+        if maven_workspace is not None:
+            maven_id = _create_container(
+                docker,
+                containers,
+                name=f"repo-agent-day6-maven-{run_id}",
+                case="maven-e2e",
+                image=MAVEN_IMAGE,
+                workspace=maven_workspace,
+            )
+            _start_container(docker, maven_id)
+            _verify_container_contract(
+                docker, checks, "maven", maven_id, maven_workspace
+            )
+            _verify_runtime_isolation(
+                docker, checks, "maven", maven_id, maven_workspace
+            )
+            runtime_ids.append(maven_id)
+        _verify_network_isolation(docker, checks, python_id, runtime_ids)
         _pass_security_probe(
             report,
             "network_isolation",
-            "DNS and direct outbound TCP were blocked in both offline sandboxes",
+            "DNS and direct outbound TCP were blocked in every enabled sandbox",
         )
 
         report_e2e = report["e2e"]
         assert isinstance(report_e2e, dict)
         report_e2e["python"] = _run_python_e2e(docker, checks, python_id)
-        report_e2e["maven"] = _run_maven_e2e(docker, checks, maven_id)
+        if maven_id is not None:
+            report_e2e["maven"] = _run_maven_e2e(docker, checks, maven_id)
 
         timeout_target = _create_container(
             docker,
@@ -316,7 +332,7 @@ def main() -> int:
             host_canary,
             canary_digest,
             canary_value,
-            (python_workspace, maven_workspace),
+            tuple(workspaces),
         )
         security["host_mutations"] = host_mutations
         security["canary_leaks"] = int(security["canary_leaks"]) + host_leaks
@@ -324,7 +340,7 @@ def main() -> int:
             checks,
             "host_boundary.canary_isolated",
             host_mutations == 0 and host_leaks == 0,
-            "the unmounted host canary is unchanged and absent from both workspaces",
+            "the unmounted host canary is unchanged and absent from all workspaces",
         )
     except CheckFailed as exc:
         check_failed = True
@@ -396,6 +412,18 @@ def main() -> int:
     report["exit_code"] = exit_code
     print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
     return exit_code
+
+
+def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run the Day 6 offline acceptance probes for active runtimes."
+    )
+    parser.add_argument(
+        "--include-legacy-maven",
+        action="store_true",
+        help="also exercise the legacy Maven sandbox image",
+    )
+    return parser.parse_args(argv)
 
 
 def _run_local_security_probes(
@@ -606,7 +634,10 @@ def _verify_engine(docker: DockerCli, checks: list[dict[str, object]]) -> None:
 
 
 def _verify_images(
-    docker: DockerCli, checks: list[dict[str, object]]
+    docker: DockerCli,
+    checks: list[dict[str, object]],
+    *,
+    include_legacy_maven: bool = False,
 ) -> dict[str, object]:
     try:
         lock = json.loads(LOCK_PATH.read_text(encoding="utf-8"))
@@ -617,7 +648,7 @@ def _verify_images(
         raise AcceptanceError("docker/image-lock.json has no images object")
 
     result: dict[str, object] = {}
-    for runtime, image in (("python", PYTHON_IMAGE), ("maven", MAVEN_IMAGE)):
+    for runtime, image in _selected_images(include_legacy_maven):
         outcome = docker.invoke(
             ("image", "inspect", "--format", "{{json .}}", image)
         )
@@ -651,6 +682,15 @@ def _verify_images(
             "matches_recorded_local_image_id": image_id == locked_id,
         }
     return result
+
+
+def _selected_images(
+    include_legacy_maven: bool,
+) -> tuple[tuple[str, str], ...]:
+    images = [("python", PYTHON_IMAGE)]
+    if include_legacy_maven:
+        images.append(("maven", MAVEN_IMAGE))
+    return tuple(images)
 
 
 def _create_container(
@@ -979,10 +1019,10 @@ def _verify_network_isolation(
     docker: DockerCli,
     checks: list[dict[str, object]],
     python_id: str,
-    maven_id: str,
+    container_ids: Sequence[str],
 ) -> None:
     interface_results: list[bool] = []
-    for container_id in (python_id, maven_id):
+    for container_id in container_ids:
         interfaces = _exec(
             docker,
             container_id,
@@ -993,7 +1033,7 @@ def _verify_network_isolation(
         checks,
         "network.loopback_only",
         all(interface_results),
-        "both E2E containers expose only the loopback interface",
+        "all enabled E2E containers expose only the loopback interface",
     )
 
     dns_code = (

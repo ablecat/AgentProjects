@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import dataclass
 import json
 from pathlib import Path
 import sqlite3
@@ -10,6 +11,18 @@ import threading
 from typing import Any
 
 from .run_models import RunRecord, utc_now
+
+
+MAX_EVENT_SEQUENCE = (1 << 63) - 1
+MAX_EVENT_PAGE_SIZE = 256
+
+
+@dataclass(frozen=True, slots=True)
+class EventPage:
+    """One bounded, durable page of per-run service events."""
+
+    events: tuple[dict[str, Any], ...]
+    latest_sequence: int
 
 
 class RunNotFoundError(LookupError):
@@ -234,6 +247,60 @@ class RunDatabase:
             ).fetchall()
         return tuple(json.loads(row["event_json"]) for row in rows)
 
+    def event_page(
+        self,
+        run_id: str,
+        *,
+        after_sequence: int,
+        limit: int = 64,
+    ) -> EventPage:
+        """Return events after an exclusive cursor and the snapshot's latest id."""
+
+        if (
+            type(after_sequence) is not int
+            or not 0 <= after_sequence <= MAX_EVENT_SEQUENCE
+        ):
+            raise ValueError("after_sequence must be an integer from 0 to 2^63-1")
+        if type(limit) is not int or not 1 <= limit <= MAX_EVENT_PAGE_SIZE:
+            raise ValueError(
+                f"limit must be an integer from 1 to {MAX_EVENT_PAGE_SIZE}"
+            )
+
+        with self._connect() as connection:
+            connection.execute("BEGIN")
+            latest = connection.execute(
+                "SELECT COALESCE(MAX(sequence), 0) AS sequence "
+                "FROM service_events WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            exists = connection.execute(
+                "SELECT 1 FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if exists is None:
+                connection.rollback()
+                raise RunNotFoundError(f"run not found: {run_id}")
+            rows = connection.execute(
+                "SELECT sequence, event_json, created_at FROM service_events "
+                "WHERE run_id = ? AND sequence > ? "
+                "ORDER BY sequence ASC LIMIT ?",
+                (run_id, after_sequence, limit),
+            ).fetchall()
+            connection.commit()
+
+        events: list[dict[str, Any]] = []
+        for row in rows:
+            value = json.loads(row["event_json"])
+            if not isinstance(value, dict):
+                raise RuntimeError("stored service event is not an object")
+            event = dict(value)
+            event["sequence"] = int(row["sequence"])
+            event.setdefault("timestamp", row["created_at"])
+            events.append(event)
+        return EventPage(
+            events=tuple(events),
+            latest_sequence=int(latest["sequence"]),
+        )
+
     def record_side_effect(
         self, run_id: str, effect_key: str, result: dict[str, Any]
     ) -> tuple[bool, dict[str, Any]]:
@@ -298,6 +365,9 @@ class RunDatabase:
 
 
 __all__ = [
+    "EventPage",
+    "MAX_EVENT_PAGE_SIZE",
+    "MAX_EVENT_SEQUENCE",
     "RunConflictError",
     "RunDatabase",
     "RunNotFoundError",

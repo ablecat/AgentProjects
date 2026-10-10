@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "repository": "https://github.com/httpie/cli",
+  "issue": {
+    "url": "https://github.com/httpie/cli/issues/235",
+    "title": "Duplicate Host headers when custom Host specified"
+  },
+  "fix_url": "https://github.com/httpie/cli/commit/040d981f00c3f6830b2d0db3daf3c64c080e96e3",
+  "commits": {
+    "base": "8c892edd4fe700a7ca5cc733dcb4817831d253e2",
+    "fix": "040d981f00c3f6830b2d0db3daf3c64c080e96e3"
+  },
+  "source_files": {
+    "base": {
+      "url": "https://raw.githubusercontent.com/httpie/cli/8c892edd4fe700a7ca5cc733dcb4817831d253e2/httpie/models.py",
+      "sha256": "ea94fc1b01a56fe1630ef24af396d97ad536b9b98c7f301acea23eeb8111ab39"
+    },
+    "fix": {
+      "url": "https://raw.githubusercontent.com/httpie/cli/040d981f00c3f6830b2d0db3daf3c64c080e96e3/httpie/models.py",
+      "sha256": "2b0b74fc797a8716f5020024b4f6dc88c343e99b70db93daa298201f323cd153"
+    },
+    "license": {
+      "url": "https://raw.githubusercontent.com/httpie/cli/040d981f00c3f6830b2d0db3daf3c64c080e96e3/LICENSE",
+      "sha256": "4396a6f1a58b2d961e28228e005988d7059614a06de03e944f87a8a3087731a4"
+    }
+  },
+  "target": {
+    "path": "httpie/models.py",
+    "base_sha256": "ea94fc1b01a56fe1630ef24af396d97ad536b9b98c7f301acea23eeb8111ab39",
+    "fix_sha256": "2b0b74fc797a8716f5020024b4f6dc88c343e99b70db93daa298201f323cd153"
+  },
+  "license": {
+    "path": "LICENSE",
+    "sha256": "4396a6f1a58b2d961e28228e005988d7059614a06de03e944f87a8a3087731a4"
+  },
+  "curation": {
+    "complete_upstream_repository": false,
+    "snapshot": "Exact fixed production target and upstream license only",
+    "public_tests": "Dependency-free smoke tests authored for this suite",
+    "hidden_tests": "Independent regression test authored from the public issue"
+  }
+}

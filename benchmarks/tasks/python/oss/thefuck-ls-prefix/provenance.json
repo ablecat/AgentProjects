@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "repository": "https://github.com/nvbn/thefuck",
+  "issue": {
+    "url": "https://github.com/nvbn/thefuck/issues/271",
+    "title": "[n1c @ yard]->pacman -S binutils"
+  },
+  "fix_url": "https://github.com/nvbn/thefuck/commit/25cc98a21a3450a046caf418f08713c82a290805",
+  "commits": {
+    "base": "cb33c912e5f2f4c2da6b70d708ff0437bfcd3b94",
+    "fix": "25cc98a21a3450a046caf418f08713c82a290805"
+  },
+  "source_files": {
+    "base": {
+      "url": "https://raw.githubusercontent.com/nvbn/thefuck/cb33c912e5f2f4c2da6b70d708ff0437bfcd3b94/thefuck/rules/ls_lah.py",
+      "sha256": "d34fcf45876859ad0511438aa687968e533e32cc44414ad3560fc28d318fc147"
+    },
+    "fix": {
+      "url": "https://raw.githubusercontent.com/nvbn/thefuck/25cc98a21a3450a046caf418f08713c82a290805/thefuck/rules/ls_lah.py",
+      "sha256": "c89281b4660fbd64abd9007dd649fdf88f63849314a796af58e6c3210dca2ca4"
+    },
+    "license": {
+      "url": "https://raw.githubusercontent.com/nvbn/thefuck/25cc98a21a3450a046caf418f08713c82a290805/LICENSE.md",
+      "sha256": "84da771f8c614fe890db097f0090404691f6c750776972ee63e68e10c7f43196"
+    }
+  },
+  "target": {
+    "path": "thefuck/rules/ls_lah.py",
+    "base_sha256": "d34fcf45876859ad0511438aa687968e533e32cc44414ad3560fc28d318fc147",
+    "fix_sha256": "c89281b4660fbd64abd9007dd649fdf88f63849314a796af58e6c3210dca2ca4"
+  },
+  "license": {
+    "path": "LICENSE.md",
+    "sha256": "84da771f8c614fe890db097f0090404691f6c750776972ee63e68e10c7f43196"
+  },
+  "curation": {
+    "complete_upstream_repository": false,
+    "snapshot": "Exact fixed production target and upstream license only",
+    "public_tests": "Dependency-free smoke tests authored for this suite",
+    "hidden_tests": "Independent regression test authored from the public issue"
+  }
+}

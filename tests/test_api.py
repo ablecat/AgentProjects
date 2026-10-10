@@ -13,13 +13,14 @@ from starlette.routing import Route
 
 from repo_agent.api import DEFAULT_HOST, create_app
 from repo_agent.artifacts import ArtifactError
-from repo_agent.persistence import RunNotFoundError
+from repo_agent.persistence import EventPage, RunNotFoundError
 from repo_agent.run_models import CheckSummary, RunRecord, utc_now
 from repo_agent.service import (
     InvalidRunTransitionError,
     QueueFullError,
     RepositoryNotAllowedError,
     RunService,
+    ServiceSnapshot,
 )
 
 
@@ -51,6 +52,18 @@ class FakeRunService:
         self.artifact = artifact
         self.calls: list[tuple[object, ...]] = []
         self.is_ready = True
+        self.records: tuple[RunRecord, ...] = ()
+        self.snapshot = ServiceSnapshot(
+            ready=True,
+            queue_depth=0,
+            queue_capacity=4,
+            active_count=0,
+            max_concurrency=1,
+            queued_run_ids=(),
+            active_run_ids=(),
+        )
+        self.events: tuple[dict[str, object], ...] = ()
+        self.event_status = "awaiting_approval"
 
     def create_run(
         self,
@@ -75,7 +88,10 @@ class FakeRunService:
 
     def get_run(self, run_id: str) -> RunRecord:
         self.calls.append(("get", run_id))
-        return _record(repo_path=str(self.repo_path), status="awaiting_approval")
+        return _record(repo_path=str(self.repo_path), status=self.event_status)
+
+    def list_runs(self) -> tuple[RunRecord, ...]:
+        return self.records
 
     def decide(
         self, run_id: str, *, approve: bool, reason: str | None = None
@@ -98,6 +114,49 @@ class FakeRunService:
 
     def ready(self) -> bool:
         return self.is_ready
+
+    def scheduler_snapshot(self) -> ServiceSnapshot:
+        return self.snapshot
+
+    def queue_position(self, run_id: str) -> int | None:
+        try:
+            return self.snapshot.queued_run_ids.index(run_id) + 1
+        except ValueError:
+            return None
+
+    def event_page(
+        self,
+        run_id: str,
+        *,
+        after_sequence: int,
+        limit: int = 64,
+    ) -> EventPage:
+        self.calls.append(("events", run_id, after_sequence, limit))
+        events = tuple(
+            event
+            for event in self.events
+            if int(event["sequence"]) > after_sequence
+        )[:limit]
+        latest = max(
+            (int(event["sequence"]) for event in self.events),
+            default=0,
+        )
+        return EventPage(events, latest)
+
+    def wait_for_events(
+        self,
+        run_id: str,
+        *,
+        after_sequence: int,
+        timeout: float | None,
+        limit: int = 64,
+    ) -> EventPage:
+        self.calls.append(("wait", run_id, after_sequence, timeout, limit))
+        return self.event_page(
+            run_id,
+            after_sequence=after_sequence,
+            limit=limit,
+        )
 
 
 @pytest.fixture
@@ -133,6 +192,71 @@ def test_health_is_public_and_readiness_tracks_service(api_fixture) -> None:
     assert response.json() == {"status": "not_ready"}
 
 
+def test_service_status_and_run_list_expose_bounded_scheduler_state(
+    api_fixture,
+) -> None:
+    service, client, repository = api_fixture
+    queued = _record(run_id="a" * 32, repo_path=str(repository), status="queued")
+    running = _record(run_id="b" * 32, repo_path=str(repository), status="running")
+    failed = _record(run_id="c" * 32, repo_path=str(repository), status="failed")
+    service.records = (queued, running, failed)
+    service.snapshot = ServiceSnapshot(
+        ready=True,
+        queue_depth=1,
+        queue_capacity=4,
+        active_count=1,
+        max_concurrency=1,
+        queued_run_ids=(queued.run_id,),
+        active_run_ids=(running.run_id,),
+    )
+
+    status_response = client.get("/v1/service/status", headers=_auth())
+    listed = client.get("/v1/runs", headers=_auth())
+    filtered = client.get("/v1/runs?status=queued&limit=1", headers=_auth())
+
+    assert status_response.status_code == 200
+    assert status_response.json() == {
+        "ready": True,
+        "queue_depth": 1,
+        "queue_capacity": 4,
+        "active_count": 1,
+        "max_concurrency": 1,
+        "queued_run_ids": [queued.run_id],
+        "active_run_ids": [running.run_id],
+    }
+    assert [item["run_id"] for item in listed.json()["runs"]] == [
+        failed.run_id,
+        running.run_id,
+        queued.run_id,
+    ]
+    assert listed.json()["runs"][-1]["queue_position"] == 1
+    assert listed.json()["service"] == status_response.json()
+    assert [item["run_id"] for item in filtered.json()["runs"]] == [queued.run_id]
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "status=unknown",
+        "status=QUEUED",
+        "limit=0",
+        "limit=101",
+        "limit=-1",
+        "limit=1.0",
+        "limit=999999999999999999999999999999999",
+    ),
+)
+def test_run_list_rejects_unbounded_or_unknown_queries(api_fixture, query: str) -> None:
+    _service, client, _repository = api_fixture
+
+    response = client.get(f"/v1/runs?{query}", headers=_auth())
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "error": {"code": "invalid_request", "message": response.json()["error"]["message"]}
+    }
+
+
 def test_every_non_health_endpoint_requires_bearer_authentication(api_fixture) -> None:
     _service, client, repository = api_fixture
 
@@ -148,6 +272,123 @@ def test_every_non_health_endpoint_requires_bearer_authentication(api_fixture) -
         assert TOKEN not in response.text
 
     assert client.get("/missing").status_code == 401
+    assert client.get("/v1/runs").status_code == 401
+    assert client.get("/v1/service/status").status_code == 401
+    assert client.get(f"/v1/runs/{RUN_ID}/events").status_code == 401
+
+
+def test_event_stream_replays_redacted_progress_and_closes_at_pause(
+    api_fixture,
+) -> None:
+    service, client, _repository = api_fixture
+    configured_secret = "configured-secret-value"
+    service.events = (
+        {
+            "sequence": 1,
+            "event": f"Bearer {configured_secret}",
+            "node": configured_secret,
+            "phase": configured_secret,
+            "timestamp": configured_secret,
+            "detail": {"authorization": "Bearer must-not-stream"},
+        },
+        {
+            "sequence": 2,
+            "event": "workflow_stopped",
+            "node": "approval",
+            "phase": "planning",
+            "timestamp": "2026-10-09T01:00:00.000Z",
+            "tool_errors": 1,
+            "request_not_started": False,
+            "model_usage": {
+                "input_tokens": 30,
+                "output_tokens": 12,
+                "total_tokens": 42,
+                "complete": True,
+                "provider_request_id": "must-not-stream",
+            },
+            "tool_failures": [{"secret": "must-not-stream"}],
+        },
+    )
+
+    response = client.get(
+        f"/v1/runs/{RUN_ID}/events?after=0",
+        headers=_auth(),
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "text/event-stream; charset=utf-8"
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["x-accel-buffering"] == "no"
+    assert "content-length" not in response.headers
+    assert response.text.startswith("retry: 1500\nevent: snapshot\n")
+    assert "id: 1\nevent: progress\n" in response.text
+    assert "id: 2\nevent: progress\n" in response.text
+    assert "id: 2\nevent: done\n" in response.text
+    assert '"tool_errors":1' in response.text
+    assert '"request_not_started":false' in response.text
+    assert '"model_usage":{"input_tokens":30,"output_tokens":12,' in response.text
+    assert '"total_tokens":42,"complete":true}' in response.text
+    assert '"event":"workflow_event"' in response.text
+    assert '"event":"workflow_stopped"' in response.text
+    assert '"node":"approval"' in response.text
+    assert '"phase":"planning"' in response.text
+    assert '"timestamp":"2026-10-09T01:00:00.000Z"' in response.text
+    assert configured_secret not in response.text
+    assert "Bearer" not in response.text
+    assert "must-not-stream" not in response.text
+    assert '"detail"' not in response.text
+    assert '"tool_failures"' not in response.text
+
+
+def test_event_stream_last_event_id_takes_precedence_over_query_cursor(
+    api_fixture,
+) -> None:
+    service, client, _repository = api_fixture
+    service.events = (
+        {"sequence": 1, "event": "first"},
+        {"sequence": 2, "event": "second"},
+    )
+
+    response = client.get(
+        f"/v1/runs/{RUN_ID}/events?after=0",
+        headers={**_auth(), "Last-Event-ID": "1"},
+    )
+
+    assert response.status_code == 200
+    assert "id: 1\nevent: progress\n" not in response.text
+    assert "id: 2\nevent: progress\n" in response.text
+    assert ("events", RUN_ID, 1, 64) in service.calls
+
+
+def test_event_stream_resets_stale_cursor_and_releases_stream_capacity(
+    api_fixture,
+) -> None:
+    service, client, _repository = api_fixture
+    service.events = ({"sequence": 1, "event": "latest"},)
+
+    response = client.get(
+        f"/v1/runs/{RUN_ID}/events",
+        headers={**_auth(), "Last-Event-ID": "9"},
+    )
+
+    assert response.status_code == 200
+    assert response.text.startswith("retry: 1500\nid: 1\nevent: snapshot\n")
+    assert '"cursor":1,"reset":true' in response.text
+    slots = client.app.state.event_stream_slots
+    acquired = [slots.acquire(blocking=False) for _ in range(4)]
+    try:
+        assert acquired == [True, True, True, True]
+        rejected = client.get(
+            f"/v1/runs/{RUN_ID}/events",
+            headers=_auth(),
+        )
+        assert rejected.status_code == 429
+        assert rejected.headers["retry-after"] == "2"
+        assert rejected.json()["error"]["code"] == "too_many_streams"
+    finally:
+        for held in acquired:
+            if held:
+                slots.release()
 
 
 def test_create_returns_202_location_and_normalized_record(api_fixture) -> None:

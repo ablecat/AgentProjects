@@ -17,6 +17,13 @@ RUN_PREFIX = "repo-agent-day3-smoke-deadbeef-mvn"
 VOLUME_NAME = f"{RUN_PREFIX}-{RUN_ID}-cache"
 
 
+def test_maven_smoke_is_explicitly_opt_in() -> None:
+    assert not smoke_day3._parse_args([]).include_legacy_maven
+    assert smoke_day3._parse_args(
+        ["--include-legacy-maven"]
+    ).include_legacy_maven
+
+
 @pytest.mark.parametrize(
     ("relative_path", "cache_leaf"),
     [
@@ -74,7 +81,7 @@ def _create(
         "--log-driver",
         "none",
         "--tmpfs",
-        "/tmp:rw,nosuid,nodev,size=256m,mode=1777",
+        "/tmp:rw,exec,nosuid,nodev,size=256m,mode=1777",
         "--tmpfs",
         "/workspace:rw,nosuid,nodev,size=2g,mode=0700,uid=10001,gid=10001",
         "--mount",
@@ -98,6 +105,8 @@ def _create(
         smoke_day3._WORKSPACE_ENTRYPOINT,
         "repo-agent-check",
         "mvn",
+        "-T",
+        "4",
         *arguments,
     )
 

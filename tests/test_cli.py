@@ -293,16 +293,22 @@ def _check_result(status="passed") -> CheckRunResult:
     )
 
 
+def _mark_python_repository(path: Path) -> None:
+    (path / "tests").mkdir(exist_ok=True)
+
+
 def test_check_json_invokes_runner_with_explicit_bootstrap(
     monkeypatch, capsys, tmp_path
 ) -> None:
+    _mark_python_repository(tmp_path)
     received: dict[str, object] = {}
 
     class FakeCheckRunner:
         def __init__(self, repo, **kwargs) -> None:
             received.update(repo=repo, **kwargs)
 
-        def run(self) -> CheckRunResult:
+        def run(self, check_id=None) -> CheckRunResult:
+            received["check_id"] = check_id
             return _check_result()
 
     monkeypatch.setattr(cli, "CheckRunner", FakeCheckRunner)
@@ -329,6 +335,7 @@ def test_check_json_invokes_runner_with_explicit_bootstrap(
         "phase_timeout_seconds": 300.0,
         "total_timeout_seconds": 1200.0,
         "max_output_bytes": 65536,
+        "check_id": "python-pytest",
     }
 
 
@@ -346,13 +353,15 @@ def test_check_json_invokes_runner_with_explicit_bootstrap(
 def test_check_status_controls_exit_code(
     monkeypatch, capsys, tmp_path, status, expected_exit
 ) -> None:
+    _mark_python_repository(tmp_path)
     result = _check_result(status)
 
     class FakeCheckRunner:
         def __init__(self, *args, **kwargs) -> None:
             del args, kwargs
 
-        def run(self) -> CheckRunResult:
+        def run(self, check_id=None) -> CheckRunResult:
+            assert check_id == "python-pytest"
             return result
 
     monkeypatch.setattr(cli, "CheckRunner", FakeCheckRunner)
@@ -366,6 +375,8 @@ def test_check_status_controls_exit_code(
 
 
 def test_check_setup_exception_is_structured(monkeypatch, capsys, tmp_path) -> None:
+    _mark_python_repository(tmp_path)
+
     class BrokenCheckRunner:
         def __init__(self, *args, **kwargs) -> None:
             del args, kwargs
@@ -387,13 +398,15 @@ def test_check_setup_exception_is_structured(monkeypatch, capsys, tmp_path) -> N
 def test_interrupted_check_closes_runner_before_returning_130(
     monkeypatch, capsys, tmp_path
 ) -> None:
+    _mark_python_repository(tmp_path)
     closed = False
 
     class InterruptedCheckRunner:
         def __init__(self, *args, **kwargs) -> None:
             del args, kwargs
 
-        def run(self) -> CheckRunResult:
+        def run(self, check_id=None) -> CheckRunResult:
+            assert check_id == "python-pytest"
             raise KeyboardInterrupt
 
         def close(self) -> None:
@@ -414,11 +427,14 @@ def test_interrupted_check_closes_runner_before_returning_130(
 
 
 def test_text_check_lists_each_phase(monkeypatch, capsys, tmp_path) -> None:
+    _mark_python_repository(tmp_path)
+
     class FakeCheckRunner:
         def __init__(self, *args, **kwargs) -> None:
             del args, kwargs
 
-        def run(self) -> CheckRunResult:
+        def run(self, check_id=None) -> CheckRunResult:
+            assert check_id == "python-pytest"
             return _check_result()
 
     monkeypatch.setattr(cli, "CheckRunner", FakeCheckRunner)
@@ -431,6 +447,61 @@ def test_text_check_lists_each_phase(monkeypatch, capsys, tmp_path) -> None:
     assert "profile: python-pytest (python)" in output
     assert "phase: python-pytest (verify, passed, network=none, exit=0" in output
     assert "command: python -m pytest -q" in output
+
+
+def test_check_requires_explicit_legacy_flag_for_maven(
+    monkeypatch, capsys, tmp_path
+) -> None:
+    java_profile = CheckProfile(
+        id="maven-test",
+        language="java",
+        image="repo-agent-maven:0.1",
+        manifest="pom.xml",
+        bootstrap_argv=(),
+        check_argv=("mvn", "--offline", "test"),
+        java_release=21,
+    )
+    constructions = 0
+    check_ids: list[str | None] = []
+
+    class FakeCheckRunner:
+        def __init__(self, *args, **kwargs) -> None:
+            nonlocal constructions
+            del args, kwargs
+            constructions += 1
+
+        def run(self, check_id=None) -> CheckRunResult:
+            check_ids.append(check_id)
+            return _check_result()
+
+    monkeypatch.setattr(cli, "detect_check_profile", lambda _repo: java_profile)
+    monkeypatch.setattr(cli, "CheckRunner", FakeCheckRunner)
+
+    exit_code = cli.main(
+        ["check", "--repo", str(tmp_path), "--format", "json"]
+    )
+
+    assert exit_code == 1
+    denied = json.loads(capsys.readouterr().out)
+    assert denied["status"] == "policy_denied"
+    assert "supports only Python repositories" in denied["error"]
+    assert constructions == 0
+
+    exit_code = cli.main(
+        [
+            "check",
+            "--repo",
+            str(tmp_path),
+            "--include-legacy-maven",
+            "--format",
+            "json",
+        ]
+    )
+
+    assert exit_code == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "passed"
+    assert constructions == 1
+    assert check_ids == [None]
 
 
 def test_help_exposes_complete_day5_command_surface(capsys) -> None:

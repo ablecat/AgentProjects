@@ -114,6 +114,16 @@ diff --git a/app.py b/app.py
 +    return f"hi, {name}!"
 """
 
+NO_EFFECT_CORRECTION_PATCH = """\
+diff --git a/app.py b/app.py
+--- a/app.py
++++ b/app.py
+@@ -1,2 +1,2 @@
+ def greet(name):
+-    return f"hello, {name}!"
++    return f"hello, {name}!"
+"""
+
 
 def test_repo_map_describes_committed_python_snapshot_without_docker(
     day2_repo: Path,
@@ -286,6 +296,33 @@ def test_later_patch_can_correct_a_path_changed_earlier(day2_repo: Path) -> None
         assert artifact.changed_paths == ("app.py", "created.py", "obsolete.py")
         assert 'return f"hi, {name}!"' in artifact.patch
         assert 'return f"hello, {name}!"' not in artifact.patch
+
+
+def test_no_effect_patch_is_rejected_without_advancing_candidate(
+    day2_repo: Path,
+) -> None:
+    with DockerSandbox(
+        day2_repo, command_runner=FakeDockerRunner(), allow_mutations=True
+    ) as sandbox:
+        first = sandbox.execute(
+            ToolCall("initial", "apply_patch", {"patch": SUCCESSFUL_PATCH})
+        )
+        assert first.ok
+        prior_artifact = sandbox.candidate_artifact()
+
+        no_effect = sandbox.execute(
+            ToolCall(
+                "no-effect",
+                "apply_patch",
+                {"patch": NO_EFFECT_CORRECTION_PATCH},
+            )
+        )
+
+        assert not no_effect.ok
+        assert "no effective change" in (no_effect.error or "").lower()
+        assert "incremental correction diff" in (no_effect.error or "")
+        assert sandbox.workspace_revision == 1
+        assert sandbox.candidate_artifact() == prior_artifact
 
 
 def test_failed_correction_restores_all_prior_candidate_changes(

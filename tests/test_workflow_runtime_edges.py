@@ -7,10 +7,21 @@ from types import SimpleNamespace
 
 import pytest
 
+import repo_agent.openai_provider as provider_module
 import repo_agent.workflow_runtime as runtime
 from repo_agent.artifacts import ArtifactStore
 from repo_agent.models import CandidateArtifact, FinalAnswer, ToolCall, ToolResult
-from repo_agent.openai_provider import OpenAIConfig
+from repo_agent.openai_provider import (
+    OpenAIConfig,
+    OpenAIHTTPError,
+    OpenAIProvider,
+    OpenAIToolArgumentsError,
+    OpenAIUnknownToolError,
+    _apply_response_token_budget,
+    _encode_request_payload,
+    _estimate_request_input_tokens,
+    tool_result_replay_bytes,
+)
 from repo_agent.persistence import RunDatabase
 from repo_agent.processes import CapturedProcess
 from repo_agent.run_models import ChangePlan, CheckSummary, RunRecord
@@ -117,12 +128,60 @@ def test_default_provider_factory_uses_remote_model_policy(monkeypatch) -> None:
     assert provider[1]["idempotency_key"] == "idempotent"
     assert provider[1]["reasoning_effort"] is None
 
+_SMALL_REVIEW_PATCH = (
+    "diff --git a/app.py b/app.py\n"
+    "--- a/app.py\n"
+    "+++ b/app.py\n"
+    "@@ -1 +1 @@\n"
+    "-old\n"
+    "+new\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("base_url", "expected_timeout"),
+    [
+        ("https://api.deepseek.com", 120.0),
+        ("https://relay.example.com/v1", 30.0),
+    ],
+)
+def test_default_provider_factory_extends_only_official_deepseek_timeout(
+    monkeypatch,
+    base_url: str,
+    expected_timeout: float,
+) -> None:
+    config = OpenAIConfig(
+        api_key="fake-provider-key",
+        base_url=base_url,
+        model="test-model",
+        allow_remote_model=True,
+    )
+    monkeypatch.setattr(
+        runtime.OpenAIConfig,
+        "from_env",
+        lambda *, allow_remote_model: config,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "OpenAIProvider",
+        lambda provided, **kwargs: (provided, kwargs),
+    )
+
+    provider = runtime.default_provider_factory(
+        runtime.AGENT_TOOL_DEFINITIONS,
+        "system",
+        "idempotent",
+        allow_remote_model=True,
+    )
+
+    assert provider[0].timeout_seconds == expected_timeout
+
 
 @pytest.mark.parametrize(
     "base_url",
     ("https://api.deepseek.com", "https://API.DEEPSEEK.COM:443/v1/"),
 )
-def test_official_deepseek_workflow_uses_phase_reasoning_effort(
+def test_official_deepseek_workflow_disables_thinking_for_named_tools(
     base_url: str,
 ) -> None:
     config = OpenAIConfig(
@@ -138,7 +197,7 @@ def test_official_deepseek_workflow_uses_phase_reasoning_effort(
         for definition in runtime.AGENT_TOOL_DEFINITIONS
         if definition.name == "apply_patch"
     )
-    assert runtime._workflow_reasoning_effort(config, (apply_patch,)) == "low"
+    assert runtime._workflow_reasoning_effort(config, (apply_patch,)) == "none"
 
 
 @pytest.mark.parametrize(
@@ -253,6 +312,35 @@ def test_prepare_rejects_dirty_mismatched_and_linked_repositories(
         assert result.detail["failure_status"] == "policy_denied"
 
 
+def test_prepare_rejects_non_python_detected_profile(
+    operations_bundle, monkeypatch
+) -> None:
+    operations, database, _artifacts, record = operations_bundle
+    monkeypatch.setattr(runtime, "effective_core_autocrlf", lambda _repo: "false")
+    responses = iter(("", "a" * 40, "a" * 40, ""))
+    monkeypatch.setattr(runtime, "_git", lambda *_args: next(responses))
+    monkeypatch.setattr(
+        runtime,
+        "detect_check_profile",
+        lambda _repo: SimpleNamespace(
+            id="maven-test",
+            language="java",
+            image="repo-agent-maven:0.1",
+        ),
+    )
+    context = _context(record, "prepare", suffix="non-python")
+
+    result = operations.prepare(context)
+
+    assert result.ok is False
+    assert result.error == "durable workflows support only Python repositories"
+    assert result.detail == {"failure_status": "policy_denied"}
+    assert database.side_effect(
+        record.run_id, f"workflow:{context.idempotency_key}"
+    ) == result.model_dump(mode="json")
+    assert operations.prepare(context) == result
+
+
 def test_finalize_rejects_empty_candidate(operations_bundle) -> None:
     operations, _database, _artifacts, record = operations_bundle
 
@@ -266,10 +354,16 @@ class _DecisionProvider:
     def __init__(self, *decisions, usage=None) -> None:
         self.decisions = list(decisions)
         self.usage = usage
+        self.calls = 0
+        self.request_count = (
+            0 if usage is None else getattr(usage, "response_count", 0)
+        )
         self.response_token_budgets: list[int] = []
         self.forced_tool_choices: list[str] = []
 
     def next_step(self, _task, _results):
+        self.calls += 1
+        self.request_count += 1
         return self.decisions.pop(0)
 
     def set_response_token_budget(self, total_tokens: int) -> None:
@@ -317,6 +411,24 @@ class _Executor:
         return ToolResult(decision.id, decision.name, True, "ok")
 
 
+class _NoEffectThenCorrectionExecutor(_Executor):
+    def execute(self, decision: ToolCall) -> ToolResult:
+        self.calls.append(decision)
+        if decision.id == "no-effect":
+            return ToolResult(
+                decision.id,
+                decision.name,
+                False,
+                "",
+                error=(
+                    "Patch made no effective change to the candidate workspace; "
+                    "submit an incremental correction diff"
+                ),
+            )
+        self.workspace_revision += 1
+        return ToolResult(decision.id, decision.name, True, "corrected")
+
+
 class _ParallelViolationProvider(_DecisionProvider):
     def __init__(self, decision: ToolCall, violations: int) -> None:
         super().__init__(decision)
@@ -328,73 +440,82 @@ class _ParallelViolationProvider(_DecisionProvider):
         return super().next_step(task, results)
 
 
-def test_planning_parallel_violations_consume_repository_tool_budget() -> None:
+def test_named_tool_parallel_violations_do_not_consume_execution_budget() -> None:
     provider = _ParallelViolationProvider(
         ToolCall("read", "read_files", {"paths": ["app.py"]}),
         violations=2,
     )
+    submit = ToolCall("plan", "submit_change_plan", {})
+    provider.decisions.append(submit)
     executor = _Executor()
 
-    with pytest.raises(RuntimeError, match="exceeded 2 repository tool calls"):
-        runtime._run_until_named_tool(
-            provider,
-            "inspect",
-            executor,
-            target="submit_change_plan",
-            max_calls=2,
-        )
+    decision, results = runtime._run_until_named_tool(
+        provider,
+        "inspect",
+        executor,
+        target="submit_change_plan",
+        max_calls=1,
+    )
 
-    assert executor.calls == []
+    assert decision is submit
+    assert len(results) == 1
+    assert [call.id for call in executor.calls] == ["read"]
+    assert provider.parallel_tool_call_violations == 4
 
 
-def test_change_parallel_violations_consume_repository_tool_budget() -> None:
+def test_change_parallel_violations_do_not_consume_execution_budget() -> None:
     provider = _ParallelViolationProvider(
         ToolCall("read", "read_files", {"paths": ["app.py"]}),
         violations=8,
     )
+    provider.decisions.append(FinalAnswer("done"))
     executor = _Executor()
 
     outcome = runtime._run_model_loop(
         provider,
         "implement",
         executor,
-        max_calls=8,
+        max_calls=1,
     )
 
-    assert outcome.ok is False
-    assert outcome.tool_budget_exhausted is True
-    assert outcome.error == "model exceeded 8 repository tool calls"
-    assert executor.calls == []
+    assert len(outcome.tool_results) == 1
+    assert [call.id for call in executor.calls] == ["read"]
+    assert provider.parallel_tool_call_violations == 16
 
 
-def test_planning_reentry_counts_existing_results_and_parallel_violations() -> None:
+def test_named_tool_reentry_counts_only_existing_and_new_executions() -> None:
     provider = _ParallelViolationProvider(
         ToolCall("read-2", "read_files", {"paths": ["other.py"]}),
         violations=0,
     )
     provider.parallel_tool_call_violations = 1
+    submit = ToolCall("plan", "submit_change_plan", {})
+    provider.decisions.append(submit)
     executor = _Executor()
     results = [ToolResult("read-1", "read_files", True, "first")]
 
-    with pytest.raises(RuntimeError, match="exceeded 2 repository tool calls"):
-        runtime._run_until_named_tool(
-            provider,
-            "inspect",
-            executor,
-            target="submit_change_plan",
-            max_calls=2,
-            tool_results=results,
-        )
+    decision, returned_results = runtime._run_until_named_tool(
+        provider,
+        "inspect",
+        executor,
+        target="submit_change_plan",
+        max_calls=2,
+        tool_results=results,
+    )
 
-    assert executor.calls == []
+    assert decision is submit
+    assert len(returned_results) == 2
+    assert [call.id for call in executor.calls] == ["read-2"]
+    assert provider.parallel_tool_call_violations == 1
 
 
-def test_change_reentry_counts_existing_results_and_parallel_violations() -> None:
+def test_change_reentry_counts_only_existing_and_new_executions() -> None:
     provider = _ParallelViolationProvider(
         ToolCall("read-2", "read_files", {"paths": ["other.py"]}),
         violations=0,
     )
     provider.parallel_tool_call_violations = 1
+    provider.decisions.append(FinalAnswer("done"))
     executor = _Executor()
     results = [ToolResult("read-1", "read_files", True, "first")]
 
@@ -406,10 +527,10 @@ def test_change_reentry_counts_existing_results_and_parallel_violations() -> Non
         tool_results=results,
     )
 
-    assert outcome.ok is False
-    assert outcome.tool_budget_exhausted is True
-    assert outcome.error == "model exceeded 2 repository tool calls"
-    assert executor.calls == []
+    assert outcome.ok is True
+    assert len(outcome.tool_results) == 2
+    assert [call.id for call in executor.calls] == ["read-2"]
+    assert provider.parallel_tool_call_violations == 1
 
 
 def test_named_tool_loop_accepts_target_after_repository_tool() -> None:
@@ -521,9 +642,426 @@ def test_model_loop_reports_tool_budget_and_repetition() -> None:
 
     assert exhausted.error == "model exceeded 0 repository tool calls"
     assert repeated.error == "model repeated an identical tool call"
-    assert len(repeated.tool_results) == 1
+    assert len(repeated.tool_results) == 2
+    assert runtime._tool_outcome(repeated.tool_results[-1]) == "invalid_args"
     assert progressed.ok is True
     assert len(progressed.tool_results) == 1
+
+
+def test_durable_model_loop_prevents_provider_calls_after_tool_budget() -> None:
+    no_budget_provider = _DecisionProvider(
+        ToolCall("read", "read_files", {"paths": ["app.py"]})
+    )
+    no_budget = runtime._run_model_loop(
+        no_budget_provider,
+        "implement",
+        _Executor(),
+        max_calls=0,
+        allow_terminal_response_after_budget=False,
+    )
+
+    assert no_budget.tool_budget_exhausted is True
+    assert no_budget_provider.calls == 0
+    assert no_budget.tool_results == ()
+
+    call = ToolCall("read", "read_files", {"paths": ["app.py"]})
+    exhausted_provider = _DecisionProvider(call, FinalAnswer("unneeded"))
+    exhausted = runtime._run_model_loop(
+        exhausted_provider,
+        "implement",
+        _Executor(),
+        max_calls=1,
+        allow_terminal_response_after_budget=False,
+    )
+
+    assert exhausted.tool_budget_exhausted is True
+    assert exhausted_provider.calls == 1
+    assert len(exhausted.tool_results) == 1
+    assert len(exhausted_provider.decisions) == 1
+
+
+def test_model_loop_retries_unknown_tool_without_resetting_provider_history() -> None:
+    class UnknownToolThenValidProvider(_DecisionProvider):
+        def __init__(self) -> None:
+            super().__init__(ToolCall("read", "read_files", {"paths": ["app.py"]}))
+            self.requests: list[tuple[str, tuple[ToolResult, ...]]] = []
+            self.first = True
+            self.recovered = 0
+
+        def next_step(self, task, results):
+            self.requests.append((task, results))
+            if self.first:
+                self.first = False
+                raise OpenAIUnknownToolError(
+                    "model requested an unknown or inactive tool"
+                )
+            return super().next_step(task, results)
+
+        def mark_unknown_tool_recovered(self) -> None:
+            self.recovered += 1
+
+    provider = UnknownToolThenValidProvider()
+    executor = _Executor()
+    before_response_calls: list[int] = []
+
+    outcome = runtime._run_model_loop(
+        provider,
+        "implement the repair",
+        executor,
+        max_calls=1,
+        allow_terminal_response_after_budget=False,
+        retry_unknown_tool=True,
+        before_response=lambda: before_response_calls.append(1),
+    )
+
+    assert outcome.tool_budget_exhausted is True
+    assert provider.calls == 1
+    assert len(provider.requests) == 2
+    assert provider.recovered == 1
+    assert before_response_calls == [1]
+    assert provider.requests[0] == provider.requests[1] == (
+        "implement the repair",
+        (),
+    )
+    assert [call.id for call in executor.calls] == ["read"]
+
+
+def test_model_loop_does_not_retry_unknown_tool_without_opt_in() -> None:
+    class UnknownToolProvider(_DecisionProvider):
+        def next_step(self, _task, _results):
+            self.calls += 1
+            raise OpenAIUnknownToolError(
+                "model requested an unknown or inactive tool"
+            )
+
+    provider = UnknownToolProvider()
+    with pytest.raises(OpenAIUnknownToolError, match="unknown or inactive tool"):
+        runtime._run_model_loop(
+            provider,
+            "implement",
+            _Executor(),
+            max_calls=1,
+            allow_terminal_response_after_budget=False,
+            before_response=lambda: pytest.fail(
+                "no retry budget check should run without explicit recovery"
+            ),
+        )
+
+    assert provider.calls == 1
+
+
+def test_durable_model_loop_fails_closed_after_second_unknown_tool() -> None:
+    class UnknownToolProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.recovered = 0
+
+        def next_step(self, _task, _results):
+            self.calls += 1
+            raise OpenAIUnknownToolError(
+                "model requested an unknown or inactive tool"
+            )
+
+        def mark_unknown_tool_recovered(self) -> None:
+            self.recovered += 1
+
+    provider = UnknownToolProvider()
+    executor = _Executor()
+    budget_checks: list[int] = []
+
+    with pytest.raises(OpenAIUnknownToolError, match="unknown or inactive tool"):
+        runtime._run_model_loop(
+            provider,
+            "implement",
+            executor,
+            max_calls=1,
+            retry_unknown_tool=True,
+            before_response=lambda: budget_checks.append(1),
+        )
+
+    assert provider.calls == 2
+    assert provider.recovered == 0
+    assert budget_checks == [1]
+    assert executor.calls == []
+
+
+def test_durable_model_loop_allows_only_one_unknown_recovery_per_phase() -> None:
+    class UnknownValidUnknownProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.recovered = 0
+
+        def next_step(self, _task, _results):
+            self.calls += 1
+            if self.calls == 1:
+                raise OpenAIUnknownToolError(
+                    "model requested an unknown or inactive tool"
+                )
+            if self.calls == 2:
+                return ToolCall("read", "read_files", {"paths": ["app.py"]})
+            raise OpenAIUnknownToolError(
+                "model requested an unknown or inactive tool"
+            )
+
+        def mark_unknown_tool_recovered(self) -> None:
+            self.recovered += 1
+
+    provider = UnknownValidUnknownProvider()
+    executor = _Executor()
+    budget_checks: list[int] = []
+
+    with pytest.raises(OpenAIUnknownToolError, match="unknown or inactive tool"):
+        runtime._run_model_loop(
+            provider,
+            "implement",
+            executor,
+            max_calls=2,
+            retry_unknown_tool=True,
+            before_response=lambda: budget_checks.append(1),
+        )
+
+    assert provider.calls == 3
+    assert provider.recovered == 1
+    assert budget_checks == [1, 1]
+    assert [call.id for call in executor.calls] == ["read"]
+
+
+def test_durable_model_loop_retries_malformed_tool_arguments_once() -> None:
+    class MalformedThenValidProvider(_DecisionProvider):
+        def __init__(self) -> None:
+            super().__init__(ToolCall("read", "read_files", {"paths": ["app.py"]}))
+            self.requests: list[tuple[str, tuple[ToolResult, ...]]] = []
+            self.malformed = True
+            self.recovered = 0
+
+        def next_step(self, task, results):
+            self.requests.append((task, results))
+            if self.malformed:
+                self.malformed = False
+                raise OpenAIToolArgumentsError("tool arguments is invalid JSON")
+            return super().next_step(task, results)
+
+        def mark_malformed_tool_arguments_recovered(self) -> None:
+            self.recovered += 1
+
+    provider = MalformedThenValidProvider()
+    executor = _Executor()
+    before_response_calls: list[int] = []
+
+    outcome = runtime._run_model_loop(
+        provider,
+        "implement",
+        executor,
+        max_calls=1,
+        allow_terminal_response_after_budget=False,
+        retry_unknown_tool=False,
+        retry_malformed_tool_arguments=True,
+        before_response=lambda: before_response_calls.append(1),
+    )
+
+    assert outcome.tool_budget_exhausted is True
+    assert len(provider.requests) == 2
+    assert provider.recovered == 1
+    assert before_response_calls == [1]
+    assert provider.requests[0] == provider.requests[1] == ("implement", ())
+    assert [call.id for call in executor.calls] == ["read"]
+
+
+def test_durable_model_loop_fails_closed_after_second_malformed_arguments() -> None:
+    class MalformedProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def next_step(self, _task, _results):
+            self.calls += 1
+            raise OpenAIToolArgumentsError("tool arguments is invalid JSON")
+
+    provider = MalformedProvider()
+    budget_checks: list[int] = []
+
+    with pytest.raises(OpenAIToolArgumentsError, match="invalid JSON"):
+        runtime._run_model_loop(
+            provider,
+            "implement",
+            _Executor(),
+            max_calls=1,
+            retry_malformed_tool_arguments=True,
+            before_response=lambda: budget_checks.append(1),
+        )
+
+    assert provider.calls == 2
+    assert budget_checks == [1]
+
+
+def test_malformed_arguments_retry_stops_before_http_when_budget_is_exhausted() -> None:
+    class MalformedProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def next_step(self, _task, _results):
+            self.calls += 1
+            raise OpenAIToolArgumentsError("tool arguments is invalid JSON")
+
+    provider = MalformedProvider()
+    with pytest.raises(runtime._PhaseBudgetExhausted):
+        runtime._run_model_loop(
+            provider,
+            "implement",
+            _Executor(),
+            max_calls=1,
+            retry_malformed_tool_arguments=True,
+            before_response=lambda: (_ for _ in ()).throw(
+                runtime._PhaseBudgetExhausted("budget exhausted")
+            ),
+        )
+
+    assert provider.calls == 1
+
+
+def test_unknown_tool_retry_stops_before_second_request_when_budget_is_exhausted() -> None:
+    class UnknownToolProvider(_DecisionProvider):
+        def next_step(self, _task, _results):
+            self.calls += 1
+            raise OpenAIUnknownToolError(
+                "model requested an unknown or inactive tool"
+            )
+
+    provider = UnknownToolProvider()
+    with pytest.raises(runtime._PhaseBudgetExhausted):
+        runtime._run_model_loop(
+            provider,
+            "implement",
+            _Executor(),
+            max_calls=1,
+            retry_unknown_tool=True,
+            before_response=lambda: (_ for _ in ()).throw(
+                runtime._PhaseBudgetExhausted("budget exhausted")
+            ),
+        )
+
+    assert provider.calls == 1
+
+
+def test_model_loop_does_not_execute_a_tool_after_response_time_cancellation() -> None:
+    cancelled = False
+    executor = _Executor()
+
+    class CancellingProvider(_DecisionProvider):
+        def next_step(self, task, results):
+            nonlocal cancelled
+            decision = super().next_step(task, results)
+            cancelled = True
+            return decision
+
+    def check_cancelled() -> None:
+        if cancelled:
+            raise runtime.WorkflowCancelled("run was cancelled")
+
+    with pytest.raises(runtime.WorkflowCancelled, match="run was cancelled"):
+        runtime._run_model_loop(
+            CancellingProvider(
+                ToolCall("read", "read_files", {"paths": ["app.py"]})
+            ),
+            "task",
+            executor,
+            max_calls=1,
+            check_cancelled=check_cancelled,
+        )
+
+    assert executor.calls == []
+
+
+@pytest.mark.parametrize("has_required_regression_test", (True, False))
+def test_model_loop_stops_after_successful_patch_only_for_verifiable_candidate(
+    has_required_regression_test: bool,
+) -> None:
+    provider = _DecisionProvider(
+        ToolCall("patch", "apply_patch", {"unified_diff": "patch text"}),
+        FinalAnswer("continued because the candidate is incomplete"),
+    )
+    checks: list[bool] = []
+
+    outcome = runtime._run_model_loop(
+        provider,
+        "task",
+        _Executor(),
+        max_calls=1,
+        stop_after_successful_tool="apply_patch",
+        stop_after_successful_tool_check=lambda: (
+            checks.append(has_required_regression_test)
+            or has_required_regression_test
+        ),
+    )
+
+    assert len(outcome.tool_results) == 1
+    assert checks == [has_required_regression_test]
+    if has_required_regression_test:
+        assert outcome.ok is True
+        assert outcome.summary == "candidate submitted for independent verification"
+        assert len(provider.decisions) == 1
+    else:
+        assert outcome.ok is False
+        assert outcome.error == (
+            "model returned text before submitting a verifiable candidate"
+        )
+        assert provider.decisions == []
+
+
+def test_model_loop_skips_result_transform_for_terminal_patch() -> None:
+    provider = _DecisionProvider(
+        ToolCall("patch", "apply_patch", {"unified_diff": "patch text"}),
+    )
+
+    def unexpected_transform(_result):
+        raise AssertionError("terminal patch must not consume continuation budget")
+
+    outcome = runtime._run_model_loop(
+        provider,
+        "task",
+        _Executor(),
+        max_calls=1,
+        allow_terminal_response_after_budget=False,
+        stop_after_successful_tool="apply_patch",
+        stop_after_successful_tool_check=lambda: True,
+        result_transform=unexpected_transform,
+    )
+
+    assert outcome.ok is True
+    assert len(outcome.tool_results) == 1
+    assert provider.calls == 1
+
+
+def test_repair_loop_feeds_no_effect_error_back_before_accepting_correction() -> None:
+    class RecordingProvider(_DecisionProvider):
+        def __init__(self, *decisions) -> None:
+            super().__init__(*decisions)
+            self.results_seen: list[tuple[ToolResult, ...]] = []
+
+        def next_step(self, task, results):
+            self.results_seen.append(tuple(results))
+            return super().next_step(task, results)
+
+    provider = RecordingProvider(
+        ToolCall("no-effect", "apply_patch", {"unified_diff": "same"}),
+        ToolCall("corrected", "apply_patch", {"unified_diff": "fixed"}),
+    )
+    executor = _NoEffectThenCorrectionExecutor()
+
+    outcome = runtime._run_model_loop(
+        provider,
+        "repair",
+        executor,
+        max_calls=2,
+        allow_terminal_response_after_budget=False,
+        stop_after_successful_tool="apply_patch",
+        stop_after_successful_tool_check=lambda: True,
+    )
+
+    assert outcome.ok is True
+    assert [call.id for call in executor.calls] == ["no-effect", "corrected"]
+    assert "no effective change" in (provider.results_seen[1][-1].error or "")
+    assert executor.workspace_revision == 1
+    assert outcome.summary == "candidate submitted for independent verification"
 
 
 def test_run_budget_aggregates_only_valid_model_events(operations_bundle) -> None:
@@ -556,6 +1094,35 @@ def test_run_budget_aggregates_only_valid_model_events(operations_bundle) -> Non
         runtime.MAX_RUN_TOOL_CALLS - 7,
         None,
     )
+
+
+def test_run_budget_prefers_executed_tool_calls_over_telemetry_total(
+    operations_bundle,
+) -> None:
+    operations, database, _artifacts, record = operations_bundle
+    database.append_event(
+        record.run_id,
+        {
+            "event": "model_tool_summary",
+            "phase": "implement",
+            "executed_tool_calls": 2,
+            "tool_calls": 8,
+            "parallel_tool_call_violations": 6,
+            "model_usage": {"complete": True, "total_tokens": 100},
+        },
+    )
+
+    assert operations._model_budget(_context(record, "implement")) == (
+        runtime.MAX_RUN_TOOL_CALLS - 2,
+        100,
+    )
+    assert operations._phase_model_budget(
+        _context(record, "implement"),
+        phases=frozenset({"implement", "repair"}),
+        tool_limit=runtime.MAX_CHANGE_TOOL_CALLS,
+        token_limit=runtime.MAX_CHANGE_TOKENS,
+        label="change",
+    ) == (runtime.MAX_CHANGE_TOOL_CALLS - 2, 100)
 
 
 @pytest.mark.parametrize(
@@ -802,9 +1369,10 @@ def test_fixed_phase_budgets_do_not_borrow_between_phases(operations_bundle) -> 
     assert runtime.MAX_RUN_TOKENS == 30_000
     assert runtime.MAX_PLANNING_TOOL_CALLS == 2
     assert runtime.MAX_CHANGE_TOOL_CALLS == 8
-    change_tool_names = {definition.name for definition in runtime._change_tools()}
-    assert "read_files" in change_tool_names
-    assert "run_check" not in change_tool_names
+    change_tool_names = tuple(
+        definition.name for definition in runtime._change_tools()
+    )
+    assert change_tool_names == ("read_files", "write_files")
 
     database.append_event(
         record.run_id,
@@ -832,15 +1400,6 @@ def test_fixed_phase_budgets_do_not_borrow_between_phases(operations_bundle) -> 
         label="change",
     )
     assert (remaining, tokens) == (8, 0)
-
-
-def test_planning_exposes_only_batched_reads_before_plan_submission() -> None:
-    planning_tool_names = [
-        definition.name
-        for definition in (*runtime._read_only_tools(), runtime.PLAN_TOOL)
-    ]
-
-    assert planning_tool_names == ["read_files", "submit_change_plan"]
 
 
 def test_implement_and_repair_share_budget_while_review_remains_isolated(
@@ -884,18 +1443,21 @@ def test_next_response_estimate_includes_provider_replay_bytes(
     operations, _database, _artifacts, _record_value = operations_bundle
     result = ToolResult("read", "read_file", True, "多字节 output")
     response_budgets: list[int] = []
+    input_estimates: list[int] = []
     provider = SimpleNamespace(
         usage=SimpleNamespace(complete=True, total_tokens=1_000),
         last_response_usage=SimpleNamespace(complete=True, total_tokens=100),
         pending_internal_tool_result_bytes=37,
         set_response_token_budget=response_budgets.append,
+        set_next_response_input_token_estimate=input_estimates.append,
     )
     estimate = runtime._next_response_token_estimate(
         provider, (result,), require_complete=True
     )
+    result_bytes = tool_result_replay_bytes(result)
     assert estimate == (
         100
-        + len(runtime._json(runtime.asdict(result)).encode("utf-8"))
+        + result_bytes
         + 37
         + runtime.NEXT_RESPONSE_TOKEN_MARGIN
     )
@@ -908,6 +1470,7 @@ def test_next_response_estimate_includes_provider_replay_bytes(
         new_tool_results=(result,),
     )
     assert response_budgets == [estimate]
+    assert input_estimates == [estimate]
     with pytest.raises(runtime._PhaseBudgetExhausted, match="predicted next"):
         operations._enforce_next_model_response(
             0,
@@ -919,9 +1482,64 @@ def test_next_response_estimate_includes_provider_replay_bytes(
         )
 
 
+def test_local_openai_usage_gap_stops_before_an_uncapped_follow_up(
+    operations_bundle,
+) -> None:
+    operations, _database, _artifacts, _record_value = operations_bundle
+    response_budgets: list[int] = []
+    provider = SimpleNamespace(
+        usage=SimpleNamespace(
+            response_count=1,
+            reported_response_count=0,
+            input_tokens=None,
+            cached_input_tokens=None,
+            output_tokens=None,
+            total_tokens=None,
+            complete=False,
+        ),
+        last_response_usage=SimpleNamespace(
+            response_count=1,
+            reported_response_count=0,
+            total_tokens=None,
+            complete=False,
+        ),
+        set_response_token_budget=response_budgets.append,
+    )
+
+    with pytest.raises(RuntimeError, match="model token usage is incomplete"):
+        operations._enforce_next_model_response(
+            0,
+            provider,
+            phase_prior_tokens=0,
+            phase_token_limit=runtime.MAX_CHANGE_TOKENS,
+            phase_label="change",
+            new_tool_results=(
+                ToolResult("read", "read_files", True, "evidence"),
+            ),
+            reserved_run_tokens=runtime.MAX_REVIEW_TOKENS,
+        )
+
+    assert response_budgets == []
+
+
+def test_request_not_started_requires_an_explicit_request_counter() -> None:
+    unknown = SimpleNamespace(
+        usage=SimpleNamespace(response_count=0, complete=False)
+    )
+    responded = SimpleNamespace(
+        usage=SimpleNamespace(response_count=1, complete=False)
+    )
+
+    assert runtime._provider_request_count(unknown) is None
+    assert runtime._provider_request_count(responded) == 1
+    assert runtime._provider_request_count(
+        SimpleNamespace(request_count=0, usage=unknown.usage)
+    ) == 0
+
+
 def test_tool_result_fit_reserves_provider_replay_bytes() -> None:
     result = ToolResult("read", "read_files", True, "x" * 1_000)
-    maximum_result_bytes = 200
+    maximum_result_bytes = 300
     current_tokens = 100
     last_tokens = 10
     pending_bytes = 50
@@ -944,16 +1562,133 @@ def test_tool_result_fit_reserves_provider_replay_bytes() -> None:
         prior_tokens=0,
         phase_prior_tokens=0,
         phase_token_limit=phase_limit,
-        phase_label="planning",
+        phase_label="change",
         reserved_run_tokens=runtime.MAX_REVIEW_TOKENS,
         require_complete=True,
     )
 
     assert fitted.truncated is True
-    assert len(runtime._json(runtime.asdict(fitted)).encode("utf-8")) <= 200
+    assert tool_result_replay_bytes(fitted) <= (
+        (
+            phase_limit
+            - current_tokens
+            - last_tokens
+            - pending_bytes
+            - runtime.NEXT_RESPONSE_TOKEN_MARGIN
+        )
+    )
 
 
-def test_observed_planning_usage_and_batch_read_leave_capacity_for_plan(
+def test_ascii_tool_result_near_limit_fails_before_provider_request(
+    operations_bundle,
+) -> None:
+    operations, _database, _artifacts, _record_value = operations_bundle
+    result = ToolResult("read", "read_files", True, "x" * 3_000)
+    legacy_json_bytes = len(runtime._json(runtime.asdict(result)).encode("utf-8"))
+    result_bytes = tool_result_replay_bytes(result)
+    current_tokens = 19_000
+    last_tokens = 500
+    response_budgets: list[int] = []
+    provider = SimpleNamespace(
+        usage=SimpleNamespace(complete=True, total_tokens=current_tokens),
+        last_response_usage=SimpleNamespace(
+            complete=True,
+            total_tokens=last_tokens,
+        ),
+        set_response_token_budget=response_budgets.append,
+    )
+
+    legacy_estimate = (
+        last_tokens
+        + runtime._bytes_to_estimated_tokens(legacy_json_bytes)
+        + runtime.NEXT_RESPONSE_TOKEN_MARGIN
+    )
+    assert current_tokens + legacy_estimate <= runtime.MAX_CHANGE_TOKENS
+    assert (
+        current_tokens
+        + last_tokens
+        + result_bytes
+        + runtime.NEXT_RESPONSE_TOKEN_MARGIN
+        > runtime.MAX_CHANGE_TOKENS
+    )
+
+    with pytest.raises(runtime._PhaseBudgetExhausted, match="predicted next"):
+        operations._enforce_next_model_response(
+            0,
+            provider,
+            phase_prior_tokens=0,
+            phase_token_limit=runtime.MAX_CHANGE_TOKENS,
+            phase_label="change",
+            soft_phase_boundary=True,
+            new_tool_results=(result,),
+            reserved_run_tokens=runtime.MAX_REVIEW_TOKENS,
+        )
+
+    assert response_budgets == []
+
+
+def test_extreme_unicode_replay_is_charged_and_blocked_before_provider_request(
+    operations_bundle,
+) -> None:
+    operations, _database, _artifacts, _record_value = operations_bundle
+    result = ToolResult(
+        "unicode-read",
+        "read_files",
+        True,
+        "\U0001f600" * 4_096,
+        exit_code=0,
+    )
+    assert len(result.output.encode("utf-8")) == 16 * 1_024
+
+    unescaped_json_bytes = len(
+        runtime._json(runtime.asdict(result)).encode("utf-8")
+    )
+    replay_bytes = tool_result_replay_bytes(result)
+    pending_bytes = 29
+    last_tokens = 100
+    current_tokens = 1_000
+    response_budgets: list[int] = []
+    input_estimates: list[int] = []
+    provider = SimpleNamespace(
+        usage=SimpleNamespace(complete=True, total_tokens=current_tokens),
+        last_response_usage=SimpleNamespace(
+            complete=True,
+            total_tokens=last_tokens,
+        ),
+        pending_internal_tool_result_bytes=pending_bytes,
+        set_response_token_budget=response_budgets.append,
+        set_next_response_input_token_estimate=input_estimates.append,
+    )
+
+    estimate = runtime._next_response_token_estimate(
+        provider,
+        (result,),
+        require_complete=True,
+    )
+
+    assert replay_bytes > unescaped_json_bytes * 3
+    assert estimate == (
+        last_tokens
+        + replay_bytes
+        + pending_bytes
+        + runtime.NEXT_RESPONSE_TOKEN_MARGIN
+    )
+    with pytest.raises(runtime._PhaseBudgetExhausted, match="predicted next"):
+        operations._enforce_next_model_response(
+            0,
+            provider,
+            phase_prior_tokens=0,
+            phase_token_limit=current_tokens + estimate - 1,
+            phase_label="change",
+            soft_phase_boundary=True,
+            new_tool_results=(result,),
+        )
+
+    assert response_budgets == []
+    assert input_estimates == []
+
+
+def test_observed_change_usage_and_batch_read_leave_capacity_for_follow_up(
     operations_bundle,
 ) -> None:
     operations, _database, _artifacts, _record_value = operations_bundle
@@ -964,8 +1699,8 @@ def test_observed_planning_usage_and_batch_read_leave_capacity_for_plan(
         "x" * 1_225,
         exit_code=0,
     )
-    result_bytes = len(runtime._json(runtime.asdict(result)).encode("utf-8"))
-    assert 1_300 <= result_bytes <= 1_350
+    result_bytes = tool_result_replay_bytes(result)
+    assert 1_350 <= result_bytes <= 1_400
     first_response_tokens = 600
     response_budgets: list[int] = []
     provider = SimpleNamespace(
@@ -985,23 +1720,158 @@ def test_observed_planning_usage_and_batch_read_leave_capacity_for_plan(
         0,
         provider,
         phase_prior_tokens=0,
-        phase_token_limit=runtime.MAX_PLANNING_TOKENS,
-        phase_label="planning",
+        phase_token_limit=runtime.MAX_CHANGE_TOKENS,
+        phase_label="change",
         new_tool_results=(result,),
         reserved_run_tokens=runtime.MAX_REVIEW_TOKENS,
     )
 
     assert response_budgets == [
-        runtime.MAX_PLANNING_TOKENS - first_response_tokens
+        runtime.MAX_CHANGE_TOKENS - first_response_tokens
     ]
 
 
-def test_planning_truncates_observed_batch_result_before_provider_history(
+def test_planning_is_one_forced_response_without_repository_tool_execution(
+    operations_bundle,
+) -> None:
+    operations, database, _artifacts, record = operations_bundle
+    definitions_seen: list[tuple[runtime.ToolDefinition, ...]] = []
+
+    class ObservedPlanningProvider:
+        def __init__(self) -> None:
+            self.usage = SimpleNamespace(
+                response_count=0,
+                reported_response_count=0,
+                input_tokens=None,
+                cached_input_tokens=None,
+                output_tokens=None,
+                total_tokens=None,
+                complete=False,
+            )
+            self.last_response_usage = None
+            self.response_token_budgets: list[int] = []
+            self.forced_tool_choices: list[str] = []
+            self.requests: list[tuple[str, tuple[ToolResult, ...]]] = []
+
+        def set_response_token_budget(self, total_tokens: int) -> None:
+            self.response_token_budgets.append(total_tokens)
+
+        def set_forced_tool_choice(self, tool_name: str) -> None:
+            self.forced_tool_choices.append(tool_name)
+
+        def next_step(
+            self, task: str, results: tuple[ToolResult, ...]
+        ) -> ToolCall:
+            self.requests.append((task, results))
+            self.usage = SimpleNamespace(
+                response_count=1,
+                reported_response_count=1,
+                input_tokens=840,
+                cached_input_tokens=0,
+                output_tokens=33,
+                total_tokens=873,
+                complete=True,
+            )
+            self.last_response_usage = SimpleNamespace(
+                total_tokens=873,
+                complete=True,
+            )
+            return ToolCall(
+                "plan",
+                "submit_change_plan",
+                {
+                    "goal": "repair",
+                    "files": ["app.py"],
+                    "steps": ["change the implementation"],
+                    "checks": ["pytest"],
+                    "risks": [],
+                },
+            )
+
+    provider = ObservedPlanningProvider()
+
+    def provider_factory(definitions, *_args):
+        definitions_seen.append(tuple(definitions))
+        return provider
+
+    operations._provider_factory = provider_factory
+    operations._repository_map = lambda _context: "repository map"
+    operations._tool_executor = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("planning must not create a repository tool executor")
+    )
+
+    plan = operations.inspect_and_plan(
+        _context(record, "inspect_and_plan", suffix="single-response")
+    )
+
+    assert plan.goal == "repair"
+    assert definitions_seen == [(runtime.PLAN_TOOL,)]
+    assert len(provider.requests) == 1
+    assert "R:\nrepository map" in provider.requests[0][0]
+    assert provider.requests[0][1] == ()
+    assert provider.response_token_budgets == [runtime.MAX_PLANNING_TOKENS]
+    assert provider.forced_tool_choices == ["submit_change_plan"]
+    summary = _only_model_summary(database, record.run_id)
+    assert summary["executed_tool_calls"] == 0
+    assert summary["tool_calls"] == 0
+
+
+def test_planning_discards_a_decision_returned_after_cancellation(
     operations_bundle,
 ) -> None:
     operations, _database, _artifacts, record = operations_bundle
+    provider = _DecisionProvider(
+        ToolCall(
+            "plan",
+            "submit_change_plan",
+            {
+                "goal": "repair",
+                "files": ["app.py"],
+                "steps": ["change the implementation"],
+                "checks": ["pytest"],
+                "risks": [],
+            },
+        )
+    )
+    next_step = provider.next_step
 
-    class ObservedPlanningProvider:
+    def cancel_during_response(task, results):
+        decision = next_step(task, results)
+        operations.cancel_event.set()
+        return decision
+
+    provider.next_step = cancel_during_response  # type: ignore[method-assign]
+    operations._provider_factory = lambda *_args: provider
+    operations._repository_map = lambda _context: "repository map"
+
+    with pytest.raises(runtime.WorkflowCancelled, match="run was cancelled"):
+        operations.inspect_and_plan(
+            _context(record, "inspect_and_plan", suffix="cancelled-response")
+        )
+
+    assert provider.forced_tool_choices == ["submit_change_plan"]
+
+
+def test_change_truncates_tool_result_before_provider_history(
+    operations_bundle,
+) -> None:
+    operations, _database, _artifacts, record = operations_bundle
+    repository = Path(record.repo_path)
+    (repository / "pyproject.toml").write_text(
+        "[project]\nname='fixture'\nversion='0.1.0'\n",
+        encoding="utf-8",
+    )
+    patch = (
+        "diff --git a/tests/test_change_regression.py "
+        "b/tests/test_change_regression.py\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/tests/test_change_regression.py\n"
+        "@@ -0,0 +1 @@\n"
+        "+def test_regression(): assert True\n"
+    )
+
+    class ObservedChangeProvider:
         def __init__(self) -> None:
             self.usage = SimpleNamespace(
                 response_count=0,
@@ -1025,7 +1895,7 @@ def test_planning_truncates_observed_batch_result_before_provider_history(
 
         def next_step(
             self, _task: str, results: tuple[ToolResult, ...]
-        ) -> ToolCall:
+        ) -> ToolCall | FinalAnswer:
             self.result_histories.append(results)
             if len(self.result_histories) == 1:
                 self.usage = SimpleNamespace(
@@ -1056,54 +1926,464 @@ def test_planning_truncates_observed_batch_result_before_provider_history(
                 total_tokens=1_127,
                 complete=True,
             )
-            return ToolCall(
-                "plan",
-                "submit_change_plan",
-                {
-                    "goal": "repair",
-                    "files": ["app.py"],
-                    "steps": ["change the implementation"],
-                    "checks": ["pytest"],
-                    "risks": [],
-                },
-            )
+            if len(self.result_histories) == 2:
+                return ToolCall(
+                    "patch",
+                    "write_files",
+                    {"files": [{"path": "app.py", "content": "changed\n"}]},
+                )
+            raise AssertionError("successful write_files must end the model loop")
 
-    provider = ObservedPlanningProvider()
+    provider = ObservedChangeProvider()
     executor = _Executor()
     executor.execute = lambda decision: ToolResult(  # type: ignore[method-assign]
         decision.id,
         decision.name,
         True,
-        "x" * 2_000,
+        "x" * 100_000 if decision.name == "read_files" else "patched",
         exit_code=0,
     )
-    operations._provider_factory = lambda *_args: provider
-    operations._repository_map = lambda _context: "repository map"
-    operations._sandbox = lambda *_args, **_kwargs: _CandidateSandbox(None)
+    candidate = CandidateArtifact(
+        "a" * 40,
+        1,
+        ("tests/test_change_regression.py",),
+        patch,
+    )
+    definitions_seen: list[tuple[str, ...]] = []
+
+    def provider_factory(definitions, *_args):
+        definitions_seen.append(tuple(item.name for item in definitions))
+        return provider
+
+    operations._provider_factory = provider_factory
+    operations._sandbox = lambda *_args, **_kwargs: _CandidateSandbox(candidate)
     operations._tool_executor = lambda *_args, **_kwargs: executor
 
-    plan = operations.inspect_and_plan(
-        _context(record, "inspect_and_plan", suffix="trim-observed-result")
+    outcome = operations.implement(
+        _context(record, "implement", suffix="trim-change-result")
     )
 
     delivered = provider.result_histories[1][0]
     maximum_result_bytes = (
-        runtime.MAX_PLANNING_TOKENS
+        runtime.MAX_CHANGE_TOKENS
         - 873
         - 873
         - runtime.NEXT_RESPONSE_TOKEN_MARGIN
     )
-    assert plan.goal == "repair"
+    assert outcome.ok is True
+    assert outcome.summary == "candidate submitted for independent verification"
+    assert definitions_seen == [("read_files", "write_files")]
+    assert provider.forced_tool_choices == ["read_files", "read_files"]
+    assert len(provider.result_histories) == 2
     assert delivered.truncated is True
     assert delivered.output.endswith(runtime._PLANNING_TOOL_RESULT_TRUNCATION_MARKER)
-    assert len(runtime._json(runtime.asdict(delivered)).encode("utf-8")) == (
-        maximum_result_bytes
+    assert tool_result_replay_bytes(delivered) == maximum_result_bytes
+
+
+def test_change_allows_phase_tools_after_the_initial_read(
+    operations_bundle,
+) -> None:
+    operations, _database, _artifacts, record = operations_bundle
+    repository = Path(record.repo_path)
+    (repository / "pyproject.toml").write_text(
+        "[project]\nname='fixture'\nversion='0.1.0'\n",
+        encoding="utf-8",
     )
-    assert provider.response_token_budgets == [
-        runtime.MAX_PLANNING_TOKENS,
-        runtime.MAX_PLANNING_TOKENS - 873,
+    patch = (
+        "diff --git a/tests/test_tool_state_regression.py "
+        "b/tests/test_tool_state_regression.py\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/tests/test_tool_state_regression.py\n"
+        "@@ -0,0 +1 @@\n"
+        "+def test_regression(): assert True\n"
+    )
+    provider = _DecisionProvider(
+        ToolCall("read-bad", "read_files", {"paths": []}),
+        ToolCall("read-good", "read_files", {"paths": ["app.py"]}),
+        ToolCall("patch-bad", "write_files", {"files": []}),
+        ToolCall(
+            "patch-good",
+            "write_files",
+            {"files": [{"path": "app.py", "content": "changed\n"}]},
+        ),
+    )
+
+    class ScriptedExecutor:
+        workspace_revision = 0
+        mutation_persistence_failed = False
+
+        def __init__(self) -> None:
+            self.calls: list[ToolCall] = []
+            self.outcomes = iter((False, True, False, True))
+
+        def execute(self, decision: ToolCall) -> ToolResult:
+            self.calls.append(decision)
+            ok = next(self.outcomes)
+            return ToolResult(
+                decision.id,
+                decision.name,
+                ok,
+                "ok" if ok else "",
+                error=None if ok else "rejected",
+            )
+
+    executor = ScriptedExecutor()
+    candidate = CandidateArtifact(
+        "a" * 40,
+        1,
+        ("tests/test_tool_state_regression.py",),
+        patch,
+    )
+    operations._provider_factory = lambda *_args: provider
+    operations._sandbox = lambda *_args, **_kwargs: _CandidateSandbox(candidate)
+    operations._tool_executor = lambda *_args, **_kwargs: executor
+
+    outcome = operations.implement(
+        _context(record, "implement", suffix="tool-state-retries")
+    )
+
+    assert outcome.ok is True
+    assert [call.id for call in executor.calls] == [
+        "read-bad",
+        "read-good",
+        "patch-bad",
+        "patch-good",
     ]
-    assert provider.forced_tool_choices == ["submit_change_plan"]
+    assert provider.forced_tool_choices == [
+        "read_files",
+        "read_files",
+        "write_files",
+        "write_files",
+    ]
+    assert provider.decisions == []
+
+
+def test_change_recovers_missing_complete_read_before_retrying_write(
+    operations_bundle,
+) -> None:
+    operations, _database, _artifacts, record = operations_bundle
+    repository = Path(record.repo_path)
+    (repository / "pyproject.toml").write_text(
+        "[project]\nname='fixture'\nversion='0.1.0'\n",
+        encoding="utf-8",
+    )
+    patch = (
+        "diff --git a/tests/test_tool_state_regression.py "
+        "b/tests/test_tool_state_regression.py\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/tests/test_tool_state_regression.py\n"
+        "@@ -0,0 +1 @@\n"
+        "+def test_regression(): assert True\n"
+    )
+    provider = _DecisionProvider(
+        ToolCall("read-main", "read_files", {"paths": ["app.py"]}),
+        ToolCall(
+            "write-unread",
+            "write_files",
+            {"files": [{"path": "package/__init__.py", "content": "value = 1\n"}]},
+        ),
+        ToolCall(
+            "read-missing",
+            "read_files",
+            {"paths": ["package/__init__.py"]},
+        ),
+        ToolCall(
+            "write-good",
+            "write_files",
+            {"files": [{"path": "app.py", "content": "changed\n"}]},
+        ),
+    )
+
+    class ScriptedExecutor:
+        workspace_revision = 0
+        mutation_persistence_failed = False
+
+        def __init__(self) -> None:
+            self.calls: list[ToolCall] = []
+
+        def execute(self, decision: ToolCall) -> ToolResult:
+            self.calls.append(decision)
+            if decision.id == "write-unread":
+                return ToolResult(
+                    decision.id,
+                    decision.name,
+                    False,
+                    "",
+                    error=(
+                        "ValueError: write_files target must be read completely "
+                        "before editing: package/__init__.py"
+                    ),
+                )
+            return ToolResult(decision.id, decision.name, True, "ok")
+
+    executor = ScriptedExecutor()
+    candidate = CandidateArtifact(
+        "a" * 40,
+        1,
+        ("tests/test_tool_state_regression.py",),
+        patch,
+    )
+    operations._provider_factory = lambda *_args: provider
+    operations._sandbox = lambda *_args, **_kwargs: _CandidateSandbox(candidate)
+    operations._tool_executor = lambda *_args, **_kwargs: executor
+
+    outcome = operations.implement(
+        _context(record, "implement", suffix="missing-complete-read")
+    )
+
+    assert outcome.ok is True
+    assert [call.id for call in executor.calls] == [
+        "read-main",
+        "write-unread",
+        "read-missing",
+        "write-good",
+    ]
+    assert provider.forced_tool_choices == [
+        "read_files",
+        "write_files",
+        "read_files",
+        "write_files",
+    ]
+
+
+def test_change_rejects_candidate_without_required_regression_test(
+    operations_bundle,
+) -> None:
+    operations, _database, artifacts, record = operations_bundle
+    repository = Path(record.repo_path)
+    (repository / "pyproject.toml").write_text(
+        "[project]\nname='fixture'\nversion='0.1.0'\n",
+        encoding="utf-8",
+    )
+    patch = (
+        "diff --git a/app.py b/app.py\n"
+        "--- a/app.py\n"
+        "+++ b/app.py\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n"
+    )
+    candidate = CandidateArtifact("a" * 40, 1, ("app.py",), patch)
+    provider = _DecisionProvider(
+        ToolCall("read", "read_files", {"paths": ["app.py"]}),
+        ToolCall(
+            "patch",
+            "write_files",
+            {"files": [{"path": "app.py", "content": "changed\n"}]},
+        ),
+        FinalAnswer("done"),
+    )
+    operations._provider_factory = lambda *_args: provider
+    operations._sandbox = lambda *_args, **_kwargs: _CandidateSandbox(candidate)
+    operations._tool_executor = lambda *_args, **_kwargs: _Executor()
+
+    outcome = operations.implement(
+        _context(record, "implement", suffix="missing-regression-test")
+    )
+
+    assert outcome.ok is False
+    assert outcome.error == "candidate patch does not add the required regression test"
+    assert provider.forced_tool_choices == [
+        "read_files",
+        "write_files",
+        "write_files",
+    ]
+    assert artifacts.path(record.run_id, "patch").read_text(encoding="utf-8") == ""
+
+
+def test_candidate_regression_contract_is_python_only(monkeypatch) -> None:
+    def unexpected_profile_detection(_repo_path):
+        raise AssertionError("candidate validation must not detect a check profile")
+
+    monkeypatch.setattr(runtime, "detect_check_profile", unexpected_profile_detection)
+    expected_by_path = {
+        "tests/test_value_regression.py": True,
+        "tests/unit/test_value_regression.py": False,
+        "tests/test_value.py": False,
+        "src/test/java/FooRegressionTest.java": False,
+    }
+
+    for path, expected in expected_by_path.items():
+        patch = (
+            f"diff --git a/{path} b/{path}\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            f"+++ b/{path}\n"
+            "@@ -0,0 +1 @@\n"
+            "+def test_regression(): assert True\n"
+        )
+        candidate = CandidateArtifact("a" * 40, 1, (path,), patch)
+
+        assert runtime._candidate_has_required_regression_test(
+            candidate, "unused"
+        ) is expected
+
+
+def test_candidate_scope_allows_approved_paths_and_new_regression_only() -> None:
+    plan = ChangePlan(
+        goal="Repair the application",
+        files=("app.py",),
+        steps=("Update the approved implementation file.",),
+        checks=("pytest",),
+    )
+
+    def candidate_for(path: str) -> CandidateArtifact:
+        patch = (
+            f"diff --git a/{path} b/{path}\n"
+            f"--- a/{path}\n"
+            f"+++ b/{path}\n"
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            "+new\n"
+            "diff --git a/tests/test_app_regression.py "
+            "b/tests/test_app_regression.py\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            "+++ b/tests/test_app_regression.py\n"
+            "@@ -0,0 +1 @@\n"
+            "+def test_regression(): assert True\n"
+        )
+        return CandidateArtifact(
+            "a" * 40,
+            1,
+            (path, "tests/test_app_regression.py"),
+            patch,
+        )
+
+    assert runtime._candidate_paths_outside_approved_scope(
+        candidate_for("app.py"), plan
+    ) == ()
+    assert runtime._candidate_paths_outside_approved_scope(
+        candidate_for("unplanned.py"), plan
+    ) == ("unplanned.py",)
+    assert runtime._candidate_paths_outside_approved_scope(
+        candidate_for("unplanned.py"), None
+    ) == ()
+
+
+def test_change_rejects_candidate_outside_approved_scope(
+    operations_bundle, monkeypatch
+) -> None:
+    operations, _database, artifacts, record = operations_bundle
+    record = record.model_copy(
+        update={
+            "plan": ChangePlan(
+                goal="Repair the application",
+                files=("app.py",),
+                steps=("Only update the approved implementation file.",),
+                checks=("pytest",),
+            )
+        }
+    )
+    patch = (
+        "diff --git a/unplanned.py b/unplanned.py\n"
+        "--- a/unplanned.py\n"
+        "+++ b/unplanned.py\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n"
+        "diff --git a/tests/test_app_regression.py "
+        "b/tests/test_app_regression.py\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/tests/test_app_regression.py\n"
+        "@@ -0,0 +1 @@\n"
+        "+def test_regression(): assert True\n"
+    )
+    candidate = CandidateArtifact(
+        "a" * 40,
+        1,
+        ("unplanned.py", "tests/test_app_regression.py"),
+        patch,
+    )
+    _stub_change_execution(monkeypatch, operations, _CandidateSandbox(candidate))
+
+    outcome = operations.implement(
+        _context(record, "implement", suffix="scope-violation")
+    )
+
+    assert outcome.ok is False
+    assert outcome.error == (
+        "candidate changed paths outside the approved plan: unplanned.py"
+    )
+    assert outcome.detail["failure_status"] == "policy_denied"
+    assert outcome.detail["failure_code"] == "candidate_scope_violation"
+    assert artifacts.path(record.run_id, "patch").read_text(encoding="utf-8") == ""
+
+
+def test_change_terminal_candidate_avoids_unfittable_tool_result(
+    operations_bundle,
+) -> None:
+    operations, _database, artifacts, record = operations_bundle
+    repository = Path(record.repo_path)
+    (repository / "pyproject.toml").write_text(
+        "[project]\nname='fixture'\nversion='0.1.0'\n",
+        encoding="utf-8",
+    )
+    patch = (
+        "diff --git a/tests/test_envelope_regression.py "
+        "b/tests/test_envelope_regression.py\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/tests/test_envelope_regression.py\n"
+        "@@ -0,0 +1 @@\n"
+        "+def test_regression(): assert True\n"
+    )
+    candidate = CandidateArtifact(
+        "a" * 40, 1, ("tests/test_envelope_regression.py",), patch
+    )
+
+    class NearCapacityProvider(_DecisionProvider):
+        def __init__(self) -> None:
+            super().__init__()
+            self.usage = SimpleNamespace(
+                response_count=0,
+                reported_response_count=0,
+                input_tokens=None,
+                cached_input_tokens=None,
+                output_tokens=None,
+                total_tokens=None,
+                complete=False,
+            )
+            self.last_response_usage = None
+
+        def next_step(self, _task, _results):
+            self.calls += 1
+            self.usage = SimpleNamespace(
+                response_count=1,
+                reported_response_count=1,
+                input_tokens=11_200,
+                cached_input_tokens=0,
+                output_tokens=100,
+                total_tokens=11_300,
+                complete=True,
+            )
+            self.last_response_usage = SimpleNamespace(
+                total_tokens=11_300,
+                complete=True,
+            )
+            return ToolCall(
+                "patch",
+                "write_files",
+                {"files": [{"path": "app.py", "content": "changed\n"}]},
+            )
+
+    provider = NearCapacityProvider()
+    operations._provider_factory = lambda *_args: provider
+    operations._sandbox = lambda *_args, **_kwargs: _CandidateSandbox(candidate)
+    operations._tool_executor = lambda *_args, **_kwargs: _Executor()
+
+    outcome = operations.implement(
+        _context(record, "implement", suffix="unfittable-result-envelope")
+    )
+
+    assert outcome.ok is True
+    assert outcome.summary == "candidate submitted for independent verification"
+    assert outcome.detail["soft_budget_boundary"] is False
+    assert provider.calls == 1
+    assert artifacts.path(record.run_id, "patch").read_text(encoding="utf-8") == patch
 
 
 def test_tool_result_truncation_counts_unicode_and_json_escaping() -> None:
@@ -1217,9 +2497,7 @@ def test_tool_result_budget_preserves_review_reservation() -> None:
     )
     assert without_reservation is result
     assert with_reservation.truncated is True
-    assert len(runtime._json(runtime.asdict(with_reservation)).encode("utf-8")) == (
-        reserved_result_bytes
-    )
+    assert tool_result_replay_bytes(with_reservation) == reserved_result_bytes
 
 
 def test_planning_and_review_set_initial_fixed_response_budgets(
@@ -1251,13 +2529,14 @@ def test_planning_and_review_set_initial_fixed_response_budgets(
     assert planning_provider.response_token_budgets == [
         runtime.MAX_PLANNING_TOKENS
     ]
+    assert planning_provider.forced_tool_choices == ["submit_change_plan"]
 
     review_record = record.model_copy(update={"run_id": "d" * 32})
     review_database = RunDatabase(artifacts.root.parent / "review-runs.sqlite3")
     review_artifacts = ArtifactStore(artifacts.root.parent / "review-artifacts")
     review_directory = review_artifacts.initialize(review_record.run_id)
     review_database.create(review_record, review_directory)
-    review_artifacts.write_patch(review_record.run_id, "diff\n")
+    review_artifacts.write_patch(review_record.run_id, _SMALL_REVIEW_PATCH)
     review_operations = runtime.RepositoryWorkflowOperations(
         review_record,
         database=review_database,
@@ -1285,7 +2564,26 @@ def test_change_phase_sets_initial_shared_response_budget(
     operations_bundle,
 ) -> None:
     operations, _database, _artifacts, record = operations_bundle
-    candidate = CandidateArtifact("a" * 40, 1, ("app.py",), "durable diff\n")
+    repository = Path(record.repo_path)
+    (repository / "pyproject.toml").write_text(
+        "[project]\nname='fixture'\nversion='0.1.0'\n",
+        encoding="utf-8",
+    )
+    patch = (
+        "diff --git a/tests/test_budget_regression.py "
+        "b/tests/test_budget_regression.py\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/tests/test_budget_regression.py\n"
+        "@@ -0,0 +1 @@\n"
+        "+def test_regression(): assert True\n"
+    )
+    candidate = CandidateArtifact(
+        "a" * 40,
+        1,
+        ("tests/test_budget_regression.py",),
+        patch,
+    )
     operations._sandbox = lambda *_args, **_kwargs: _CandidateSandbox(candidate)
     operations._tool_executor = lambda *_args, **_kwargs: _Executor()
     provider = _DecisionProvider(FinalAnswer("done"))
@@ -1295,8 +2593,10 @@ def test_change_phase_sets_initial_shared_response_budget(
         _context(record, "implement", suffix="initial-change-budget")
     )
 
-    assert outcome.ok is True
+    assert outcome.ok is False
+    assert outcome.error == "model returned text before submitting a verifiable candidate"
     assert provider.response_token_budgets == [runtime.MAX_CHANGE_TOKENS]
+    assert provider.forced_tool_choices == ["read_files"]
 
 
 @pytest.mark.parametrize(
@@ -1401,18 +2701,39 @@ def test_tool_outcomes_distinguish_expected_checks_from_actionable_errors() -> N
     }
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        "Invalid tool call: ToolValidationError: hunk line counts do not match its header",
+        "ValueError: patch must be a Git-style unified diff; submit a complete diff",
+        "Patch did not apply cleanly to the candidate workspace",
+    ],
+)
+def test_apply_patch_validation_failures_are_patch_rejections(error: str) -> None:
+    result = ToolResult("patch", "apply_patch", False, "", error=error)
+
+    assert runtime._tool_outcome(result) == "patch_rejected"
+
+
 def test_model_summary_keeps_legacy_counts_and_adds_tool_outcomes(
     operations_bundle,
 ) -> None:
     operations, database, _artifacts, record = operations_bundle
     results = (
         ToolResult("ok", "read_file", True, "ok"),
-        ToolResult("bad", "apply_patch", False, "", error="Patch rejected"),
+        ToolResult(
+            "bad",
+            "write_files",
+            False,
+            "sensitive successful output must not be logged",
+            error="Patch rejected; Authorization: Bearer fake",
+        ),
     )
 
     provider = SimpleNamespace(
         usage=None,
         parallel_tool_call_violations=2,
+        rejected_tool_call_violations=1,
     )
     operations._append_model_summary(
         _context(record, "implement"),
@@ -1423,12 +2744,87 @@ def test_model_summary_keeps_legacy_counts_and_adds_tool_outcomes(
     )
 
     summary = _only_model_summary(database, record.run_id)
-    assert summary["tool_calls"] == 4
-    assert summary["tool_errors"] == 3
+    assert isinstance(summary["timestamp"], str)
+    assert summary["timestamp"].endswith("Z")
+    assert summary["executed_tool_calls"] == 2
+    assert summary["tool_calls"] == 5
+    assert summary["tool_errors"] == 4
     assert summary["parallel_tool_call_violations"] == 2
+    assert summary["rejected_tool_call_violations"] == 1
     assert summary["tool_outcomes"]["ok"] == 1
-    assert summary["tool_outcomes"]["invalid_args"] == 2
+    assert summary["tool_outcomes"]["invalid_args"] == 3
     assert summary["tool_outcomes"]["patch_rejected"] == 1
+    assert summary["tool_failures"] == [
+        {
+            "ordinal": 2,
+            "tool": "write_files",
+            "outcome": "patch_rejected",
+            "reason_code": "patch_rejected",
+            "error_summary": "Patch rejected; Authorization: [REDACTED]",
+        }
+    ]
+    assert "sensitive successful output" not in str(summary["tool_failures"])
+
+
+def test_recovered_argument_retry_is_visible_but_not_actionable(
+    operations_bundle,
+) -> None:
+    operations, database, _artifacts, record = operations_bundle
+    provider = SimpleNamespace(
+        usage=None,
+        parallel_tool_call_violations=0,
+        rejected_tool_call_violations=1,
+        recovered_tool_argument_violations=1,
+    )
+
+    operations._append_model_summary(
+        _context(record, "implement", suffix="recovered-arguments"),
+        event="model_tool_summary",
+        phase="implement",
+        provider=provider,
+        tool_results=(),
+    )
+
+    summary = _only_model_summary(database, record.run_id)
+    assert summary["tool_calls"] == 1
+    assert summary["tool_errors"] == 1
+    assert summary["rejected_tool_call_violations"] == 1
+    assert summary["recovered_protocol_errors"] == 1
+    assert summary["tool_outcomes"]["invalid_args"] == 0
+
+
+def test_recovered_unknown_tool_retry_is_visible_but_not_actionable(
+    operations_bundle,
+) -> None:
+    operations, database, _artifacts, record = operations_bundle
+    provider = SimpleNamespace(
+        usage=None,
+        parallel_tool_call_violations=0,
+        rejected_tool_call_violations=1,
+        recovered_unknown_tool_violations=1,
+    )
+
+    operations._append_model_summary(
+        _context(record, "implement", suffix="recovered-unknown-tool"),
+        event="model_tool_summary",
+        phase="implement",
+        provider=provider,
+        tool_results=(),
+    )
+
+    summary = _only_model_summary(database, record.run_id)
+    assert summary["tool_calls"] == 1
+    assert summary["tool_errors"] == 1
+    assert summary["rejected_tool_call_violations"] == 1
+    assert summary["recovered_protocol_errors"] == 1
+    assert summary["tool_outcomes"]["invalid_args"] == 0
+
+
+def test_change_system_prompt_reserves_pytest_for_the_workflow() -> None:
+    prompt = runtime._implementation_system_prompt()
+
+    assert "workflow runs pytest after the change phase" in prompt
+    assert "do not request shell, pytest, or run_check tools" in prompt
 
 
 def test_model_metrics_preserve_actual_failure_usage_beyond_policy_caps(
@@ -1465,13 +2861,11 @@ def _only_model_summary(database: RunDatabase, run_id: str) -> dict[str, object]
     return summaries[0]
 
 
-def test_planning_provider_failure_preserves_tool_and_usage_summary(
+def test_planning_provider_failure_preserves_usage_summary(
     operations_bundle,
 ) -> None:
     operations, database, _artifacts, record = operations_bundle
-    provider = _FailingProvider(
-        ToolCall("read", "read_file", {"path": "app.py"}), total_tokens=19
-    )
+    provider = _FailingProvider(total_tokens=19)
     operations._provider_factory = lambda *_args: provider
     operations._repository_map = lambda _context: "repository map"
     operations._sandbox = lambda *_args, **_kwargs: _CandidateSandbox(None)
@@ -1483,7 +2877,8 @@ def test_planning_provider_failure_preserves_tool_and_usage_summary(
     summary = _only_model_summary(database, record.run_id)
     assert summary["event"] == "planning_tool_summary"
     assert summary["phase"] == "planning"
-    assert summary["tool_calls"] == 1
+    assert summary["executed_tool_calls"] == 0
+    assert summary["tool_calls"] == 0
     assert summary["tool_errors"] == 0
     assert summary["model_usage"]["total_tokens"] == 19
 
@@ -1511,7 +2906,8 @@ def test_implementation_provider_failure_preserves_tool_and_usage_summary(
 
 
 def test_review_provider_failure_preserves_usage_summary(operations_bundle) -> None:
-    operations, database, _artifacts, record = operations_bundle
+    operations, database, artifacts, record = operations_bundle
+    artifacts.write_patch(record.run_id, _SMALL_REVIEW_PATCH)
     operations._provider_factory = lambda *_args: _FailingProvider(total_tokens=29)
 
     with pytest.raises(RuntimeError, match="provider failed after reporting usage"):
@@ -1521,13 +2917,16 @@ def test_review_provider_failure_preserves_usage_summary(operations_bundle) -> N
     assert summary["event"] == "model_tool_summary"
     assert summary["phase"] == "review"
     assert summary["tool_calls"] == 0
+    assert summary["tool_errors"] == 0
+    assert summary["tool_outcomes"]["invalid_args"] == 0
     assert summary["model_usage"]["total_tokens"] == 29
 
 
 def test_summary_write_failure_does_not_mask_provider_failure(
     operations_bundle,
 ) -> None:
-    operations, _database, _artifacts, record = operations_bundle
+    operations, _database, artifacts, record = operations_bundle
+    artifacts.write_patch(record.run_id, _SMALL_REVIEW_PATCH)
     operations._provider_factory = lambda *_args: _FailingProvider()
     operations._append_model_summary = lambda *_args, **_kwargs: (_ for _ in ()).throw(
         RuntimeError("summary write failed")
@@ -1540,7 +2939,8 @@ def test_summary_write_failure_does_not_mask_provider_failure(
 def test_summary_write_failure_propagates_without_provider_failure(
     operations_bundle,
 ) -> None:
-    operations, _database, _artifacts, record = operations_bundle
+    operations, _database, artifacts, record = operations_bundle
+    artifacts.write_patch(record.run_id, _SMALL_REVIEW_PATCH)
     operations._provider_factory = lambda *_args: _DecisionProvider(
         ToolCall(
             "review",
@@ -1557,7 +2957,8 @@ def test_summary_write_failure_propagates_without_provider_failure(
 
 
 def test_broken_usage_fields_are_recorded_as_incomplete(operations_bundle) -> None:
-    operations, database, _artifacts, record = operations_bundle
+    operations, database, artifacts, record = operations_bundle
+    artifacts.write_patch(record.run_id, _SMALL_REVIEW_PATCH)
     provider = _FailingProvider()
     provider.usage = _BrokenUsage()
     operations._provider_factory = lambda *_args: provider
@@ -1629,7 +3030,7 @@ def test_review_rejects_invalid_model_verdicts(
     operations_bundle, decision, error: str
 ) -> None:
     operations, _database, artifacts, record = operations_bundle
-    artifacts.write_patch(record.run_id, "diff\n")
+    artifacts.write_patch(record.run_id, _SMALL_REVIEW_PATCH)
     operations._provider_factory = lambda *_args: _DecisionProvider(decision)
 
     with pytest.raises((RuntimeError, ValueError), match=error):
@@ -1638,7 +3039,7 @@ def test_review_rejects_invalid_model_verdicts(
 
 def test_review_preserves_rejection_as_node_failure(operations_bundle) -> None:
     operations, _database, artifacts, record = operations_bundle
-    artifacts.write_patch(record.run_id, "diff\n")
+    artifacts.write_patch(record.run_id, _SMALL_REVIEW_PATCH)
     decision = ToolCall(
         "review",
         "submit_review",
@@ -1651,6 +3052,320 @@ def test_review_preserves_rejection_as_node_failure(operations_bundle) -> None:
     assert result.ok is False
     assert result.error == "risk remains"
     assert result.detail["risks"] == ["scope"]
+
+
+def test_planning_tool_keeps_review_semantics_bounded() -> None:
+    properties = runtime.PLAN_TOOL.input_schema["properties"]
+    steps = properties["steps"]
+    risks = properties["risks"]
+
+    assert steps["maxItems"] == 2
+    assert steps["items"]["maxLength"] == 80
+    assert risks["maxItems"] == 2
+    assert risks["items"]["maxLength"] == 40
+
+
+def test_planning_task_and_full_map_fit_fixed_budget_with_output_room() -> None:
+    system_prompt = runtime._planning_system_prompt()
+    task = (
+        f"T:{runtime._json('x' * 500)}\nR:\n"
+        + ("r" * runtime.MAX_PLANNING_REPOSITORY_MAP_BYTES)
+    )
+    provider = OpenAIProvider(
+        OpenAIConfig(
+            api_key="fake-provider-key",
+            base_url="https://api.deepseek.com/v1",
+            model="deepseek-v4-pro",
+            allow_remote_model=True,
+        ),
+        tool_definitions=(runtime.PLAN_TOOL,),
+        system_prompt=system_prompt,
+        reasoning_effort="none",
+    )
+    provider._prepare_conversation(task, ())
+    request = {
+        "model": "deepseek-v4-pro",
+        "instructions": system_prompt,
+        "input": provider._responses_input,
+        "tools": provider._responses_tools,
+        "parallel_tool_calls": False,
+        "store": False,
+        "reasoning": {"effort": "none"},
+        "tool_choice": {"type": "function", "name": "submit_change_plan"},
+    }
+
+    _apply_response_token_budget(
+        request,
+        field_name="max_output_tokens",
+        total_tokens=runtime.MAX_PLANNING_TOKENS,
+    )
+
+    output_tokens = request["max_output_tokens"]
+    assert type(output_tokens) is int
+    assert output_tokens >= 256
+    assert len(_encode_request_payload(request)) <= 3_300
+    assert (
+        _estimate_request_input_tokens(request) + output_tokens
+        <= runtime.MAX_PLANNING_TOKENS
+    )
+
+
+def test_typical_review_patch_keeps_complete_evidence_within_budget(
+    operations_bundle,
+) -> None:
+    operations, _database, artifacts, record = operations_bundle
+    record = record.model_copy(
+        update={
+            "task": "Add a stable formatter while preserving legacy output.",
+            "plan": ChangePlan(
+                goal="Add deterministic machine-readable output.",
+                files=("package/formatter.py", "tests/test_formatter_regression.py"),
+                steps=("Implement the exporter.",),
+                checks=("pytest",),
+                risks=("Do not alter the text renderer.",),
+            ),
+            "checks": (
+                CheckSummary(
+                    attempt=0,
+                    check_id="python-pytest",
+                    status="passed",
+                    ok=True,
+                    duration_ms=123,
+                    log_artifact="checks/verify-0.log",
+                ),
+            ),
+        }
+    )
+    production_patch = (
+        "diff --git a/package/formatter.py b/package/formatter.py\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/package/formatter.py\n"
+        "@@ -0,0 +1,48 @@\n"
+        + ("+return value\n" * 48)
+    )
+    regression_patch = (
+        "diff --git a/tests/test_formatter_regression.py "
+        "b/tests/test_formatter_regression.py\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/tests/test_formatter_regression.py\n"
+        "@@ -0,0 +1,2 @@\n"
+        "+def test_regression_marker():\n"
+        "+    assert True\n"
+    )
+    complete_patch = production_patch + regression_patch
+    assert 1_000 <= len(complete_patch.encode("utf-8")) <= 1_500
+    artifacts.write_patch(record.run_id, complete_patch)
+    decision = ToolCall(
+        "review",
+        "submit_review",
+        {"approved": True, "summary": "ok", "risks": []},
+    )
+    captured_tasks: list[str] = []
+    captured_system_prompts: list[str] = []
+
+    class CapturingProvider(_DecisionProvider):
+        def next_step(self, task, results):
+            captured_tasks.append(task)
+            return super().next_step(task, results)
+
+    provider = CapturingProvider(decision)
+
+    def provider_factory(_definitions, system_prompt, _idempotency_key):
+        captured_system_prompts.append(system_prompt)
+        return provider
+
+    operations._provider_factory = provider_factory
+    result = operations.review(_context(record, "review", suffix="compact-prompt"))
+
+    assert result.ok is True
+    assert len(captured_tasks) == 1
+    task = captured_tasks[0]
+    assert task.startswith('G:"Add deterministic machine-readable output."\nD:\n')
+    assert "\nD:\n" in task
+    assert "Add a stable formatter" not in task
+    assert "\nP:" not in task
+    assert "\nC:" not in task
+    assert "Implement the exporter." not in task
+    assert "Do not alter the text renderer." not in task
+    assert '"checks"' not in task
+    assert '"goal"' not in task
+    assert '"files"' not in task
+    assert "return value" in task
+    assert "tests/test_formatter_regression.py" in task
+    assert "test_regression_marker" in task
+    patch = task.split("\nD:\n", maxsplit=1)[1]
+    assert 700 <= len(patch.encode("utf-8")) <= 1_000
+    assert "diff --git" not in patch
+    assert "--- /dev/null" not in patch
+
+    assert captured_system_prompts
+    assert "untrusted" in captured_system_prompts[0]
+    provider_for_estimate = OpenAIProvider(
+        OpenAIConfig(
+            api_key="fake-provider-key",
+            base_url="https://api.deepseek.com/v1",
+            model="deepseek-v4-pro",
+            allow_remote_model=True,
+        ),
+        tool_definitions=(runtime.REVIEW_TOOL,),
+        system_prompt=captured_system_prompts[0],
+        reasoning_effort="none",
+    )
+    provider_for_estimate._prepare_conversation(task, ())
+    request = {
+        "model": "deepseek-v4-pro",
+        "instructions": captured_system_prompts[0],
+        "input": provider_for_estimate._responses_input,
+        "tools": provider_for_estimate._responses_tools,
+        "parallel_tool_calls": False,
+        "store": False,
+        "reasoning": {"effort": "none"},
+        "tool_choice": {"type": "function", "name": "submit_review"},
+    }
+    _apply_response_token_budget(
+        request,
+        field_name="max_output_tokens",
+        total_tokens=runtime.MAX_REVIEW_TOKENS,
+        minimum_output_tokens=runtime.MIN_REVIEW_OUTPUT_TOKENS,
+    )
+    output_tokens = request["max_output_tokens"]
+    assert type(output_tokens) is int
+    assert output_tokens >= runtime.MIN_REVIEW_OUTPUT_TOKENS
+    assert len(_encode_request_payload(request)) <= 2_000
+    assert (
+        _estimate_request_input_tokens(request) + output_tokens
+        <= runtime.MAX_REVIEW_TOKENS
+    )
+
+    schema = runtime.REVIEW_TOOL.input_schema["properties"]
+    summary_limit = schema["summary"]["maxLength"]
+    risks_schema = schema["risks"]
+    risk_limit = risks_schema["items"]["maxLength"]
+    assert risks_schema["maxItems"] == 1
+    largest_verdict = runtime._json(
+        {
+            "type": "function_call",
+            "call_id": "r" * 64,
+            "name": "submit_review",
+            "arguments": runtime._json(
+                {
+                    "approved": False,
+                    "summary": "s" * summary_limit,
+                    "risks": ["r" * risk_limit],
+                }
+            ),
+        }
+    )
+    assert (
+        runtime._bytes_to_estimated_tokens(len(largest_verdict.encode("utf-8")))
+        <= runtime.MIN_REVIEW_OUTPUT_TOKENS
+    )
+
+
+def test_review_uses_bounded_full_payload_estimate_without_dropping_evidence(
+    operations_bundle,
+) -> None:
+    operations, _database, artifacts, record = operations_bundle
+    patch = (
+        "diff --git a/app.py b/app.py\n"
+        "--- a/app.py\n"
+        "+++ b/app.py\n"
+        "@@ -1 +1,180 @@\n"
+        "-old = True\n"
+        + "".join(f"+value_{index} = {index}\n" for index in range(180))
+        + "diff --git a/tests/test_app_regression.py "
+        "b/tests/test_app_regression.py\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/tests/test_app_regression.py\n"
+        "@@ -0,0 +1,2 @@\n"
+        "+def test_values_regression():\n"
+        "+    assert value_179 == 179\n"
+    )
+    assert 2_500 < len(patch.encode("utf-8")) < 4_000
+    artifacts.write_patch(record.run_id, patch)
+    input_estimates: list[int] = []
+
+    class ReviewProvider(_DecisionProvider):
+        def prepare_next_request_payload_bytes(self, task, results):
+            assert results == ()
+            assert "value_179" in task
+            assert "test_values_regression" in task
+            return 4_500
+
+        def set_next_response_input_token_estimate(self, value):
+            input_estimates.append(value)
+
+    provider = ReviewProvider(
+        ToolCall(
+            "review",
+            "submit_review",
+            {"approved": True, "summary": "complete", "risks": []},
+        )
+    )
+    operations._provider_factory = lambda *_args: provider
+
+    result = operations.review(
+        _context(record, "review", suffix="bounded-full-payload")
+    )
+
+    assert result.ok is True
+    assert input_estimates == [
+        runtime._bytes_to_estimated_tokens(4_500)
+        + runtime.REVIEW_INPUT_TOKEN_MARGIN
+    ]
+    assert input_estimates[0] + runtime.MIN_REVIEW_OUTPUT_TOKENS < (
+        runtime.MAX_REVIEW_TOKENS
+    )
+
+
+def test_review_patch_evidence_keeps_all_changed_lines_and_regression_body() -> None:
+    patch = (
+        "diff --git a/app.py b/app.py\n"
+        "--- a/app.py\n"
+        "+++ b/app.py\n"
+        "@@ -1,3 +1,3 @@\n"
+        " unchanged_before\n"
+        "-old_value = 1\n"
+        "+new_value = 2\n"
+        " unchanged_after\n"
+        "diff --git a/tests/test_app_regression.py "
+        "b/tests/test_app_regression.py\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/tests/test_app_regression.py\n"
+        "@@ -0,0 +1,2 @@\n"
+        "+def test_new_value_regression():\n"
+        "+    assert new_value == 2\n"
+    )
+
+    evidence = runtime._review_patch_evidence(patch)
+
+    assert "M:app.py" in evidence
+    assert "-old_value = 1" in evidence
+    assert "+new_value = 2" in evidence
+    assert "unchanged_before" not in evidence
+    assert "unchanged_after" not in evidence
+    assert "A:tests/test_app_regression.py" in evidence
+    assert "+def test_new_value_regression():" in evidence
+    assert "+    assert new_value == 2" in evidence
+    assert "diff --git" not in evidence
+
+
+def test_review_goal_preserves_approved_internal_whitespace() -> None:
+    goal = "Preserve  two spaces\nand\ttabs"
+    plan = ChangePlan(
+        goal=goal,
+        files=("app.py", "tests/test_app_regression.py"),
+        steps=("Implement the approved contract.",),
+        checks=("pytest",),
+        risks=(),
+    )
+
+    assert runtime._review_goal_summary(plan, "fallback task") == goal
+    assert runtime._json(goal) == '"Preserve  two spaces\\nand\\ttabs"'
 
 
 def test_review_capacity_failure_keeps_full_patch_and_uses_zero_tokens(
@@ -1720,12 +3435,139 @@ def test_review_capacity_failure_keeps_full_patch_and_uses_zero_tokens(
     )
     assert stored == result.model_dump(mode="json")
     summary = _only_model_summary(database, record.run_id)
+    assert summary["request_not_started"] is True
     assert summary["model_usage"]["response_count"] == 0
     assert summary["model_usage"]["total_tokens"] is None
     synchronized = runtime._synchronize_model_metrics(
         record, database.events(record.run_id)
     )
     assert synchronized.metrics.tokens == 0
+
+
+def test_review_fallback_capacity_failure_is_not_a_zero_request_preflight(
+    operations_bundle, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    operations, database, artifacts, record = operations_bundle
+    artifacts.write_patch(record.run_id, _SMALL_REVIEW_PATCH)
+    requests: list[str] = []
+    providers: list[OpenAIProvider] = []
+
+    apply_budget = provider_module._apply_response_token_budget
+
+    def fail_chat_preflight(payload, *, field_name, **kwargs):
+        if field_name == "max_completion_tokens":
+            raise runtime.OpenAIRequestCapacityError(
+                "Chat fallback cannot fit the remaining review budget"
+            )
+        return apply_budget(payload, field_name=field_name, **kwargs)
+
+    monkeypatch.setattr(
+        provider_module,
+        "_apply_response_token_budget",
+        fail_chat_preflight,
+    )
+
+    def provider_factory(definitions, system_prompt, idempotency_key):
+        provider = OpenAIProvider(
+            OpenAIConfig(
+                api_key="fake-provider-key",
+                base_url="http://127.0.0.1:9",
+                model="fake-model",
+            ),
+            tool_definitions=definitions,
+            system_prompt=system_prompt,
+            idempotency_key=idempotency_key,
+        )
+
+        def post_json(endpoint, _payload, *, idempotency_key=None):
+            del idempotency_key
+            requests.append(endpoint)
+            if endpoint == "/responses":
+                raise OpenAIHTTPError(404, endpoint_unsupported=True)
+            raise AssertionError("Chat fallback must fail capacity before HTTP")
+
+        monkeypatch.setattr(provider._client, "post_json", post_json)
+        providers.append(provider)
+        return provider
+
+    operations._provider_factory = provider_factory
+
+    result = operations.review(_context(record, "review", suffix="fallback-capacity"))
+
+    assert result.ok is False
+    assert result.detail["failure_code"] == "review_capacity_exceeded"
+    assert requests == ["/responses"]
+    assert providers[0].request_count == 1
+    summary = _only_model_summary(database, record.run_id)
+    assert summary["request_not_started"] is False
+    assert summary["model_usage"]["response_count"] == 1
+    assert summary["model_usage"]["reported_response_count"] == 0
+    assert summary["model_usage"]["complete"] is False
+
+
+def test_review_bounded_estimate_allows_long_approved_goal_within_capacity(
+    operations_bundle, monkeypatch
+) -> None:
+    operations, _database, artifacts, record = operations_bundle
+    goal = "Keep the approved behavior " + ("g" * 1900)
+    record = record.model_copy(
+        update={
+            "plan": ChangePlan(
+                goal=goal,
+                files=("app.py", "tests/test_app_regression.py"),
+                steps=("Preserve existing behavior.",),
+                checks=("pytest",),
+                risks=("Avoid unrelated changes.",),
+            )
+        }
+    )
+    artifacts.write_patch(record.run_id, _SMALL_REVIEW_PATCH)
+    http_calls: list[tuple[object, ...]] = []
+
+    def provider_factory(definitions, system_prompt, idempotency_key):
+        provider = runtime.OpenAIProvider(
+            runtime.OpenAIConfig(
+                api_key="fake-provider-key",
+                base_url="http://127.0.0.1:9",
+                model="fake-model",
+            ),
+            tool_definitions=definitions,
+            system_prompt=system_prompt,
+            idempotency_key=idempotency_key,
+        )
+
+        def approve_review(*args, **kwargs):
+            http_calls.append((args, kwargs))
+            return {
+                "output": [
+                    {
+                        "type": "function_call",
+                        "call_id": "review-long-goal",
+                        "name": "submit_review",
+                        "arguments": runtime._json(
+                            {"approved": True, "summary": "ok", "risks": []}
+                        ),
+                    }
+                ],
+                "usage": {
+                    "input_tokens": 1_800,
+                    "output_tokens": 20,
+                    "total_tokens": 1_820,
+                },
+            }
+
+        monkeypatch.setattr(provider._client, "post_json", approve_review)
+        return provider
+
+    operations._provider_factory = provider_factory
+
+    result = operations.review(_context(record, "review", suffix="long-goal"))
+
+    assert runtime._review_goal_summary(record.plan, "fallback task") == goal
+    assert result.ok is True
+    assert result.summary == "ok"
+    assert result.detail["tokens"] == 1_820
+    assert len(http_calls) == 1
 
 
 class _CandidateSandbox:
@@ -1911,6 +3753,252 @@ def test_soft_budget_boundary_advances_only_candidate_with_new_regression_test(
     assert "patch" not in stored["detail"]
 
 
+def test_request_capacity_boundary_preserves_verifiable_candidate(
+    operations_bundle, monkeypatch
+) -> None:
+    operations, database, artifacts, record = operations_bundle
+    repository = Path(record.repo_path)
+    (repository / "pyproject.toml").write_text(
+        "[project]\nname='fixture'\nversion='0.1.0'\n",
+        encoding="utf-8",
+    )
+    patch = (
+        "diff --git a/tests/test_capacity_regression.py "
+        "b/tests/test_capacity_regression.py\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/tests/test_capacity_regression.py\n"
+        "@@ -0,0 +1 @@\n"
+        "+def test_regression(): assert True\n"
+    )
+    candidate = CandidateArtifact(
+        "a" * 40, 1, ("tests/test_capacity_regression.py",), patch
+    )
+    operations._sandbox = lambda *_args, **_kwargs: _CandidateSandbox(candidate)
+    operations._provider_factory = lambda *_args: _DecisionProvider(FinalAnswer("done"))
+    monkeypatch.setattr(
+        runtime,
+        "_run_model_loop",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            runtime.OpenAIRequestCapacityError("request cannot fit response budget")
+        ),
+    )
+
+    context = _context(record, "implement", suffix="capacity-candidate")
+    outcome = operations.implement(context)
+
+    assert outcome.ok is True
+    assert outcome.summary == (
+        "change budget reached; persisted candidate sent to verification"
+    )
+    assert outcome.detail["soft_budget_boundary"] is True
+    assert artifacts.path(record.run_id, "patch").read_text(encoding="utf-8") == patch
+    summary = _only_model_summary(database, record.run_id)
+    assert summary["executed_tool_calls"] == 0
+    assert summary["request_not_started"] is True
+    assert summary["model_usage"]["response_count"] == 0
+
+
+def test_repair_follow_up_capacity_failure_is_not_marked_request_not_started(
+    operations_bundle, monkeypatch
+) -> None:
+    operations, database, artifacts, record = operations_bundle
+    repository = Path(record.repo_path)
+    (repository / "pyproject.toml").write_text(
+        "[project]\nname='fixture'\nversion='0.1.0'\n",
+        encoding="utf-8",
+    )
+    patch = (
+        "diff --git a/tests/test_capacity_regression.py "
+        "b/tests/test_capacity_regression.py\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/tests/test_capacity_regression.py\n"
+        "@@ -0,0 +1 @@\n"
+        "+def test_regression(): assert True\n"
+    )
+    candidate = CandidateArtifact(
+        "a" * 40, 1, ("tests/test_capacity_regression.py",), patch
+    )
+    artifacts.write_patch(record.run_id, patch)
+    operations._sandbox = lambda *_args, **_kwargs: _CandidateSandbox(candidate)
+    provider = _DecisionProvider(
+        FinalAnswer("done"),
+        usage=SimpleNamespace(
+            response_count=1,
+            reported_response_count=1,
+            input_tokens=99,
+            cached_input_tokens=0,
+            output_tokens=1,
+            total_tokens=100,
+            complete=True,
+        ),
+    )
+    operations._provider_factory = lambda *_args: provider
+    monkeypatch.setattr(
+        runtime,
+        "_run_model_loop",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            runtime.OpenAIRequestCapacityError("repair follow-up cannot fit")
+        ),
+    )
+
+    with pytest.raises(
+        runtime.OpenAIRequestCapacityError, match="repair follow-up cannot fit"
+    ):
+        operations.repair(
+            _context(record, "repair", suffix="follow-up-capacity")
+        )
+
+    summary = _only_model_summary(database, record.run_id)
+    assert summary["request_not_started"] is False
+    assert summary["model_usage"]["response_count"] == 1
+
+
+def test_repair_shrinks_optional_log_after_pre_http_capacity_failure(
+    operations_bundle, monkeypatch
+) -> None:
+    operations, _database, artifacts, record = operations_bundle
+    repository = Path(record.repo_path)
+    (repository / "pyproject.toml").write_text(
+        "[project]\nname='fixture'\nversion='0.1.0'\n",
+        encoding="utf-8",
+    )
+    test_path = "tests/test_capacity_regression.py"
+    prior_patch = (
+        f"diff --git a/{test_path} b/{test_path}\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        f"+++ b/{test_path}\n"
+        "@@ -0,0 +1 @@\n"
+        "+def test_regression(): assert False\n"
+    )
+    corrected_patch = prior_patch.replace("assert False", "assert True")
+    sandbox = _CandidateSandbox(
+        CandidateArtifact("a" * 40, 1, (test_path,), prior_patch)
+    )
+    artifacts.write_patch(record.run_id, prior_patch)
+    operations._sandbox = lambda *_args, **_kwargs: sandbox
+    operations._tool_executor = lambda *_args, **_kwargs: _Executor()
+    provider = _DecisionProvider(FinalAnswer("unused"))
+    operations._provider_factory = lambda *_args: provider
+    monkeypatch.setattr(
+        operations,
+        "_repair_log_tail",
+        lambda *_args, **_kwargs: "x" * runtime.MAX_REPAIR_LOG_BYTES,
+    )
+    prompts: list[str] = []
+
+    def capacity_then_success(_provider, prompt, *_args, **_kwargs):
+        prompts.append(prompt)
+        if len(prompts) == 1:
+            raise runtime.OpenAIRequestCapacityError("initial repair request is too large")
+        sandbox.candidate = CandidateArtifact(
+            "a" * 40, 2, (test_path,), corrected_patch
+        )
+        return runtime.ModelLoopOutcome(
+            True,
+            "candidate submitted for independent verification",
+            (),
+            (),
+        )
+
+    monkeypatch.setattr(runtime, "_run_model_loop", capacity_then_success)
+
+    outcome = operations.repair(
+        _context(record, "repair", suffix="shrink-pre-http-log")
+    )
+
+    assert outcome.ok is True
+    assert len(prompts) == 2
+    assert len(prompts[0].encode("utf-8")) - len(
+        prompts[1].encode("utf-8")
+    ) == runtime.MAX_REPAIR_LOG_BYTES // 2
+    assert provider.request_count == 0
+    assert provider.response_token_budgets == [
+        runtime.MAX_CHANGE_TOKENS,
+        runtime.MAX_CHANGE_TOKENS,
+    ]
+    assert artifacts.path(record.run_id, "patch").read_text(encoding="utf-8") == (
+        corrected_patch
+    )
+
+
+def test_request_capacity_boundary_without_verifiable_candidate_fails_explicitly(
+    operations_bundle, monkeypatch
+) -> None:
+    operations, database, artifacts, record = operations_bundle
+    repository = Path(record.repo_path)
+    (repository / "pyproject.toml").write_text(
+        "[project]\nname='fixture'\nversion='0.1.0'\n",
+        encoding="utf-8",
+    )
+    operations._sandbox = lambda *_args, **_kwargs: _CandidateSandbox(None)
+    operations._provider_factory = lambda *_args: _DecisionProvider(FinalAnswer("done"))
+    monkeypatch.setattr(
+        runtime,
+        "_run_model_loop",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            runtime.OpenAIRequestCapacityError("request cannot fit response budget")
+        ),
+    )
+
+    context = _context(record, "implement", suffix="capacity-no-candidate")
+    with pytest.raises(RuntimeError) as captured:
+        operations.implement(context)
+
+    assert str(captured.value) == (
+        "request cannot fit response budget; no verifiable candidate was available"
+    )
+    assert artifacts.path(record.run_id, "patch").read_text(encoding="utf-8") == ""
+    summary = _only_model_summary(database, record.run_id)
+    assert summary["executed_tool_calls"] == 0
+
+
+def test_repair_capacity_before_mutation_preserves_typed_failure(
+    operations_bundle, monkeypatch
+) -> None:
+    operations, database, artifacts, record = operations_bundle
+    repository = Path(record.repo_path)
+    (repository / "pyproject.toml").write_text(
+        "[project]\nname='fixture'\nversion='0.1.0'\n",
+        encoding="utf-8",
+    )
+    patch = (
+        "diff --git a/tests/test_capacity_regression.py "
+        "b/tests/test_capacity_regression.py\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/tests/test_capacity_regression.py\n"
+        "@@ -0,0 +1 @@\n"
+        "+def test_regression(): assert True\n"
+    )
+    candidate = CandidateArtifact(
+        "a" * 40, 1, ("tests/test_capacity_regression.py",), patch
+    )
+    artifacts.write_patch(record.run_id, patch)
+    operations._sandbox = lambda *_args, **_kwargs: _CandidateSandbox(candidate)
+    operations._provider_factory = lambda *_args: _DecisionProvider(FinalAnswer("done"))
+    monkeypatch.setattr(
+        runtime,
+        "_run_model_loop",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            runtime.OpenAIRequestCapacityError("repair follow-up cannot fit")
+        ),
+    )
+
+    with pytest.raises(
+        runtime.OpenAIRequestCapacityError, match="repair follow-up cannot fit"
+    ):
+        operations.repair(
+            _context(record, "repair", suffix="capacity-before-mutation")
+        )
+
+    assert artifacts.path(record.run_id, "patch").read_text(encoding="utf-8") == patch
+    summary = _only_model_summary(database, record.run_id)
+    assert summary["executed_tool_calls"] == 0
+
+
 def test_tool_call_boundary_advances_a_verifiable_persisted_candidate(
     operations_bundle, monkeypatch
 ) -> None:
@@ -2025,6 +4113,70 @@ def test_repair_receives_only_redacted_eight_kibibyte_log_tail(
         operations._repair_log_tail(_context(unsafe, "repair", suffix="unsafe-log"))
 
 
+def test_repair_log_tail_honors_zero_and_tight_byte_limits(
+    operations_bundle,
+) -> None:
+    operations, _database, artifacts, record = operations_bundle
+    artifacts.write_check(
+        record.run_id,
+        "verify-tight.log",
+        "prefix\n" + ("x" * 300) + "\napi_key=plain-secret\nTAIL\n",
+    )
+    failed = CheckSummary(
+        attempt=0,
+        check_id="python-pytest",
+        status="failed",
+        ok=False,
+        duration_ms=1,
+        log_artifact="checks/verify-tight.log",
+    )
+    context = _context(
+        record.model_copy(update={"checks": (failed,)}),
+        "repair",
+        suffix="tight-log",
+    )
+
+    assert operations._repair_log_tail(context, max_bytes=0) == ""
+    tail = operations._repair_log_tail(context, max_bytes=32)
+    assert len(tail.encode("utf-8")) <= 32
+    assert "plain-secret" not in tail
+    assert "TAIL" in tail
+
+    with pytest.raises(ValueError, match="byte limit"):
+        operations._repair_log_tail(context, max_bytes=-1)
+
+
+def test_repair_log_budget_shrinks_with_phase_and_prompt_pressure() -> None:
+    full = runtime._repair_log_budget_bytes(
+        prior_tokens=0,
+        phase_prior_tokens=0,
+        system_prompt="system",
+        prompt_without_repair_log="prompt",
+    )
+    tight = runtime._repair_log_budget_bytes(
+        prior_tokens=22_500,
+        phase_prior_tokens=19_500,
+        system_prompt="system",
+        prompt_without_repair_log="prompt",
+    )
+    long_prompt = runtime._repair_log_budget_bytes(
+        prior_tokens=22_500,
+        phase_prior_tokens=19_500,
+        system_prompt="system" * 500,
+        prompt_without_repair_log="prompt" * 500,
+    )
+
+    assert full == runtime.MAX_REPAIR_LOG_BYTES
+    assert 0 < tight < full
+    assert long_prompt < tight
+    assert runtime._repair_log_budget_bytes(
+        prior_tokens=None,
+        phase_prior_tokens=0,
+        system_prompt="system",
+        prompt_without_repair_log="prompt",
+    ) == runtime.MAX_REPAIR_LOG_BYTES
+
+
 def test_change_candidate_reports_missing_and_unchanged_patch(
     operations_bundle, monkeypatch
 ) -> None:
@@ -2042,6 +4194,115 @@ def test_change_candidate_reports_missing_and_unchanged_patch(
     unchanged = operations.repair(_context(record, "repair", suffix="unchanged"))
     assert unchanged.ok is False
     assert unchanged.error == "repair did not change the candidate patch"
+
+
+def test_repair_can_change_only_generated_regression_test_and_advance_to_verification(
+    operations_bundle,
+) -> None:
+    operations, _database, artifacts, record = operations_bundle
+    repository = Path(record.repo_path)
+    (repository / "pyproject.toml").write_text(
+        "[project]\nname='fixture'\nversion='0.1.0'\n",
+        encoding="utf-8",
+    )
+    test_path = "tests/test_widget_regression.py"
+    incorrect_test = (
+        "from package.widget import normalize\n\n\n"
+        "def test_normalize_preserves_public_contract():\n"
+        "    assert normalize(['first', 'second']) == ['wrong']\n"
+    )
+    corrected_test = incorrect_test.replace("['wrong']", "['first', 'second']")
+
+    def added_test_patch(content: str) -> str:
+        lines = content.rstrip("\n").splitlines()
+        additions = "\n".join(f"+{line}" for line in lines)
+        return (
+            f"diff --git a/{test_path} b/{test_path}\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            f"+++ b/{test_path}\n"
+            f"@@ -0,0 +1,{len(lines)} @@\n"
+            f"{additions}\n"
+        )
+
+    prior_patch = added_test_patch(incorrect_test)
+    corrected_patch = added_test_patch(corrected_test)
+    prior_candidate = CandidateArtifact(
+        "a" * 40,
+        1,
+        (test_path,),
+        prior_patch,
+    )
+    corrected_candidate = CandidateArtifact(
+        "a" * 40,
+        2,
+        (test_path,),
+        corrected_patch,
+    )
+    artifacts.write_patch(record.run_id, prior_patch)
+
+    class MutableRepairSandbox(_CandidateSandbox):
+        def __init__(self) -> None:
+            super().__init__(None)
+            self.restore_calls: list[ToolCall] = []
+
+        def execute(self, call: ToolCall) -> ToolResult:
+            self.restore_calls.append(call)
+            assert call.name == "apply_patch"
+            assert call.arguments == {"patch": prior_patch}
+            self.candidate = prior_candidate
+            return ToolResult(call.id, call.name, True, "restored")
+
+    sandbox = MutableRepairSandbox()
+
+    class RepairExecutor:
+        workspace_revision = 1
+        mutation_persistence_failed = False
+
+        def __init__(self) -> None:
+            self.calls: list[ToolCall] = []
+
+        def execute(self, call: ToolCall) -> ToolResult:
+            self.calls.append(call)
+            if call.name == "read_files":
+                assert call.arguments == {"paths": [test_path]}
+                return ToolResult(call.id, call.name, True, incorrect_test)
+            assert call.name == "write_files"
+            assert call.arguments == {
+                "files": [{"path": test_path, "content": corrected_test}]
+            }
+            sandbox.candidate = corrected_candidate
+            self.workspace_revision += 1
+            return ToolResult(call.id, call.name, True, "updated")
+
+    executor = RepairExecutor()
+    provider = _DecisionProvider(
+        ToolCall("read", "read_files", {"paths": [test_path]}),
+        ToolCall(
+            "write",
+            "write_files",
+            {"files": [{"path": test_path, "content": corrected_test}]},
+        ),
+    )
+    operations._sandbox = lambda *_args, **_kwargs: sandbox
+    operations._tool_executor = lambda *_args, **_kwargs: executor
+    operations._provider_factory = lambda *_args: provider
+
+    outcome = operations.repair(
+        _context(record, "repair", suffix="test-only-correction")
+    )
+
+    assert outcome.ok is True
+    assert outcome.summary == "candidate submitted for independent verification"
+    assert [call.name for call in sandbox.restore_calls] == ["apply_patch"]
+    assert [call.name for call in executor.calls] == ["read_files", "write_files"]
+    assert provider.forced_tool_choices == ["read_files", "write_files"]
+    assert provider.calls == 2
+    assert provider.decisions == []
+    assert corrected_patch != prior_patch
+    assert artifacts.path(record.run_id, "patch").read_text(encoding="utf-8") == (
+        corrected_patch
+    )
 
 
 def test_change_candidate_stops_when_prior_patch_cannot_be_restored(
@@ -2165,6 +4426,25 @@ def test_operations_default_provider_delegates_record_policy(
     assert captured[0]["allow_remote_model"] == record.allow_remote_model
 
 
+def test_operations_injects_cancellation_check_into_provider(
+    operations_bundle,
+) -> None:
+    operations, _database, _artifacts, _record = operations_bundle
+    checks = []
+    provider = SimpleNamespace(
+        set_cancellation_check=lambda check: checks.append(check)
+    )
+    operations._provider_factory = lambda *_args: provider
+
+    result = operations._provider((runtime.PLAN_TOOL,), "system", "key")
+
+    assert result is provider
+    assert len(checks) == 1
+    operations.cancel_event.set()
+    with pytest.raises(runtime.WorkflowCancelled, match="run was cancelled"):
+        checks[0]()
+
+
 def test_service_runner_cancel_delegates_only_for_active_run(operations_bundle) -> None:
     _operations, database, artifacts, _record_value = operations_bundle
     runner = runtime.ServiceWorkflowRunner(database, artifacts)
@@ -2175,6 +4455,17 @@ def test_service_runner_cancel_delegates_only_for_active_run(operations_bundle) 
     runner.cancel(RUN_ID)
 
     assert calls == [RUN_ID]
+
+
+def test_service_runner_close_budget_covers_one_provider_request(
+    operations_bundle,
+) -> None:
+    _operations, database, artifacts, _record_value = operations_bundle
+    runner = runtime.ServiceWorkflowRunner(database, artifacts)
+
+    assert runner.close_timeout_seconds == (
+        runtime.DURABLE_DEEPSEEK_REQUEST_TIMEOUT_SECONDS + 5.0
+    )
 
 
 @pytest.mark.parametrize(

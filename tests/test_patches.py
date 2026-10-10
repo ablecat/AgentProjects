@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import os
+from pathlib import Path
+import shutil
+import subprocess
+
 import pytest
 
+from repo_agent import patches as patches_module
 from repo_agent.patches import (
     MAX_CHANGED_LINES,
     MAX_PATCH_BYTES,
     MAX_PATCH_FILES,
     MAX_PATCH_LINES,
     PatchValidationError,
+    normalize_model_patch,
     validate_patch,
 )
 
@@ -158,6 +165,332 @@ def test_hunk_header_counts_must_match_the_hunk_body() -> None:
 
     with pytest.raises(PatchValidationError):
         validate_patch(malformed)
+
+
+def test_model_patch_recounts_stale_hunk_headers_but_public_validator_stays_strict() -> None:
+    malformed = modify_patch().replace("@@ -1 +1 @@", "@@ -1,9 +1,7 @@")
+
+    with pytest.raises(PatchValidationError):
+        validate_patch(malformed)
+
+    normalized = normalize_model_patch(malformed)
+
+    assert normalized.text.startswith("diff --git a/src/app.py b/src/app.py\n")
+    assert "@@ -1,1 +1,1 @@" in normalized.text
+    assert normalized.changed_lines == 2
+
+
+def test_model_patch_recount_then_canonicalize_uses_corrected_hunks(
+    tmp_path: Path,
+) -> None:
+    repository = _git_fixture(tmp_path)
+    patch = (
+        "diff --git a/src/app.py b/src/app.py\n"
+        "--- a/src/app.py\n"
+        "+++ b/src/app.py\n"
+        "@@ -1,99 +1,99 @@\n"
+        " one\n"
+        "-two\n"
+        "+TWO\n"
+        " three\n"
+        " four\n"
+        "diff --git a/src/new.py b/src/new.py\n"
+        "--- /dev/null\n"
+        "+++ b/src/new.py\n"
+        "@@ -0,0 +99 @@\n"
+        "+created\n"
+    )
+
+    normalized = normalize_model_patch(patch, repository=repository)
+
+    _assert_git_check(repository, normalized.text)
+    assert "@@ -1,4 +1,4 @@" in normalized.text
+    assert "new file mode 100644\n" in normalized.text
+
+
+def test_model_patch_recovers_bare_hunk_and_empty_context_lines(
+    tmp_path: Path,
+) -> None:
+    repository = _git_fixture(tmp_path, content="one\ntwo\n\nfour\n")
+    patch = (
+        "diff --git a/src/app.py b/src/app.py\n"
+        "--- a/src/app.py\n"
+        "+++ b/src/app.py\n"
+        "@@\n"
+        " one\n"
+        "-two\n"
+        "+TWO\n"
+        "\n"
+        " four\n"
+    )
+
+    normalized = normalize_model_patch(patch, repository=repository)
+
+    _assert_git_check(repository, normalized.text)
+    assert "-two\n" in normalized.text
+    assert "+TWO\n" in normalized.text
+
+
+def test_model_patch_strips_one_markdown_diff_fence() -> None:
+    patch = "```diff\n" + modify_patch() + "```\n"
+
+    normalized = normalize_model_patch(patch)
+
+    assert normalized.paths == ("src/app.py",)
+    assert normalized.text.startswith("diff --git a/src/app.py b/src/app.py\n")
+
+
+def test_model_patch_recount_does_not_relax_path_or_hunk_content_policy() -> None:
+    unsafe = modify_patch("../outside.py").replace("@@ -1 +1 @@", "@@ -1,9 +1,7 @@")
+    malformed_body = modify_patch().replace("-old value", "?old value")
+    bare_carriage_return = modify_patch().replace("\n", "\r", 1)
+
+    with pytest.raises(PatchValidationError):
+        normalize_model_patch(unsafe)
+    with pytest.raises(PatchValidationError):
+        normalize_model_patch(malformed_body)
+    with pytest.raises(PatchValidationError, match="carriage returns"):
+        normalize_model_patch(bare_carriage_return)
+
+
+def _git_fixture(tmp_path: Path, *, content: str = "one\ntwo\nthree\nfour\n") -> Path:
+    if shutil.which("git") is None:
+        pytest.skip("git is required for model patch integration checks")
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    (repository / "src").mkdir()
+    (repository / "src" / "app.py").write_bytes(content.encode("utf-8"))
+    for args in (
+        ("init", "-q"),
+        ("config", "core.autocrlf", "false"),
+        ("config", "user.email", "tests@example.invalid"),
+        ("config", "user.name", "patch-tests"),
+        ("add", "."),
+        ("commit", "-qm", "fixture"),
+    ):
+        completed = subprocess.run(
+            ["git", *args], cwd=repository, capture_output=True, check=False
+        )
+        assert completed.returncode == 0, completed.stderr.decode(errors="replace")
+    return repository
+
+
+def _assert_git_check(repository: Path, patch: str) -> None:
+    completed = subprocess.run(
+        ["git", "apply", "--check", "--index", "--whitespace=error-all", "--"],
+        cwd=repository,
+        input=patch.encode("utf-8"),
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr.decode(errors="replace")
+
+
+@pytest.mark.parametrize(
+    "check_patch",
+    [patches_module._git_patch_applies, patches_module._git_patch_applies_recount],
+)
+def test_git_patch_checks_remove_hostile_git_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    check_patch,
+) -> None:
+    repository = _git_fixture(tmp_path)
+    hostile = tmp_path / "hostile"
+    hostile.mkdir()
+    hostile_config = hostile / "gitconfig"
+    hostile_config.write_text("[apply]\n\twhitespace = nowarn\n", encoding="utf-8")
+    hostile_values = {
+        "GIT_DIR": str(hostile / ".git"),
+        "GIT_WORK_TREE": str(hostile),
+        "GIT_INDEX_FILE": str(hostile / "index"),
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "core.attributesFile",
+        "GIT_CONFIG_VALUE_0": str(hostile / "attributes"),
+        "GIT_CONFIG_GLOBAL": str(hostile_config),
+        "GIT_CONFIG_NOSYSTEM": "0",
+        "GIT_CONFIG_SYSTEM": str(hostile_config),
+    }
+    for key, value in hostile_values.items():
+        monkeypatch.setenv(key, value)
+
+    real_run = subprocess.run
+    observed_environments: list[dict[str, str]] = []
+
+    def recording_run(*args, **kwargs):
+        environment = kwargs.get("env")
+        assert isinstance(environment, dict)
+        observed_environments.append(environment)
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(patches_module.subprocess, "run", recording_run)
+    patch = (
+        "diff --git a/src/app.py b/src/app.py\n"
+        "--- a/src/app.py\n"
+        "+++ b/src/app.py\n"
+        "@@ -1,4 +1,4 @@\n"
+        "-one\n"
+        "+ONE\n"
+        " two\n"
+        " three\n"
+        " four\n"
+    )
+
+    assert check_patch(repository, patch)
+    assert len(observed_environments) == 1
+    environment = observed_environments[0]
+    for key in hostile_values:
+        if key in {"GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_SYSTEM"}:
+            continue
+        assert key not in environment
+    assert environment["GIT_CONFIG_GLOBAL"] == os.devnull
+    assert environment["GIT_CONFIG_SYSTEM"] == os.devnull
+    assert environment["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert not (hostile / "index").exists()
+
+
+def test_model_patch_canonicalizes_bare_unified_diff_without_deleting_omitted_lines(
+    tmp_path: Path,
+) -> None:
+    repository = _git_fixture(tmp_path)
+    patch = (
+        "--- a/src/app.py\n"
+        "+++ b/src/app.py\n"
+        "@@ -2,1 +2,1 @@\n"
+        "-two\n"
+        "+TWO\n"
+    )
+
+    normalized = normalize_model_patch(patch, repository=repository)
+
+    _assert_git_check(repository, normalized.text)
+    assert " three\n" in normalized.text
+    assert normalized.paths == ("src/app.py",)
+
+
+def test_model_patch_canonicalizes_editor_style_update(tmp_path: Path) -> None:
+    repository = _git_fixture(tmp_path)
+    patch = (
+        "*** Begin Patch\n"
+        "*** Update File: src/app.py\n"
+        "@@\n"
+        "-two\n"
+        "+TWO\n"
+        "*** End Patch\n"
+    )
+
+    normalized = normalize_model_patch(patch, repository=repository)
+
+    _assert_git_check(repository, normalized.text)
+    assert "-two\n" in normalized.text
+    assert "+TWO\n" in normalized.text
+
+
+def test_model_add_without_mode_gets_git_safe_metadata(tmp_path: Path) -> None:
+    repository = _git_fixture(tmp_path)
+    patch = (
+        "diff --git a/src/new.py b/src/new.py\n"
+        "--- /dev/null\n"
+        "+++ b/src/new.py\n"
+        "@@ -0,0 +1 @@\n"
+        "+created\n"
+    )
+
+    normalized = normalize_model_patch(patch, repository=repository)
+
+    assert "new file mode 100644\n" in normalized.text
+
+
+def test_model_add_trims_terminal_blank_hunk_line(tmp_path: Path) -> None:
+    repository = _git_fixture(tmp_path)
+    patch = (
+        "diff --git a/src/new.py b/src/new.py\n"
+        "--- /dev/null\n"
+        "+++ b/src/new.py\n"
+        "@@ -0,0 +1,3 @@\n"
+        "+one\n"
+        "+two\n"
+        "+\n"
+    )
+
+    normalized = normalize_model_patch(patch, repository=repository)
+
+    _assert_git_check(repository, normalized.text)
+    assert "+two\n" in normalized.text
+    assert normalized.text.endswith("+two\n")
+    _assert_git_check(repository, normalized.text)
+
+
+def test_model_patch_rejects_noncontiguous_fuzzy_context_instead_of_deleting_lines(
+    tmp_path: Path,
+) -> None:
+    repository = _git_fixture(tmp_path, content="one\ntwo\nthree\nfour\n")
+    patch = (
+        "diff --git a/src/app.py b/src/app.py\n"
+        "--- a/src/app.py\n"
+        "+++ b/src/app.py\n"
+        "@@ -1,4 +1,4 @@\n"
+        " one\n"
+        "-two\n"
+        "+TWO\n"
+        " four\n"
+    )
+
+    # The body is deliberately inconsistent with the checkout: ``three`` is
+    # omitted between two context lines. It must not be treated as disposable.
+    with pytest.raises(PatchValidationError):
+        normalize_model_patch(patch, repository=repository)
+
+
+def test_model_patch_rejects_context_outside_bounded_fuzz_window(
+    tmp_path: Path,
+) -> None:
+    content = "".join(f"line-{index}\n" for index in range(100))
+    repository = _git_fixture(tmp_path, content=content)
+    patch = (
+        "diff --git a/src/app.py b/src/app.py\n"
+        "--- a/src/app.py\n"
+        "+++ b/src/app.py\n"
+        "@@ -1 +1 @@\n"
+        "-line-99\n"
+        "+changed\n"
+    )
+
+    with pytest.raises(PatchValidationError):
+        normalize_model_patch(patch, repository=repository)
+
+
+def test_model_patch_rejects_equidistant_ambiguous_context(tmp_path: Path) -> None:
+    lines = [f"line-{index}" for index in range(30)]
+    lines[9] = "TARGET"
+    lines[19] = "TARGET"
+    repository = _git_fixture(tmp_path, content="\n".join(lines) + "\n")
+    patch = (
+        "diff --git a/src/app.py b/src/app.py\n"
+        "--- a/src/app.py\n"
+        "+++ b/src/app.py\n"
+        "@@ -15 +15 @@\n"
+        "-TARGET\n"
+        "+changed\n"
+    )
+
+    with pytest.raises(PatchValidationError):
+        normalize_model_patch(patch, repository=repository)
+
+
+def test_model_editor_path_traversal_is_rejected(tmp_path: Path) -> None:
+    repository = _git_fixture(tmp_path)
+    patch = (
+        "*** Begin Patch\n"
+        "*** Update File: ../outside.py\n"
+        "@@\n"
+        "-old\n"
+        "+new\n"
+        "*** End Patch\n"
+    )
+
+    with pytest.raises(PatchValidationError):
+        normalize_model_patch(patch, repository=repository)
 
 
 @pytest.mark.parametrize(

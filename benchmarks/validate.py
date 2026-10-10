@@ -1113,7 +1113,8 @@ def bootstrap_maven_dependencies(
     bootstrap_steps = (
         (
             "-DskipTests",
-            f"{MAVEN_DEPENDENCY_PLUGIN}:go-offline",
+            "process-test-classes",
+            "org.apache.maven.plugins:maven-surefire-plugin:3.5.2:help",
         ),
         *(
             (

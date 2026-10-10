@@ -793,6 +793,7 @@ fieldset {
 }
 
 .answer-section,
+.activity-section,
 .tools-section,
 .plan-section,
 .artifact-section {
@@ -836,6 +837,7 @@ fieldset {
 }
 
 .answer-section h3,
+.activity-section h3,
 .tools-section h3,
 .environment-section h3 {
   font-size: 12px;
@@ -859,6 +861,55 @@ fieldset {
 #tool-summary {
   color: var(--muted);
   font-size: 11px;
+}
+
+#activity-state {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.activity-list {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  list-style: none;
+  margin: 0 0 16px;
+  max-height: 184px;
+  overflow: auto;
+  padding: 0;
+}
+
+.activity-list:empty::before {
+  color: var(--muted);
+  content: "Waiting for workflow events";
+  display: block;
+  font-size: 11px;
+  padding: 11px 12px;
+}
+
+.activity-list li {
+  align-items: center;
+  border-top: 1px solid var(--line);
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  min-height: 34px;
+  padding: 8px 11px;
+}
+
+.activity-list li:first-child {
+  border-top: 0;
+}
+
+.activity-event {
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.activity-meta {
+  color: var(--muted);
+  flex: 0 0 auto;
+  font-size: 10px;
 }
 
 .tool-list {

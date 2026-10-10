@@ -5,21 +5,31 @@ from __future__ import annotations
 import importlib
 import math
 import os
+from collections import deque
 from dataclasses import dataclass, replace
 from pathlib import Path
-import queue
 import threading
 import time
 from typing import Any, Literal, Protocol
 import uuid
 
 from .artifacts import ArtifactStore
+from .checks import CheckPolicyError, detect_check_profile
 from .loop import AgentLoop
 from .models import RunResult
-from .persistence import RunDatabase, RunNotFoundError
+from .persistence import (
+    MAX_EVENT_PAGE_SIZE,
+    MAX_EVENT_SEQUENCE,
+    EventPage,
+    RunDatabase,
+    RunNotFoundError,
+)
 from .providers import DemoProvider, Provider
 from .run_models import RunRecord, TERMINAL_STATUSES, WorkflowNode, utc_now
 from .sandbox import DockerSandbox
+
+
+DEFAULT_RUN_SERVICE_CLOSE_TIMEOUT_SECONDS = 10.0
 
 
 class SandboxFactory(Protocol):
@@ -186,6 +196,19 @@ class _QueuedRun:
     resume: bool
 
 
+@dataclass(frozen=True, slots=True)
+class ServiceSnapshot:
+    """One lock-consistent view of the local workflow scheduler."""
+
+    ready: bool
+    queue_depth: int
+    queue_capacity: int
+    active_count: int
+    max_concurrency: int
+    queued_run_ids: tuple[str, ...]
+    active_run_ids: tuple[str, ...]
+
+
 class RunExecutionContext:
     """Service-owned capabilities exposed to one workflow execution."""
 
@@ -210,6 +233,16 @@ class RunExecutionContext:
         return self.cancel_event.is_set() or self.database.get(
             self.run_id
         ).cancel_requested
+
+    def publish_event(self, event: dict[str, Any]) -> int:
+        """Persist an auxiliary workflow event and wake live subscribers."""
+
+        if not isinstance(event, dict):
+            raise TypeError("workflow event must be a dictionary")
+        with self._publication_lock:
+            sequence = self.database.append_event(self.run_id, event)
+            self._notify(self.run_id)
+        return sequence
 
     def checkpoint(
         self,
@@ -327,10 +360,13 @@ class RunService:
                     review_enabled=review_enabled,
                 )
             )
-            self._queue: queue.Queue[_QueuedRun] = queue.Queue()
+            self._close_timeout_seconds = _runner_close_timeout_seconds(self._runner)
+            self._queue: deque[_QueuedRun] = deque()
             self._pending_slots = threading.BoundedSemaphore(max_queue)
             self._max_queue = max_queue
-            self._scheduled: set[str] = set()
+            # Dict insertion order is the scheduler's FIFO order. The deque is kept
+            # in lockstep so cancelled waiting jobs release physical capacity too.
+            self._scheduled: dict[str, _QueuedRun] = {}
             self._cancel_events: dict[str, threading.Event] = {}
             self._lock = threading.RLock()
             self._publication_lock = threading.RLock()
@@ -367,9 +403,14 @@ class RunService:
                 )
                 self._worker.start()
 
-    def close(self, *, timeout: float = 10.0) -> None:
-        validated_timeout = _validated_non_negative_timeout(timeout)
-        assert validated_timeout is not None
+    @property
+    def close_timeout_seconds(self) -> float:
+        return self._close_timeout_seconds
+
+    def close(self, *, timeout: float | None = None) -> None:
+        validated_timeout = _validated_non_negative_timeout(timeout, optional=True)
+        if validated_timeout is None:
+            validated_timeout = self.close_timeout_seconds
         with self._close_lock:
             lease = self._lease
             if lease is None or not lease.held:
@@ -479,6 +520,60 @@ class RunService:
             record for record in self.database.list() if self._record_is_allowed(record)
         )
 
+    def event_page(
+        self,
+        run_id: str,
+        *,
+        after_sequence: int,
+        limit: int = 64,
+    ) -> EventPage:
+        """Return one bounded page of allowed, durable run events."""
+
+        normalized = _validated_run_id(run_id)
+        _validate_event_cursor(after_sequence, limit)
+        self.get_run(normalized)
+        return self.database.event_page(
+            normalized,
+            after_sequence=after_sequence,
+            limit=limit,
+        )
+
+    def wait_for_events(
+        self,
+        run_id: str,
+        *,
+        after_sequence: int,
+        timeout: float | None,
+        limit: int = 64,
+    ) -> EventPage:
+        """Wait for events after a cursor without a query/wait lost-wakeup gap."""
+
+        normalized = _validated_run_id(run_id)
+        _validate_event_cursor(after_sequence, limit)
+        validated_timeout = _validated_non_negative_timeout(timeout, optional=True)
+        deadline = (
+            None
+            if validated_timeout is None
+            else time.monotonic() + validated_timeout
+        )
+        with self._condition:
+            self.get_run(normalized)
+            while True:
+                page = self.database.event_page(
+                    normalized,
+                    after_sequence=after_sequence,
+                    limit=limit,
+                )
+                if page.events:
+                    return page
+                if deadline is None:
+                    remaining = None
+                else:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return page
+                self._condition.wait(timeout=remaining)
+
     def decide(
         self,
         run_id: str,
@@ -586,6 +681,20 @@ class RunService:
                 event = self._cancel_events.get(record.run_id)
                 if event is not None:
                     event.set()
+                if (
+                    not active
+                    and record.status == "queued"
+                ):
+                    queued_job = self._scheduled.pop(record.run_id, None)
+                    if queued_job is not None:
+                        try:
+                            self._queue.remove(queued_job)
+                        except ValueError as exc:  # pragma: no cover - invariant guard
+                            raise RuntimeError(
+                                "scheduled run is missing from the waiting queue"
+                            ) from exc
+                        self._pending_slots.release()
+                        self._condition.notify_all()
             if active:
                 self.database.put(cancelled)
                 self._trace(cancelled, "cancel_requested", detail={"active": True})
@@ -598,8 +707,13 @@ class RunService:
                     detail={"active": False},
                 )
         cancel = getattr(self._runner, "cancel", None)
-        if callable(cancel):
-            cancel(record.run_id)
+        if active and callable(cancel):
+            try:
+                cancel(record.run_id)
+            except Exception:
+                # The durable cancellation request is authoritative. A runner hook
+                # only accelerates cooperative shutdown and must remain best effort.
+                pass
         return cancelled
 
     def artifact_path(self, run_id: str, kind: str) -> Path:
@@ -642,16 +756,42 @@ class RunService:
                 self._condition.wait(timeout=remaining)
 
     def ready(self) -> bool:
-        worker = self._worker
-        return (
-            not self._stop_event.is_set()
-            and worker is not None
-            and worker.is_alive()
-        )
+        return self.scheduler_snapshot().ready
 
     @property
     def queue_depth(self) -> int:
-        return self._queue.qsize()
+        return self.scheduler_snapshot().queue_depth
+
+    def scheduler_snapshot(self) -> ServiceSnapshot:
+        """Return an atomic scheduler view without exposing Queue internals."""
+
+        with self._lock:
+            worker = self._worker
+            queued_run_ids = tuple(self._scheduled)
+            active_run_ids = tuple(self._cancel_events)
+            return ServiceSnapshot(
+                ready=(
+                    not self._stop_event.is_set()
+                    and worker is not None
+                    and worker.is_alive()
+                ),
+                queue_depth=len(queued_run_ids),
+                queue_capacity=self._max_queue,
+                active_count=len(active_run_ids),
+                max_concurrency=1,
+                queued_run_ids=queued_run_ids,
+                active_run_ids=active_run_ids,
+            )
+
+    def queue_position(self, run_id: str) -> int | None:
+        """Return a waiting run's one-based FIFO position, if it is queued."""
+
+        normalized = _validated_run_id(run_id)
+        with self._lock:
+            for position, queued_run_id in enumerate(self._scheduled, start=1):
+                if queued_run_id == normalized:
+                    return position
+        return None
 
     def _require_open(self) -> None:
         lease = self._lease
@@ -671,27 +811,36 @@ class RunService:
         acquired = slot_reserved or self._pending_slots.acquire(blocking=False)
         if not acquired:
             raise QueueFullError(f"run queue is full (maximum {self._max_queue})")
+        inserted = False
         try:
             with self._lock:
                 if run_id in self._scheduled:
                     raise InvalidRunTransitionError(f"run is already scheduled: {run_id}")
-                self._scheduled.add(run_id)
-                self._queue.put_nowait(_QueuedRun(run_id, resume))
+                job = _QueuedRun(run_id, resume)
+                self._scheduled[run_id] = job
+                inserted = True
+                self._queue.append(job)
                 self._condition.notify_all()
         except BaseException:
+            if inserted:
+                with self._lock:
+                    self._scheduled.pop(run_id, None)
             if not slot_reserved:
                 self._pending_slots.release()
             raise
 
     def _worker_main(self) -> None:
-        while not self._stop_event.is_set():
-            try:
-                job = self._queue.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            self._pending_slots.release()
-            with self._lock:
-                self._scheduled.discard(job.run_id)
+        while True:
+            with self._condition:
+                while not self._queue and not self._stop_event.is_set():
+                    self._condition.wait(timeout=0.2)
+                if self._stop_event.is_set():
+                    return
+                job = self._queue.popleft()
+                scheduled = self._scheduled.pop(job.run_id, None)
+                if scheduled != job:  # pragma: no cover - invariant guard
+                    raise RuntimeError("waiting queue and scheduler state diverged")
+                self._pending_slots.release()
                 cancel_event = self._cancel_events.setdefault(
                     job.run_id, threading.Event()
                 )
@@ -704,10 +853,13 @@ class RunService:
                 with self._lock:
                     self._cancel_events.pop(job.run_id, None)
                     self._condition.notify_all()
-                self._queue.task_done()
 
     def _execute_job(self, job: _QueuedRun, cancel_event: threading.Event) -> None:
+        if cancel_event.is_set():
+            return
         with self._publication_lock:
+            if cancel_event.is_set():
+                return
             try:
                 record = self.get_run(job.run_id)
             except RunNotFoundError:
@@ -866,6 +1018,7 @@ class RunService:
                 "detail": detail,
             },
         )
+        self._notify(record.run_id)
 
     def _write_report(self, record: RunRecord) -> None:
         lines = [
@@ -931,6 +1084,8 @@ class RunService:
 
 
 class _MissingWorkflowRunner:
+    close_timeout_seconds = DEFAULT_RUN_SERVICE_CLOSE_TIMEOUT_SECONDS
+
     def execute(
         self,
         record: RunRecord,
@@ -945,6 +1100,38 @@ class _MissingWorkflowRunner:
         del run_id
 
 
+class _PythonOnlyWorkflowRunner:
+    """Enforce the v1 language boundary before every execute or resume."""
+
+    def __init__(self, runner: DurableWorkflowRunner) -> None:
+        self._runner = runner
+
+    @property
+    def allow_bootstrap(self) -> bool:
+        return bool(getattr(self._runner, "allow_bootstrap", False))
+
+    @property
+    def close_timeout_seconds(self) -> float:
+        return _runner_close_timeout_seconds(self._runner)
+
+    def execute(
+        self,
+        record: RunRecord,
+        context: RunExecutionContext,
+        *,
+        resume: bool,
+    ) -> RunRecord:
+        profile = detect_check_profile(record.repo_path)
+        if profile.language != "python":
+            raise CheckPolicyError(
+                "durable workflows support only Python repositories"
+            )
+        return self._runner.execute(record, context, resume=resume)
+
+    def cancel(self, run_id: str) -> None:
+        self._runner.cancel(run_id)
+
+
 def _load_default_runner(
     service: RunService,
     *,
@@ -955,11 +1142,13 @@ def _load_default_runner(
         from .workflow_runtime import ServiceWorkflowRunner
     except (ImportError, AttributeError):
         return _MissingWorkflowRunner()
-    return ServiceWorkflowRunner(
-        service.database,
-        service.artifacts,
-        allow_bootstrap=allow_bootstrap,
-        review_enabled=review_enabled,
+    return _PythonOnlyWorkflowRunner(
+        ServiceWorkflowRunner(
+            service.database,
+            service.artifacts,
+            allow_bootstrap=allow_bootstrap,
+            review_enabled=review_enabled,
+        )
     )
 
 
@@ -1026,6 +1215,29 @@ def _validated_non_negative_timeout(
     return timeout
 
 
+def _validate_event_cursor(after_sequence: object, limit: object) -> None:
+    if (
+        type(after_sequence) is not int
+        or not 0 <= after_sequence <= MAX_EVENT_SEQUENCE
+    ):
+        raise ValueError("after_sequence must be an integer from 0 to 2^63-1")
+    if type(limit) is not int or not 1 <= limit <= MAX_EVENT_PAGE_SIZE:
+        raise ValueError(
+            f"limit must be an integer from 1 to {MAX_EVENT_PAGE_SIZE}"
+        )
+
+
+def _runner_close_timeout_seconds(runner: object) -> float:
+    value = getattr(
+        runner,
+        "close_timeout_seconds",
+        DEFAULT_RUN_SERVICE_CLOSE_TIMEOUT_SECONDS,
+    )
+    timeout = _validated_non_negative_timeout(value)
+    assert timeout is not None
+    return timeout
+
+
 def _validated_run_id(value: object) -> str:
     if not isinstance(value, str) or len(value) != 32:
         raise ValueError("invalid run id")
@@ -1051,5 +1263,6 @@ __all__ = [
     "RepositoryNotAllowedError",
     "RunExecutionContext",
     "RunService",
+    "ServiceSnapshot",
     "run_agent",
 ]

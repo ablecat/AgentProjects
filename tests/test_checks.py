@@ -452,15 +452,20 @@ def test_detects_single_module_maven_profile_with_offline_verify(
     assert profile.bootstrap_argv == (
         (
             "mvn",
+            "-T",
+            "4",
             "--batch-mode",
             "--no-transfer-progress",
             "-Dstyle.color=never",
             "-Dmaven.repo.local=/cache/m2",
             "-DskipTests",
-            "org.apache.maven.plugins:maven-dependency-plugin:3.8.1:go-offline",
+            "process-test-classes",
+            "org.apache.maven.plugins:maven-surefire-plugin:3.5.2:help",
         ),
         (
             "mvn",
+            "-T",
+            "4",
             "--batch-mode",
             "--no-transfer-progress",
             "-Dstyle.color=never",
@@ -471,6 +476,8 @@ def test_detects_single_module_maven_profile_with_offline_verify(
         ),
         (
             "mvn",
+            "-T",
+            "4",
             "--batch-mode",
             "--no-transfer-progress",
             "-Dstyle.color=never",
@@ -481,6 +488,8 @@ def test_detects_single_module_maven_profile_with_offline_verify(
         ),
         (
             "mvn",
+            "-T",
+            "4",
             "--batch-mode",
             "--no-transfer-progress",
             "-Dstyle.color=never",
@@ -1708,9 +1717,10 @@ def test_maven_bootstrap_and_verify_use_only_fixed_commands(tmp_path: Path) -> N
         "bridge",
         "none",
     ]
-    assert result.phases[0].argv[-2:] == (
+    assert result.phases[0].argv[-3:] == (
         "-DskipTests",
-        "org.apache.maven.plugins:maven-dependency-plugin:3.8.1:go-offline",
+        "process-test-classes",
+        "org.apache.maven.plugins:maven-surefire-plugin:3.5.2:help",
     )
     assert result.phases[1].argv[-3:] == (
         "org.apache.maven.plugins:maven-dependency-plugin:3.8.1:get",
@@ -1742,6 +1752,11 @@ def test_maven_bootstrap_and_verify_use_only_fixed_commands(tmp_path: Path) -> N
     ]
     assert all(command[-len(phase.argv) :] == phase.argv for command, phase in zip(creates, result.phases, strict=True))
     assert all("repo-agent-maven:0.1" in command for command in creates)
+    assert all(
+        "/tmp:rw,exec,nosuid,nodev,size=256m,mode=1777"
+        in _option_values(command, "--tmpfs")
+        for command in creates
+    )
 
 
 @pytest.mark.parametrize(
@@ -1793,6 +1808,55 @@ def test_maven_bootstrap_retries_once_for_transient_transfer_failure(
         creates[0][creates[0].index("repo-agent-maven:0.1") :]
         == creates[1][creates[1].index("repo-agent-maven:0.1") :]
     )
+
+
+def test_maven_bootstrap_retries_once_after_phase_timeout(tmp_path: Path) -> None:
+    runner = FakeDockerRunner(
+        starts=[
+            CommandOutcome(None, "first bootstrap timed out", timed_out=True),
+            CommandOutcome(0, "retry succeeded"),
+        ]
+    )
+
+    result = CheckRunner(
+        _maven_repository(tmp_path),
+        command_runner=runner,
+        temp_parent=tmp_path,
+        allow_bootstrap=True,
+    ).run("maven-test")
+
+    assert result.ok
+    assert len(result.phases) == 5
+    assert result.phases[0].status == "passed"
+    assert "first bootstrap timed out" in result.phases[0].output
+    assert "retry succeeded" in result.phases[0].output
+    creates = [command for command in runner.commands if command[2] == "create"]
+    assert len(creates) == 6
+    assert _mount_sources(creates[0]) == _mount_sources(creates[1])
+
+
+def test_maven_bootstrap_does_not_retry_phase_timeout_twice(tmp_path: Path) -> None:
+    runner = FakeDockerRunner(
+        starts=[
+            CommandOutcome(None, "first bootstrap timed out", timed_out=True),
+            CommandOutcome(None, "second bootstrap timed out", timed_out=True),
+        ]
+    )
+
+    result = CheckRunner(
+        _maven_repository(tmp_path),
+        command_runner=runner,
+        temp_parent=tmp_path,
+        allow_bootstrap=True,
+    ).run("maven-test")
+
+    assert result.status == "timed_out"
+    assert len(result.phases) == 1
+    assert result.phases[0].status == "timed_out"
+    assert "first bootstrap timed out" in result.phases[0].output
+    assert "second bootstrap timed out" in result.phases[0].output
+    creates = [command for command in runner.commands if command[2] == "create"]
+    assert len(creates) == 2
 
 
 def test_maven_bootstrap_stops_after_one_transient_retry(tmp_path: Path) -> None:

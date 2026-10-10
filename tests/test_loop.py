@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from types import SimpleNamespace
 
 import pytest
 
@@ -43,6 +44,83 @@ def test_loop_completes_with_structured_history() -> None:
         ToolResult("call-1", "git_status", True, "ran git_status"),
     )
     assert executor.calls == [ToolCall("call-1", "git_status", {})]
+
+
+def test_budgeted_loop_recomputes_remaining_tokens_before_each_request() -> None:
+    class BudgetedProvider:
+        def __init__(self) -> None:
+            self.usage = SimpleNamespace(
+                response_count=0,
+                complete=False,
+                total_tokens=None,
+            )
+            self.budgets: list[int] = []
+
+        def set_response_token_budget(self, total_tokens: int) -> None:
+            self.budgets.append(total_tokens)
+
+        def next_step(
+            self, task: str, results: Sequence[ToolResult]
+        ) -> ToolCall | FinalAnswer:
+            del task
+            if not results:
+                self.usage = SimpleNamespace(
+                    response_count=1,
+                    complete=True,
+                    total_tokens=100,
+                )
+                return ToolCall("call-1", "git_status", {})
+            self.usage = SimpleNamespace(
+                response_count=2,
+                complete=True,
+                total_tokens=150,
+            )
+            return FinalAnswer("done")
+
+    provider = BudgetedProvider()
+
+    result = AgentLoop(provider, RecordingExecutor()).run("inspect")
+
+    assert result.status == "completed"
+    assert provider.budgets == [30_000, 29_900]
+
+
+def test_budgeted_loop_stops_after_first_response_with_missing_usage() -> None:
+    class MissingUsageProvider:
+        def __init__(self) -> None:
+            self.usage = SimpleNamespace(
+                response_count=0,
+                complete=False,
+                total_tokens=None,
+            )
+            self.budgets: list[int] = []
+            self.calls = 0
+
+        def set_response_token_budget(self, total_tokens: int) -> None:
+            self.budgets.append(total_tokens)
+
+        def next_step(
+            self, task: str, results: Sequence[ToolResult]
+        ) -> ToolCall:
+            del task, results
+            self.calls += 1
+            self.usage = SimpleNamespace(
+                response_count=1,
+                complete=False,
+                total_tokens=None,
+            )
+            return ToolCall("call-1", "git_status", {})
+
+    provider = MissingUsageProvider()
+    executor = RecordingExecutor()
+
+    result = AgentLoop(provider, executor).run("inspect")
+
+    assert result.status == "provider_error"
+    assert result.answer == "Provider failed: RuntimeError: model token usage is incomplete"
+    assert provider.budgets == [30_000]
+    assert provider.calls == 1
+    assert executor.calls == []
 
 
 def test_failed_tool_result_is_returned_to_provider() -> None:

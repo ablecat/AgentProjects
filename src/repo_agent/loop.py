@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Protocol, runtime_checkable
 
 from .models import FinalAnswer, RunResult, ToolCall, ToolResult
+from .openai_provider import MAX_RESPONSE_TOKEN_BUDGET
 from .providers import Provider
 
 
@@ -37,7 +38,10 @@ class AgentLoop:
 
         for step in range(1, self._max_steps + 1):
             try:
+                budgeted = _configure_provider_token_budget(self._provider)
                 decision = self._provider.next_step(task, tuple(results))
+                if budgeted:
+                    _enforce_provider_token_usage(self._provider)
             except Exception as exc:
                 return RunResult(
                     task=task,
@@ -168,6 +172,58 @@ def _workspace_revision(executor: ToolExecutor) -> int:
     if type(revision) is not int or revision < 0:
         return 0
     return revision
+
+
+def _configure_provider_token_budget(provider: Provider) -> bool:
+    """Apply the remaining hard run budget when the provider supports it."""
+
+    setter = getattr(provider, "set_response_token_budget", None)
+    if not callable(setter):
+        return False
+    response_count, complete, total_tokens = _provider_token_usage(provider)
+    if response_count == 0:
+        remaining = MAX_RESPONSE_TOKEN_BUDGET
+    else:
+        if not complete or total_tokens is None:
+            raise RuntimeError("model token usage is incomplete")
+        remaining = MAX_RESPONSE_TOKEN_BUDGET - total_tokens
+    if remaining <= 0:
+        raise RuntimeError(
+            f"model token budget exhausted {MAX_RESPONSE_TOKEN_BUDGET} tokens"
+        )
+    setter(remaining)
+    return True
+
+
+def _enforce_provider_token_usage(provider: Provider) -> None:
+    """Reject a completed model turn whose cumulative usage is unprovable."""
+
+    response_count, complete, total_tokens = _provider_token_usage(provider)
+    if response_count == 0 or not complete or total_tokens is None:
+        raise RuntimeError("model token usage is incomplete")
+    if total_tokens > MAX_RESPONSE_TOKEN_BUDGET:
+        raise RuntimeError(
+            f"model token budget exceeded {MAX_RESPONSE_TOKEN_BUDGET} tokens"
+        )
+
+
+def _provider_token_usage(provider: Provider) -> tuple[int, bool, int | None]:
+    try:
+        usage = getattr(provider, "usage", None)
+        response_count = getattr(usage, "response_count", None)
+        complete = getattr(usage, "complete", None)
+        total_tokens = getattr(usage, "total_tokens", None)
+    except Exception as exc:
+        raise RuntimeError("model token usage is unavailable") from exc
+    if type(response_count) is not int or response_count < 0:
+        raise RuntimeError("model token usage is unavailable")
+    if type(complete) is not bool:
+        raise RuntimeError("model token usage is unavailable")
+    if total_tokens is not None and (
+        type(total_tokens) is not int or total_tokens < 0
+    ):
+        raise RuntimeError("model token usage is unavailable")
+    return response_count, complete, total_tokens
 
 
 def _exception_detail(exc: Exception) -> str:

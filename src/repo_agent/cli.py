@@ -21,7 +21,13 @@ except ImportError:  # pragma: no cover - exercised by Typer releases before 0.2
     typer_click = importlib.import_module("click")
 
 from .api import serve as serve_api
-from .checks import CheckError, CheckRunResult, CheckRunner
+from .checks import (
+    CheckError,
+    CheckPolicyError,
+    CheckRunResult,
+    CheckRunner,
+    detect_check_profile,
+)
 from .doctor import run_doctor
 from .evaluation import (
     EvaluationBatchReport,
@@ -514,9 +520,9 @@ def eval_command(
         help="Experiment variant: baseline, full, or no-review.",
     ),
     benchmark_dir: Path = typer.Option(
-        Path("benchmarks"),
+        Path("benchmarks/tasks/python/bugfix"),
         "--benchmark-dir",
-        help="Frozen benchmark suite directory.",
+        help="Python bug-fix suite; pass benchmarks explicitly for legacy matrix modes.",
     ),
     execute: bool = typer.Option(
         False,
@@ -890,6 +896,11 @@ def serve_command(
 @app.command("check")
 def check_command(
     repo: Path = typer.Option(Path("."), "--repo", help="Local Git repository."),
+    include_legacy_maven: bool = typer.Option(
+        False,
+        "--include-legacy-maven",
+        help="Explicitly allow the historical Maven check profile.",
+    ),
     allow_bootstrap: bool = typer.Option(
         False,
         "--allow-bootstrap",
@@ -921,6 +932,7 @@ def check_command(
 
     return _command_result(_run_check(
         repo=repo,
+        include_legacy_maven=include_legacy_maven,
         allow_bootstrap=allow_bootstrap,
         phase_timeout_seconds=phase_timeout_seconds,
         total_timeout_seconds=total_timeout_seconds,
@@ -979,6 +991,7 @@ def _run_demo(
 def _run_check(
     *,
     repo: Path,
+    include_legacy_maven: bool,
     allow_bootstrap: bool,
     phase_timeout_seconds: float,
     total_timeout_seconds: float,
@@ -987,6 +1000,13 @@ def _run_check(
 ) -> int:
     runner: CheckRunner | None = None
     try:
+        if not include_legacy_maven:
+            profile = detect_check_profile(repo)
+            if profile.language != "python":
+                raise CheckPolicyError(
+                    "repo-agent check supports only Python repositories; "
+                    "use --include-legacy-maven only for historical compatibility"
+                )
         runner = CheckRunner(
             repo,
             allow_bootstrap=allow_bootstrap,
@@ -994,7 +1014,9 @@ def _run_check(
             total_timeout_seconds=total_timeout_seconds,
             max_output_bytes=max_output_bytes,
         )
-        result = runner.run()
+        result = runner.run(
+            None if include_legacy_maven else "python-pytest"
+        )
     except KeyboardInterrupt:
         cleanup_error: str | None = None
         if runner is not None:
@@ -1018,6 +1040,16 @@ def _run_check(
         else:
             typer.echo("repo-agent check interrupted", err=True)
         return 130
+    except CheckPolicyError as exc:
+        result = CheckRunResult(
+            status="policy_denied",
+            profile=None,
+            base_commit=None,
+            candidate_applied=False,
+            phases=(),
+            duration_ms=0,
+            error=_exception_detail(exc),
+        )
     except (OSError, ValueError, CheckError) as exc:
         result = CheckRunResult(
             status="setup_error",
