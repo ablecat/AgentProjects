@@ -1,6 +1,6 @@
 # Repo Maintainer Agent
 
-[简体中文](README.zh-CN.md) | [Demo](docs/DEMO.md) | [Chinese user guide](docs/USER_GUIDE.zh-CN.md) | [Benchmark protocol](benchmarks/README.md)
+[简体中文](README.zh-CN.md) | [Demo](docs/DEMO.md) | [OSS evaluation](docs/OSS_EVALUATION_V1.md) | [Chinese user guide](docs/USER_GUIDE.zh-CN.md) | [Benchmark protocol](benchmarks/README.md)
 
 Repo Maintainer Agent turns a natural-language bug report into a reviewed,
 verified patch for a local Git repository. It plans with an OpenAI-compatible
@@ -15,6 +15,14 @@ Python/pytest sandbox, and a frozen Python acceptance suite. The earlier mixed
 Python/Java experiment is retained as read-only historical evidence in
 `benchmarks/results/v1`; its sanitized `results.jsonl` remains its source of
 truth.
+
+**Measured Python-only v1 evidence (2026-10-11):** one frozen, unrepeated
+DeepSeek `deepseek-v4-pro` trial completed all three curated public-issue tasks
+with zero timeouts and solved **1/3**. The solved task passed public, hidden,
+regression-lifecycle, and policy checks on its first patch. All tasks stayed
+within the 30,000-token limit. See the [full evidence report and
+showcase](docs/OSS_EVALUATION_V1.md); these are curated snapshots, not complete
+upstream repositories or a general success-rate claim.
 
 ## What it does
 
@@ -442,11 +450,13 @@ python ./benchmarks/tasks/python/oss/validate.py
 repo-agent eval --benchmark-dir ./benchmarks/tasks/python/oss --variant full --format json
 ```
 
-No model repair rate is claimed until an executed run exists. A later run can
-derive the final solved count, duration, and token usage from its evaluation
-report. The corresponding durable `run.json` records `checks[0].ok` for the
-first verification and `metrics.repair_attempts` for the bounded repair pass, so
-first-verify and repair-assisted outcomes remain distinguishable.
+The single frozen trial on source commit `394fb21e` completed 3/3 tasks and
+solved 1/3, with zero timeouts and zero budget failures. The one success passed
+on its first patch; neither failed candidate was repaired successfully. Total
+usage was 43,132 tokens, median task latency was 437.668 seconds, and p95 was
+546.199 seconds. See the [sanitized evidence and failure
+analysis](docs/OSS_EVALUATION_V1.md). The run was not repeated after observing
+the result.
 
 After freezing the code, prompt, model, and budgets, the restricted formal
 entry point runs only the six Python tasks as `full` trial 1 and writes to a

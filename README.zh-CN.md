@@ -1,6 +1,6 @@
 # Repo Maintainer Agent
 
-[English](README.md) | [演示流程](docs/DEMO.md) | [详细用户说明](docs/USER_GUIDE.zh-CN.md) | [评测协议](benchmarks/README.md)
+[English](README.md) | [演示流程](docs/DEMO.md) | [OSS 评测证据](docs/OSS_EVALUATION_V1.md) | [详细用户说明](docs/USER_GUIDE.zh-CN.md) | [评测协议](benchmarks/README.md)
 
 Repo Maintainer Agent 把自然语言 Bug 描述转换为可审阅、经过验证的本地 Git
 仓库补丁。它使用 OpenAI-compatible 模型生成计划，等待人工批准，只在一次性候选
@@ -11,6 +11,13 @@ clone 中修改代码，再用加固的 Docker 容器验证结果，最后交付
 LangGraph 工作流、加固的 Python/pytest 沙箱和冻结的 Python 验收集。早期
 Python/Java 混合实验仅作为只读历史证据保留在 `benchmarks/results/v1`；其中脱敏
 后的 `results.jsonl` 仍是该历史实验的唯一数据源。
+
+**Python-only v1 实测证据（2026-10-11）：** 使用 DeepSeek 官方
+`deepseek-v4-pro` 对三个冻结的公开 issue 裁剪快照执行一次且不重跑的 trial，
+3/3 均完成、零超时，独立评分解决 **1/3**。成功题首补通过 public、hidden、
+回归生命周期和 policy 检查，三题均未超过 30,000 token。完整口径、失败原因与
+可核查案例见 [OSS 评测事实报告](docs/OSS_EVALUATION_V1.md)；该结果不是完整上游
+仓库评测，也不外推为通用成功率。
 
 ## 核心能力
 
@@ -395,9 +402,10 @@ python ./benchmarks/tasks/python/oss/validate.py
 repo-agent eval --benchmark-dir ./benchmarks/tasks/python/oss --variant full --format json
 ```
 
-在真正执行模型评测前，不报告修复成功率。后续 executed run 可从评测报告读取最终
-solved 数、耗时和 token；对应的 durable `run.json` 用 `checks[0].ok` 标识首次
-verify，用 `metrics.repair_attempts` 标识有界 repair，从而区分首验通过与修复后通过。
+在源码 commit `394fb21e` 上完成的单次冻结 trial 中，3/3 任务均完成、解决 1/3，
+零超时、零预算失败；唯一成功题为首补通过，两个失败候选均未在有界 repair 后通过。
+三题合计使用 43,132 tokens，中位耗时 437.668 秒，p95 为 546.199 秒。完整脱敏
+证据与失败分析见 [OSS 评测事实报告](docs/OSS_EVALUATION_V1.md)。观察结果后未重跑。
 
 冻结代码、prompt、模型和预算后，受限入口只运行这 6 个 Python 任务的 `full`
 trial 1：

@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "evidence_kind": "single_frozen_public_issue_trial",
+  "evaluated_at": "2026-10-11",
+  "source_commit": "394fb21e467efdd701570686b8afefeb20c95bd2",
+  "suite_id": "repo-agent-python-oss-v1",
+  "formal_evaluation": false,
+  "manifest_sha256": "d2f50704618f598cee5f97349b72ee9a4b2cd905a24f6dffa3076f04a7d23d98",
+  "raw_summary_sha256": "afe317479cceb586245b7f650e8dca846eb7c8b9b717eb4a450e3e3b037e76ba",
+  "variant": "full",
+  "trial": 1,
+  "model": "deepseek-v4-pro",
+  "provider_profile": "official_deepseek",
+  "manual_patch_edits": false,
+  "repeated_after_observation": false,
+  "task_count": 3,
+  "completed_task_count": 3,
+  "solved_task_count": 1,
+  "pass_at_1": 0.3333333333333333,
+  "timeout_count": 0,
+  "budget_failure_count": 0,
+  "actionable_tool_error_rate": 0.1,
+  "tokens": {
+    "input": 36651,
+    "cached_input": 9728,
+    "output": 6481,
+    "total": 43132,
+    "complete": true
+  },
+  "latency_ms": {
+    "p50": 437668,
+    "p95": 546199.0
+  },
+  "cost_usd": null,
+  "price_source": "unavailable",
+  "tasks": [
+    {
+      "task_id": "py-oss-001",
+      "upstream_issue": "https://github.com/cool-RR/PySnooper/issues/2",
+      "solved": false,
+      "workflow_status": "unverified",
+      "first_verify_passed": false,
+      "repair_attempts": 1,
+      "timed_out": false,
+      "budget_passed": true,
+      "tokens": 13639,
+      "duration_ms": 558258,
+      "failure_category": "public_tests_failed",
+      "patch_sha256": "74e001ed6a0aa3222a588095024f72eacb4ed7cd9e148388715e2531deef4680"
+    },
+    {
+      "task_id": "py-oss-002",
+      "upstream_issue": "https://github.com/httpie/cli/issues/235",
+      "solved": false,
+      "workflow_status": "failed",
+      "first_verify_passed": false,
+      "repair_attempts": 1,
+      "timed_out": false,
+      "budget_passed": true,
+      "tokens": 22539,
+      "duration_ms": 437668,
+      "failure_category": "public_tests_failed",
+      "patch_sha256": "f32895de72ade90d6e97d844037f303322376cfe59fc95032902a52649eab2f5"
+    },
+    {
+      "task_id": "py-oss-003",
+      "upstream_issue": "https://github.com/nvbn/thefuck/issues/271",
+      "solved": true,
+      "workflow_status": "succeeded",
+      "first_verify_passed": true,
+      "repair_attempts": 0,
+      "timed_out": false,
+      "budget_passed": true,
+      "tokens": 6954,
+      "duration_ms": 296200,
+      "public_passed": true,
+      "hidden_passed": true,
+      "regression_failed_on_buggy": true,
+      "regression_passed_on_candidate": true,
+      "policy_passed": true,
+      "failure_category": null,
+      "patch_sha256": "48d341bf043a3b7d3a894dbc519b8c4ed3e36246b06f940d44b1156c52bf1d26"
+    }
+  ],
+  "limitations": [
+    "curated source snapshots rather than complete upstream repositories",
+    "project-authored public and hidden tests",
+    "single trial on three previously resolved public issues",
+    "provider pricing unavailable"
+  ]
+}
